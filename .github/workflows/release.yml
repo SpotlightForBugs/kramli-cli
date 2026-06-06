@@ -317,19 +317,28 @@ jobs:
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          tag="${{ needs.plan.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists (dist host); syncing notes and assets"
+            gh release edit "$tag" --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" $PRERELEASE_FLAG
+            gh release upload "$tag" artifacts/* --clobber
+          else
+            gh release create "$tag" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          fi
 
   publish-homebrew-formula:
     needs:
       - plan
       - host
+      - build-global-artifacts
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PLAN: ${{ needs.plan.outputs.val }}
+      RELEASE_TAG: ${{ needs.plan.outputs.tag }}
       GITHUB_USER: "github-actions[bot]"
       GITHUB_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
-    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+    if: ${{ needs.host.result == 'success' && (!fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases) }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -347,9 +356,11 @@ jobs:
       # so we need to find releases with a *.rb file, and publish with that filename.
       - name: Commit formula files
         run: |
+          set -euo pipefail
           git config --global user.name "${GITHUB_USER}"
           git config --global user.email "${GITHUB_EMAIL}"
 
+          committed=0
           for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith(".rb")] | any)'); do
             filename=$(echo "$release" | jq '.artifacts[] | select(endswith(".rb"))' --raw-output)
             name=$(echo "$filename" | sed "s/\.rb$//")
@@ -361,10 +372,42 @@ jobs:
             brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}" || true
 
             git add "Formula/${filename}"
-            git commit -m "${name} ${version}" || true
+            if git diff --staged --quiet; then
+              echo "Formula/${filename} already at ${version}, nothing to commit"
+            else
+              git commit -m "${name} ${version}"
+              committed=1
+            fi
           done
-          git pull --rebase origin main
-          git push origin main
+
+          if [ "$committed" = 0 ]; then
+            echo "homebrew formula already up to date"
+            exit 0
+          fi
+
+          for attempt in 1 2 3 4 5; do
+            git pull --rebase origin main
+            if git push origin main; then
+              echo "pushed formula update on attempt ${attempt}"
+              exit 0
+            fi
+            echo "push failed (attempt ${attempt}), retrying..."
+            sleep $((attempt * 3))
+          done
+          echo "failed to push homebrew formula after 5 attempts"
+          exit 1
+      - name: Verify homebrew formula version
+        run: |
+          set -euo pipefail
+          expected="${RELEASE_TAG#v}"
+          git fetch origin main
+          git checkout origin/main -- Formula/kramli.rb
+          actual=$(grep -E '^  version ' Formula/kramli.rb | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$actual" != "$expected" ]; then
+            echo "Formula/kramli.rb version ${actual} != release ${expected}"
+            exit 1
+          fi
+          echo "homebrew tap lists kramli ${actual}"
 
   announce:
     needs:
