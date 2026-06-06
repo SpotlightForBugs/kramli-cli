@@ -16,6 +16,7 @@ CERTIFICATE_PATH="${RUNNER_TEMP:-/tmp}/kramli-signing.p12"
 
 echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERTIFICATE_PATH"
 
+security delete-keychain "$KEYCHAIN_PATH" >/dev/null 2>&1 || true
 security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
 security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
@@ -24,4 +25,5 @@ security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN
 security list-keychain -d user -s "$KEYCHAIN_PATH"
 
 codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$bin"
-codesign -dv --verbose=2 "$bin"
+codesign --verify --verbose=2 "$bin"
+spctl -a -t exec -vv "$bin" || true
