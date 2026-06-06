@@ -231,19 +231,26 @@ jobs:
         run: |
           dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
-
-          # Parse out what we just built and upload it to scratch storage
+          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      - name: Patch PowerShell installer checksums
+        run: |
+          python3 scripts/patch-installer-ps1-checksums.py \
+            --installer target/distrib/kramli-installer.ps1 \
+            --artifacts-dir target/distrib
+      - name: Verify release artifacts
+        run: python3 scripts/verify-release-artifacts.py --artifacts-dir target/distrib
+      - id: upload-paths
+        shell: bash
+        run: |
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
           jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
-
-          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
         uses: actions/upload-artifact@v7
         with:
           name: artifacts-build-global
           path: |
-            ${{ steps.cargo-dist.outputs.paths }}
+            ${{ steps.upload-paths.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
   # Determines if we should publish/announce
   host:
