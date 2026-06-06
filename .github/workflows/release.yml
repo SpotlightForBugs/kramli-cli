@@ -112,10 +112,10 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
-      # BEGIN CUSTOM — macOS signing (cargo-dist reads these on macOS runners)
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      # BEGIN CUSTOM — macOS signing only on tag releases (never PR dry-runs)
+      APPLE_CERTIFICATE: ${{ needs.plan.outputs.publishing == 'true' && secrets.APPLE_CERTIFICATE || '' }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ needs.plan.outputs.publishing == 'true' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+      APPLE_SIGNING_IDENTITY: ${{ needs.plan.outputs.publishing == 'true' && secrets.APPLE_SIGNING_IDENTITY || '' }}
       # END CUSTOM
     permissions:
       "attestations": "write"
@@ -155,7 +155,7 @@ jobs:
           echo "dist ran successfully"
       # BEGIN CUSTOM — notarize signed macOS binaries before attest/upload
       - name: Notarize macOS artifacts
-        if: ${{ contains(matrix.runner, 'macos') }}
+        if: ${{ contains(matrix.runner, 'macos') && needs.plan.outputs.publishing == 'true' }}
         env:
           APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
           APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
