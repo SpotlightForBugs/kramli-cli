@@ -24,3 +24,5 @@ publish-jobs = ["homebrew"]
 signing = ["apple"]
 # GitHub artifact attestations for supply-chain verification
 github-attestations = true
+# Custom signing/notarize steps in release.yml
+allow-dirty = ["ci"]
