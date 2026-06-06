@@ -20,10 +20,10 @@ security delete-keychain "$KEYCHAIN_PATH" >/dev/null 2>&1 || true
 security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
 security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-security list-keychain -d user -s "$KEYCHAIN_PATH"
+security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH" >/dev/null
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+security list-keychain -d user -s "$KEYCHAIN_PATH" >/dev/null
 
 codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$bin"
-codesign --verify --verbose=2 "$bin"
-spctl -a -t exec -vv "$bin" || true
+codesign --verify --verbose=0 "$bin"
+echo "Signed $(basename "$bin") for notarization"
