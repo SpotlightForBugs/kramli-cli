@@ -361,9 +361,10 @@ jobs:
             brew style --except-cops FormulaAudit/Homepage,FormulaAudit/Desc,FormulaAuditStrict --fix "Formula/${filename}" || true
 
             git add "Formula/${filename}"
-            git commit -m "${name} ${version}"
+            git commit -m "${name} ${version}" || true
           done
-          git push
+          git pull --rebase origin main
+          git push origin main
 
   announce:
     needs:
