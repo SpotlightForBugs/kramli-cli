@@ -77,4 +77,7 @@ for archive in target/distrib/kramli-*-apple-darwin.tar.xz; do
   echo "Repacking $archive"
   rm -f "$archive"
   tar -cJf "$archive" -C "$stage" "$name"
+
+  archive_name="$(basename "$archive")"
+  shasum -a 256 "$archive" | awk -v f="$archive_name" '{print $1 " *" f}' > "${archive}.sha256"
 done
