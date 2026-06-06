@@ -1,0 +1,41 @@
+[package]
+name = "kramli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI client for the Kramli shopping & todo list app"
+license = "MIT"
+repository = "https://github.com/SpotlightForBugs/kramli-cli"
+homepage = "https://github.com/SpotlightForBugs/kramli-cli"
+readme = "README.md"
+keywords = ["kramli", "todo", "shopping-list", "cli"]
+categories = ["command-line-utilities"]
+
+[package.metadata.dist]
+formula = "kramli"
+
+[[bin]]
+name = "kramli"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+dirs = "6"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+colored = "3"
+dialoguer = "0.11"
+sentry = { version = "0.46", default-features = false, features = ["backtrace", "contexts", "debug-images", "panic", "release-health", "reqwest", "rustls"] }
+shell-words = "1"
+
+[profile.release]
+strip = true
+lto = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
