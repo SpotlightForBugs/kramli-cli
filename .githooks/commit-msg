@@ -3,7 +3,7 @@
 set -euo pipefail
 msg_file="${1:?commit-msg hook requires path to commit message file}"
 tmp="${msg_file}.scrubbed"
-grep -viE '^co-authored-by:[[:space:]]*cursor[[:space:]]*<cursoragent@cursor\.com>[[:space:]]*$' "$msg_file" > "$tmp" || true
+grep -viE '^co-authored-by:.*(<cursoragent@cursor\.com>|cursor[[:space:]]*<cursoragent@cursor\.com>)' "$msg_file" > "$tmp" || true
 if [[ -s "$tmp" ]]; then
   mv "$tmp" "$msg_file"
 else

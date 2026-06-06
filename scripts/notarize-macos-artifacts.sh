@@ -59,20 +59,7 @@ for archive in target/distrib/kramli-*-apple-darwin.tar.xz; do
     exit 1
   fi
 
-  echo "Stapling $bin"
-  stapled=0
-  for attempt in $(seq 1 12); do
-    if xcrun stapler staple "$bin"; then
-      stapled=1
-      break
-    fi
-    echo "Staple attempt $attempt failed (ticket may still be propagating), waiting 10s..."
-    sleep 10
-  done
-  if [[ "$stapled" -ne 1 ]]; then
-    echo "Warning: could not staple $name (Error 73 is common for bare CLI binaries)." >&2
-    echo "Notarization was Accepted; Gatekeeper validates online without a staple." >&2
-  fi
+  echo "Notarization accepted for $name (skipping staple; bare CLI binaries use online validation)"
 
   echo "Repacking $archive"
   rm -f "$archive"
