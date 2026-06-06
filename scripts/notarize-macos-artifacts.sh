@@ -22,7 +22,10 @@ for archive in target/distrib/kramli-*-apple-darwin.tar.xz; do
   mkdir -p "$stage"
   tar -xJf "$archive" -C "$stage"
 
-  bin="$stage/kramli"
+  bin="$stage/$name/kramli"
+  if [[ ! -f "$bin" ]]; then
+    bin="$(find "$stage" -maxdepth 2 -type f -name kramli | head -1)"
+  fi
   if [[ ! -f "$bin" ]]; then
     echo "No kramli binary in $archive" >&2
     exit 1
@@ -43,5 +46,5 @@ for archive in target/distrib/kramli-*-apple-darwin.tar.xz; do
 
   echo "Repacking $archive"
   rm -f "$archive"
-  tar -cJf "$archive" -C "$stage" kramli
+  tar -cJf "$archive" -C "$stage" "$name"
 done

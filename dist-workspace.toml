@@ -26,3 +26,7 @@ signing = ["apple"]
 github-attestations = true
 # Custom signing/notarize steps in release.yml
 allow-dirty = ["ci"]
+
+[dist.dependencies.apt]
+libdbus-1-dev = "*"
+pkg-config = "*"
