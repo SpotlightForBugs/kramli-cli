@@ -176,6 +176,13 @@ jobs:
         # inconsistent syntax between shell and powershell.
         shell: bash
         run: |
+          # Sync manifest checksums with sidecars (macOS notarization repacks archives).
+          if [[ -f dist-manifest.json ]]; then
+            python3 scripts/patch-dist-manifest-checksums.py \
+              --manifest dist-manifest.json \
+              --artifacts-dir target/distrib
+          fi
+
           # Parse out what we just built and upload it to scratch storage
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
           dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
@@ -217,6 +224,8 @@ jobs:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
+      - name: Patch manifest checksums from sidecars
+        run: bash scripts/patch-all-dist-manifest-checksums.sh target/distrib
       - id: cargo-dist
         shell: bash
         run: |
