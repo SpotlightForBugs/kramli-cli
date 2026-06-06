@@ -1,0 +1,10 @@
+---
+description: Never add Cursor as git co-author on kramli-cli commits
+alwaysApply: true
+---
+
+Do **not** add `Co-authored-by: Cursor <cursoragent@cursor.com>` (or any Cursor/cursoragent trailer) to commit messages in this repository.
+
+All commits should list only the human author unless another real collaborator explicitly co-authored the work.
+
+This repo ships `.githooks/commit-msg` to strip accidental Cursor trailers; run `git config core.hooksPath .githooks` after clone.

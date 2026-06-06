@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Notarize signed macOS release archives produced by cargo-dist.
-# Expects APPLE_NOTARY_KEY, APPLE_NOTARY_KEY_ID, APPLE_NOTARY_ISSUER.
+# Sign (if needed), notarize, and staple macOS release archives from cargo-dist.
 set -euo pipefail
 
 if [[ -z "${APPLE_NOTARY_KEY:-}" || -z "${APPLE_NOTARY_KEY_ID:-}" || -z "${APPLE_NOTARY_ISSUER:-}" ]]; then
@@ -31,15 +30,33 @@ for archive in target/distrib/kramli-*-apple-darwin.tar.xz; do
     exit 1
   fi
 
+  bash scripts/apple-codesign-binary.sh "$bin"
+
   zip_path="$WORKDIR/$name.zip"
   ditto -c -k --keepParent "$bin" "$zip_path"
 
   echo "Submitting $name for notarization..."
-  xcrun notarytool submit "$zip_path" \
+  submit_log="$WORKDIR/$name-notary.log"
+  if ! xcrun notarytool submit "$zip_path" \
     --key "$KEY_PATH" \
     --key-id "$APPLE_NOTARY_KEY_ID" \
     --issuer "$APPLE_NOTARY_ISSUER" \
-    --wait
+    --wait 2>&1 | tee "$submit_log"; then
+    echo "notarytool submit failed" >&2
+    exit 1
+  fi
+
+  submission_id="$(sed -n 's/^  id: //p' "$submit_log" | tail -1)"
+  if grep -q "status: Invalid" "$submit_log"; then
+    echo "Notarization rejected for $name" >&2
+    if [[ -n "$submission_id" ]]; then
+      xcrun notarytool log "$submission_id" \
+        --key "$KEY_PATH" \
+        --key-id "$APPLE_NOTARY_KEY_ID" \
+        --issuer "$APPLE_NOTARY_ISSUER" >&2 || true
+    fi
+    exit 1
+  fi
 
   echo "Stapling $bin"
   xcrun stapler staple "$bin"

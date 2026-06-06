@@ -33,6 +33,7 @@ Generate an API key at [kramli.de/settings#api-keys](https://kramli.de/settings#
 ## Development
 
 ```bash
+git config core.hooksPath .githooks   # once per clone — strips Cursor co-author trailers
 cargo test
 cargo run -- lists list
 ```

@@ -157,6 +157,9 @@ jobs:
       - name: Notarize macOS artifacts
         if: ${{ contains(matrix.runner, 'macos') && needs.plan.outputs.publishing == 'true' }}
         env:
+          APPLE_CERTIFICATE: ${{ needs.plan.outputs.publishing == 'true' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ needs.plan.outputs.publishing == 'true' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ needs.plan.outputs.publishing == 'true' && secrets.APPLE_SIGNING_IDENTITY || '' }}
           APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
           APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
@@ -310,7 +313,7 @@ jobs:
       PLAN: ${{ needs.plan.outputs.val }}
       GITHUB_USER: "github-actions[bot]"
       GITHUB_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
-    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+    if: ${{ (!fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases) && secrets.HOMEBREW_TAP_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v6
         with:
