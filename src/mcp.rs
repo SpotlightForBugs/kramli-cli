@@ -3,6 +3,7 @@ use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::api::ApiClient;
 use crate::config::Config;
+use crate::i18n::{tr, tr_args};
 use crate::models::{ListItem, ShoppingList};
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
@@ -55,7 +56,7 @@ async fn handle_message(message: Value) -> Option<Value> {
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
         "tools/call" => handle_tool_call(message.get("params").unwrap_or(&Value::Null)).await,
-        _ => return Some(error_response(id, -32601, "Method not found")),
+        _ => return Some(error_response(id, -32601, &tr("mcp-method-not-found"))),
     };
 
     match result {
@@ -70,7 +71,7 @@ async fn handle_tool_call(params: &Value) -> Result<Value, String> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
-        .ok_or_else(|| "Missing tool name.".to_string())?;
+        .ok_or_else(|| tr("mcp-tool-name-missing"))?;
     let args = params
         .get("arguments")
         .and_then(Value::as_object)
@@ -84,7 +85,7 @@ async fn handle_tool_call(params: &Value) -> Result<Value, String> {
         "update_item" => update_item(&api, &args).await,
         "toggle_item_done" => toggle_item_done(&api, &args).await,
         "delete_item" => delete_item(&api, &args).await,
-        _ => Err(format!("Unknown tool: {name}")),
+        _ => Err(tr_args("mcp-unknown-tool", &[("name", name.to_string())])),
     };
 
     Ok(match result {
@@ -177,7 +178,7 @@ async fn update_item(api: &ApiClient, args: &Map<String, Value>) -> Result<Value
         body.insert("assigned_to".to_string(), Value::Array(assigned_to));
     }
     if body.is_empty() {
-        return Err("No changes specified.".to_string());
+        return Err(tr("mcp-no-changes"));
     }
 
     api.put(&format!("/items/{id}"), &Value::Object(body)).await
@@ -195,7 +196,8 @@ async fn delete_item(api: &ApiClient, args: &Map<String, Value>) -> Result<Value
 }
 
 fn required_i64(args: &Map<String, Value>, name: &str) -> Result<i64, String> {
-    optional_i64(args, name)?.ok_or_else(|| format!("Missing required argument: {name}"))
+    optional_i64(args, name)
+        .and_then(|v| v.ok_or_else(|| tr_args("mcp-required-argument", &[("name", name.into())])))
 }
 
 fn optional_i64(args: &Map<String, Value>, name: &str) -> Result<Option<i64>, String> {
@@ -204,25 +206,29 @@ fn optional_i64(args: &Map<String, Value>, name: &str) -> Result<Option<i64>, St
         Some(Value::Number(number)) => number
             .as_i64()
             .map(Some)
-            .ok_or_else(|| format!("Argument {name} must be an integer.")),
+            .ok_or_else(|| tr_args("mcp-argument-must-int", &[("name", name.into())])),
         Some(Value::String(value)) => value
             .trim()
             .parse::<i64>()
             .map(Some)
-            .map_err(|_| format!("Argument {name} must be an integer.")),
-        _ => Err(format!("Argument {name} must be an integer.")),
+            .map_err(|_| tr_args("mcp-argument-must-int", &[("name", name.into())])),
+        _ => Err(tr_args("mcp-argument-must-int", &[("name", name.into())])),
     }
 }
 
 fn required_string(args: &Map<String, Value>, name: &str) -> Result<String, String> {
-    optional_string(args, name)?.ok_or_else(|| format!("Missing required argument: {name}"))
+    optional_string(args, name)
+        .and_then(|v| v.ok_or_else(|| tr_args("mcp-required-argument", &[("name", name.into())])))
 }
 
 fn optional_string(args: &Map<String, Value>, name: &str) -> Result<Option<String>, String> {
     match args.get(name) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.trim().to_string()).filter(|v| !v.is_empty())),
-        _ => Err(format!("Argument {name} must be a string.")),
+        _ => Err(tr_args(
+            "mcp-argument-must-string",
+            &[("name", name.into())],
+        )),
     }
 }
 
@@ -230,7 +236,7 @@ fn optional_bool(args: &Map<String, Value>, name: &str) -> Result<Option<bool>, 
     match args.get(name) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
-        _ => Err(format!("Argument {name} must be true or false.")),
+        _ => Err(tr_args("mcp-argument-must-bool", &[("name", name.into())])),
     }
 }
 
@@ -246,11 +252,14 @@ fn optional_string_array(
     }
     let array = value
         .as_array()
-        .ok_or_else(|| format!("Argument {name} must be an array of strings."))?;
+        .ok_or_else(|| tr_args("mcp-argument-must-string-array", &[("name", name.into())]))?;
     let mut values = Vec::new();
     for item in array {
         let Some(text) = item.as_str() else {
-            return Err(format!("Argument {name} must be an array of strings."));
+            return Err(tr_args(
+                "mcp-argument-must-string-array",
+                &[("name", name.into())],
+            ));
         };
         let trimmed = text.trim();
         if !trimmed.is_empty() {
@@ -269,11 +278,14 @@ fn optional_i64_array(args: &Map<String, Value>, name: &str) -> Result<Option<Ve
     }
     let array = value
         .as_array()
-        .ok_or_else(|| format!("Argument {name} must be an array of integers."))?;
+        .ok_or_else(|| tr_args("mcp-argument-must-int-array", &[("name", name.into())]))?;
     let mut values = Vec::new();
     for item in array {
         let Some(id) = item.as_i64() else {
-            return Err(format!("Argument {name} must be an array of integers."));
+            return Err(tr_args(
+                "mcp-argument-must-int-array",
+                &[("name", name.into())],
+            ));
         };
         values.push(Value::from(id));
     }
@@ -331,13 +343,13 @@ async fn read_message<R: AsyncRead + Unpin>(
         let bytes_read = reader
             .read(&mut chunk)
             .await
-            .map_err(|e| format!("Could not read MCP message: {e}"))?;
+            .map_err(|e| tr_args("mcp-read-message-error", &[("error", e.to_string())]))?;
         if bytes_read == 0 {
             if buffer.iter().all(u8::is_ascii_whitespace) {
                 buffer.clear();
                 return Ok(None);
             }
-            return Err("Incomplete MCP message.".to_string());
+            return Err(tr("mcp-incomplete-message"));
         }
         buffer.extend_from_slice(&chunk[..bytes_read]);
     }
@@ -353,8 +365,8 @@ fn try_parse_message(buffer: &mut Vec<u8>) -> Result<Option<IncomingMessage>, St
         let Some((header_end, separator_len)) = find_header_end(buffer) else {
             return Ok(None);
         };
-        let headers = std::str::from_utf8(&buffer[..header_end])
-            .map_err(|_| "MCP headers must be UTF-8.".to_string())?;
+        let headers =
+            std::str::from_utf8(&buffer[..header_end]).map_err(|_| tr("mcp-header-not-utf8"))?;
         let length = content_length(headers)?;
         let body_start = header_end + separator_len;
         let body_end = body_start + length;
@@ -363,8 +375,8 @@ fn try_parse_message(buffer: &mut Vec<u8>) -> Result<Option<IncomingMessage>, St
         }
         let body = buffer[body_start..body_end].to_vec();
         buffer.drain(..body_end);
-        let value =
-            serde_json::from_slice(&body).map_err(|e| format!("Invalid MCP JSON body: {e}"))?;
+        let value = serde_json::from_slice(&body)
+            .map_err(|e| tr_args("mcp-invalid-json-body", &[("error", e.to_string())]))?;
         return Ok(Some(IncomingMessage {
             value,
             framing: MessageFraming::ContentLength,
@@ -377,8 +389,8 @@ fn try_parse_message(buffer: &mut Vec<u8>) -> Result<Option<IncomingMessage>, St
         if trimmed.is_empty() {
             return Ok(None);
         }
-        let value =
-            serde_json::from_str(&trimmed).map_err(|e| format!("Invalid MCP JSON line: {e}"))?;
+        let value = serde_json::from_str(&trimmed)
+            .map_err(|e| tr_args("mcp-invalid-json-line", &[("error", e.to_string())]))?;
         return Ok(Some(IncomingMessage {
             value,
             framing: MessageFraming::JsonLine,
@@ -398,30 +410,30 @@ async fn write_message<W: AsyncWrite + Unpin>(
         writer
             .write_all(&body)
             .await
-            .map_err(|e| format!("Could not write MCP response: {e}"))?;
+            .map_err(|e| tr_args("mcp-write-response-error", &[("error", e.to_string())]))?;
         writer
             .write_all(b"\n")
             .await
-            .map_err(|e| format!("Could not write MCP response: {e}"))?;
+            .map_err(|e| tr_args("mcp-write-response-error", &[("error", e.to_string())]))?;
         return writer
             .flush()
             .await
-            .map_err(|e| format!("Could not flush MCP response: {e}"));
+            .map_err(|e| tr_args("mcp-flush-response-error", &[("error", e.to_string())]));
     }
 
     let header = format!("Content-Length: {}\r\n\r\n", body.len());
     writer
         .write_all(header.as_bytes())
         .await
-        .map_err(|e| format!("Could not write MCP response: {e}"))?;
+        .map_err(|e| tr_args("mcp-write-response-error", &[("error", e.to_string())]))?;
     writer
         .write_all(&body)
         .await
-        .map_err(|e| format!("Could not write MCP response: {e}"))?;
+        .map_err(|e| tr_args("mcp-write-response-error", &[("error", e.to_string())]))?;
     writer
         .flush()
         .await
-        .map_err(|e| format!("Could not flush MCP response: {e}"))
+        .map_err(|e| tr_args("mcp-flush-response-error", &[("error", e.to_string())]))
 }
 
 fn trim_leading_ascii_whitespace(buffer: &mut Vec<u8>) {
@@ -455,17 +467,17 @@ fn content_length(headers: &str) -> Result<usize, String> {
             return value
                 .trim()
                 .parse::<usize>()
-                .map_err(|_| "Invalid Content-Length header.".to_string());
+                .map_err(|_| tr("mcp-invalid-content-length"));
         }
     }
-    Err("Missing Content-Length header.".to_string())
+    Err(tr("mcp-missing-content-length"))
 }
 
 fn tools() -> Vec<Value> {
     vec![
         json!({
             "name": "list_lists",
-            "description": "List all Kramli lists visible to the CLI user.",
+            "description": tr("mcp-tool-list-lists"),
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -474,7 +486,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "list_items",
-            "description": "List items in one Kramli list.",
+            "description": tr("mcp-tool-list-items"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -490,7 +502,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "create_item",
-            "description": "Create an item in a Kramli list.",
+            "description": tr("mcp-tool-create-item"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -510,7 +522,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_item",
-            "description": "Update fields on an existing Kramli item.",
+            "description": tr("mcp-tool-update-item"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -531,7 +543,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "toggle_item_done",
-            "description": "Toggle a Kramli item between open and done.",
+            "description": tr("mcp-tool-toggle-item"),
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "integer"}},
@@ -541,7 +553,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "delete_item",
-            "description": "Delete a Kramli item.",
+            "description": tr("mcp-tool-delete-item"),
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "integer"}},

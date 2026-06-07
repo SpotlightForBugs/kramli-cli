@@ -1,6 +1,7 @@
 mod api;
 mod cli;
 mod config;
+mod i18n;
 mod mcp;
 mod models;
 mod output;
@@ -8,6 +9,7 @@ mod telemetry;
 
 use clap::Parser;
 use cli::Cli;
+use i18n::tr;
 
 #[tokio::main]
 async fn main() {
@@ -34,7 +36,7 @@ async fn main() {
         if _guard.is_some() {
             sentry::capture_message(&telemetry::scrub_message(&e), sentry::Level::Error);
         }
-        eprintln!("\x1b[31merror:\x1b[0m {e}");
+        eprintln!("\x1b[31m{}\x1b[0m {e}", tr("main-error-prefix"));
         std::process::exit(1);
     }
 }

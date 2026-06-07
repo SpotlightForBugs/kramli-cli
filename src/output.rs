@@ -1,49 +1,219 @@
 use colored::Colorize;
 
+use crate::i18n::{tr, tr_args};
 use crate::models::{
     ActivityEntry, Folder, ItemComment, ListItem, Member, SearchResults, ShoppingList,
 };
+
+#[derive(Copy, Clone)]
+enum IconStyle {
+    Label,
+    Emoji,
+    Raw,
+}
+
+fn icon_style() -> IconStyle {
+    match std::env::var("KRAMLI_ICON_STYLE")
+        .ok()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "emoji" => IconStyle::Emoji,
+        "raw" => IconStyle::Raw,
+        _ => IconStyle::Label,
+    }
+}
+
+fn parse_hex_color(input: &str) -> Option<(u8, u8, u8)> {
+    let hex = input.trim().trim_start_matches('#');
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some((r, g, b))
+}
+
+fn map_bootstrap_icon_emoji(icon: &str, fallback: &str) -> String {
+    match icon {
+        "bi-cart-fill" => "🛒".to_string(),
+        "bi-egg-fried" => "🍳".to_string(),
+        "bi-people-fill" => "👥".to_string(),
+        "bi-tag" => "🏷️".to_string(),
+        "bi-tools" => "🛠️".to_string(),
+        "bi-paperclip" => "📎".to_string(),
+        "bi-book-fill" => "📚".to_string(),
+        "bi-check-circle-fill" => "✅".to_string(),
+        "bi-fire" => "🔥".to_string(),
+        "bi-cup-hot" => "☕".to_string(),
+        "bi-folder2" => "📁".to_string(),
+        _ => fallback.to_string(),
+    }
+}
+
+fn map_bootstrap_icon_label(icon: &str, fallback_name: &str) -> String {
+    let label = match icon {
+        "bi-cart-fill" => "cart",
+        "bi-egg-fried" => "food",
+        "bi-people-fill" => "team",
+        "bi-tag" => "tag",
+        "bi-tools" => "tools",
+        "bi-paperclip" => "clip",
+        "bi-book-fill" => "book",
+        "bi-check-circle-fill" => "done",
+        "bi-fire" => "fire",
+        "bi-cup-hot" => "coffee",
+        "bi-folder2" => "folder",
+        _ => {
+            let stripped = icon.strip_prefix("bi-").unwrap_or(icon);
+            if stripped.is_empty() {
+                fallback_name
+            } else {
+                stripped
+            }
+        }
+    };
+    format!("[{label}]")
+}
+
+fn fallback_icon(style: IconStyle, fallback_name: &str) -> String {
+    match style {
+        IconStyle::Emoji => match fallback_name {
+            "folder" => "📁".to_string(),
+            _ => "📋".to_string(),
+        },
+        IconStyle::Raw | IconStyle::Label => format!("[{fallback_name}]"),
+    }
+}
+
+fn display_icon(raw: Option<&str>, fallback_name: &str) -> String {
+    let style = icon_style();
+    let Some(icon) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return fallback_icon(style, fallback_name);
+    };
+
+    if icon.starts_with("bi-") {
+        return match style {
+            IconStyle::Emoji => {
+                map_bootstrap_icon_emoji(icon, &fallback_icon(style, fallback_name))
+            }
+            IconStyle::Raw => icon.to_string(),
+            IconStyle::Label => map_bootstrap_icon_label(icon, fallback_name),
+        };
+    }
+
+    icon.to_string()
+}
+
+fn color_dot(raw: Option<&str>) -> String {
+    let Some(color) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return String::new();
+    };
+
+    match parse_hex_color(color) {
+        Some((r, g, b)) => format!(" {}", "●".truecolor(r, g, b)),
+        None => String::new(),
+    }
+}
+
+fn colorize_text(raw: Option<&str>, text: &str) -> String {
+    match raw.and_then(parse_hex_color) {
+        Some((r, g, b)) => text.truecolor(r, g, b).to_string(),
+        None => text.to_string(),
+    }
+}
+
+fn colorize_bold_text(raw: Option<&str>, text: &str) -> String {
+    match raw.and_then(parse_hex_color) {
+        Some((r, g, b)) => text.bold().truecolor(r, g, b).to_string(),
+        None => text.bold().to_string(),
+    }
+}
+
+fn role_label(raw: &str) -> String {
+    match raw {
+        "owner" => tr("role-owner"),
+        "admin" => tr("role-admin"),
+        "editor" => tr("role-editor"),
+        "viewer" => tr("role-viewer"),
+        _ => raw.to_string(),
+    }
+}
+
+fn view_mode_label(raw: &str) -> String {
+    match raw {
+        "list" => tr("view-list"),
+        "board" => tr("view-board"),
+        "calendar" => tr("view-calendar"),
+        "timeline" => tr("view-timeline"),
+        _ => raw.to_string(),
+    }
+}
+
+fn member_type_label(raw: &str) -> String {
+    match raw {
+        "member" => tr("member-type-member"),
+        "invite" => tr("member-type-invite"),
+        _ => raw.to_string(),
+    }
+}
+
+fn activity_action_label(raw: &str) -> String {
+    match raw {
+        "item_created" => tr("activity-item-created"),
+        "item_updated" => tr("activity-item-updated"),
+        "item_deleted" => tr("activity-item-deleted"),
+        "item_done_toggled" => tr("activity-item-toggled"),
+        "item_commented" => tr("activity-item-commented"),
+        "list_updated" => tr("activity-list-updated"),
+        "member_invited" => tr("activity-member-invited"),
+        "member_removed" => tr("activity-member-removed"),
+        _ => raw.to_string(),
+    }
+}
 
 // ── Lists ──
 
 pub fn print_lists(lists: &[ShoppingList]) {
     if lists.is_empty() {
-        println!("{}", "No lists found.".dimmed());
+        println!("{}", tr("output-no-lists").dimmed());
         return;
     }
     for l in lists {
-        let icon = l.icon.as_deref().unwrap_or("📋");
+        let icon = colorize_text(l.color.as_deref(), &display_icon(l.icon.as_deref(), "list"));
+        let name = colorize_bold_text(l.color.as_deref(), &l.name);
         let done = l.done_count.unwrap_or(0);
         let total = l.item_count.unwrap_or(0);
         let role = l.role.as_deref().unwrap_or("");
         let role_badge = if role == "owner" {
             "".to_string()
         } else {
-            format!(" ({})", role.dimmed())
+            format!(" ({})", role_label(role).dimmed())
         };
-        let color_dot = match l.color.as_deref() {
-            Some(c) => format!("[{}] ", c),
-            None => String::new(),
-        };
+        let color_badge = color_dot(l.color.as_deref());
         println!(
-            "  {icon} {color_dot}{:<36} {done:>3}/{total:<3}  #{}{role_badge}",
-            l.name.bold(),
-            l.id,
+            "  {icon} {:<36} {done:>3}/{total:<3}  #{}{role_badge}{color_badge}",
+            name, l.id,
         );
     }
 }
 
 pub fn print_list_detail(l: &ShoppingList) {
-    let icon = l.icon.as_deref().unwrap_or("📋");
-    println!("{icon}  {} (#{}) ", l.name.bold(), l.id);
+    let icon = colorize_text(l.color.as_deref(), &display_icon(l.icon.as_deref(), "list"));
+    let name = colorize_bold_text(l.color.as_deref(), &l.name);
+    println!("{icon}  {name} (#{}) ", l.id);
     if let Some(ref c) = l.color {
-        println!("   Color:     {c}");
+        let dot = color_dot(Some(c));
+        println!("   {}:     {c}{dot}", tr("label-color"));
     }
     if let Some(ref vm) = l.view_mode {
-        println!("   View:      {vm}");
+        println!("   {}:   {}", tr("label-view"), view_mode_label(vm));
     }
     if let Some(ref r) = l.role {
-        println!("   Role:      {r}");
+        println!("   {}:     {}", tr("label-role"), role_label(r));
     }
     if let Some(ref states) = l.states {
         let names: Vec<String> = states
@@ -61,15 +231,22 @@ pub fn print_list_detail(l: &ShoppingList) {
             })
             .collect();
         if !names.is_empty() {
-            println!("   States:    {}", names.join(" | "));
+            println!("   {}:    {}", tr("label-states"), names.join(" | "));
         }
     }
     if let Some(fid) = l.folder_id {
-        println!("   Folder ID: {fid}");
+        println!("   {}: {fid}", tr("label-folder-id"));
     }
     let done = l.done_count.unwrap_or(0);
     let total = l.item_count.unwrap_or(0);
-    println!("   Items:     {done}/{total} done");
+    println!(
+        "   {}:  {}",
+        tr("label-items"),
+        tr_args(
+            "items-done-ratio",
+            &[("done", done.to_string()), ("total", total.to_string())],
+        )
+    );
 }
 
 // ── Items ──
@@ -131,23 +308,24 @@ pub fn print_item_detail(item: &ListItem, comments: &[ItemComment]) {
 
     if let Some(ref q) = item.quantity {
         if !q.is_empty() {
-            println!("  {}  {q}", "Quantity:".dimmed());
+            println!("  {}  {q}", tr("label-quantity").dimmed());
         }
     }
     if let Some(ref d) = item.due_date {
-        println!("  {}  {}", "Due:".dimmed(), d.yellow());
+        println!("  {}  {}", tr("label-due").dimmed(), d.yellow());
     }
     if let Some(ref d) = item.planned_date {
-        println!("  {}  {d}", "Planned:".dimmed());
+        println!("  {}  {d}", tr("label-planned").dimmed());
     }
     if let Some(ref r) = item.repeat_label {
-        println!("  {}  {r}", "Repeat:".dimmed());
+        println!("  {}  {r}", tr("label-repeat").dimmed());
     }
     if let Some(ref p) = item.progress {
-        println!("  {}  {p}", "State:".dimmed());
+        println!("  {}  {p}", tr("label-state").dimmed());
     }
     if let Some(ref c) = item.color {
-        println!("  {}  {c}", "Color:".dimmed());
+        let dot = color_dot(Some(c));
+        println!("  {}  {c}{dot}", tr("label-color").dimmed());
     }
     if let Some(ref tags) = item.tags {
         if !tags.is_empty() {
@@ -155,19 +333,19 @@ pub fn print_item_detail(item: &ListItem, comments: &[ItemComment]) {
                 .iter()
                 .map(|t| format!("#{t}").cyan().to_string())
                 .collect();
-            println!("  {}  {}", "Tags:".dimmed(), t.join("  "));
+            println!("  {}  {}", tr("label-tags").dimmed(), t.join("  "));
         }
     }
     if let Some(ref assigned) = item.assigned_to {
         if !assigned.is_empty() {
             let ids: Vec<String> = assigned.iter().map(|id| id.to_string()).collect();
-            println!("  {}  {}", "Assigned:".dimmed(), ids.join(", "));
+            println!("  {}  {}", tr("label-assigned").dimmed(), ids.join(", "));
         }
     }
     if let Some(ref notes) = item.notes {
         let plain = strip_html(notes);
         if !plain.trim().is_empty() {
-            println!("  {}", "Notes:".magenta());
+            println!("  {}", tr("label-notes").magenta());
             for line in plain.lines() {
                 println!("    {line}");
             }
@@ -175,15 +353,15 @@ pub fn print_item_detail(item: &ListItem, comments: &[ItemComment]) {
     }
     if let Some(ref tldr) = item.tldr {
         if !tldr.is_empty() {
-            println!("  {}  {tldr}", "TLDR:".blue());
+            println!("  {}  {tldr}", tr("label-tldr").blue());
         }
     }
     if let Some(ref url) = item.image_url {
-        println!("  {}  {url}", "Image:".dimmed());
+        println!("  {}  {url}", tr("label-image").dimmed());
     }
     if let Some(ref atts) = item.attachments {
         if !atts.is_empty() {
-            println!("  {} ({})", "Attachments:".dimmed(), atts.len());
+            println!("  {} ({})", tr("label-attachments").dimmed(), atts.len());
             for a in atts {
                 let name = a
                     .original_filename
@@ -198,16 +376,16 @@ pub fn print_item_detail(item: &ListItem, comments: &[ItemComment]) {
     }
     if let Some(ref created) = item.created_at {
         let display = &created[..created.len().min(16)];
-        println!("  {}  {display}", "Created:".dimmed());
+        println!("  {}  {display}", tr("label-created").dimmed());
     }
     if let Some(ref updated) = item.updated_at {
         let display = &updated[..updated.len().min(16)];
-        println!("  {}  {display}", "Updated:".dimmed());
+        println!("  {}  {display}", tr("label-updated").dimmed());
     }
     // Comments
     if !comments.is_empty() {
         println!();
-        println!("  {} ({})", "Comments:".bold(), comments.len());
+        println!("  {} ({})", tr("label-comments").bold(), comments.len());
         for c in comments {
             let who = c
                 .user_name
@@ -228,7 +406,7 @@ pub fn print_item_detail(item: &ListItem, comments: &[ItemComment]) {
 
 pub fn print_items(items: &[ListItem]) {
     if items.is_empty() {
-        println!("{}", "No items.".dimmed());
+        println!("{}", tr("output-no-items").dimmed());
         return;
     }
     for i in items {
@@ -249,7 +427,7 @@ pub fn print_items(items: &[ListItem]) {
             _ => String::new(),
         };
         let due = match &i.due_date {
-            Some(d) => format!("  due: {}", d.yellow()),
+            Some(d) => format!("  {}: {}", tr("label-due-lower"), d.yellow()),
             None => String::new(),
         };
         let tags_str = match &i.tags {
@@ -270,7 +448,7 @@ pub fn print_items(items: &[ListItem]) {
         let text = if i.is_done.unwrap_or(false) {
             i.text.dimmed().strikethrough().to_string()
         } else {
-            i.text.to_string()
+            colorize_text(i.color.as_deref(), &i.text)
         };
         println!(
             "  {indent}{check} {text}{pri}{qty}{sub}{progress}{due}{tags_str}  (#{id})",
@@ -283,12 +461,17 @@ pub fn print_items(items: &[ListItem]) {
 
 pub fn print_folders(folders: &[Folder]) {
     if folders.is_empty() {
-        println!("{}", "No folders.".dimmed());
+        println!("{}", tr("output-no-folders").dimmed());
         return;
     }
     for f in folders {
-        let icon = f.icon.as_deref().unwrap_or("📁");
-        println!("  {icon} {:<36} #{}", f.name.bold(), f.id);
+        let icon = colorize_text(
+            f.color.as_deref(),
+            &display_icon(f.icon.as_deref(), "folder"),
+        );
+        let name = colorize_bold_text(f.color.as_deref(), &f.name);
+        let color_badge = color_dot(f.color.as_deref());
+        println!("  {icon} {:<36} #{}{color_badge}", name, f.id);
     }
 }
 
@@ -296,20 +479,27 @@ pub fn print_folders(folders: &[Folder]) {
 
 pub fn print_members(members: &[Member]) {
     if members.is_empty() {
-        println!("{}", "No members.".dimmed());
+        println!("{}", tr("output-no-members").dimmed());
         return;
     }
     for m in members {
-        let name = m.display_name.as_deref().unwrap_or("(unknown)");
+        let name = m
+            .display_name
+            .clone()
+            .unwrap_or_else(|| tr("common-unknown"));
         let email = m.email.as_deref().unwrap_or("");
         let role = m.role.as_deref().unwrap_or("?");
         let kind = m.member_type.as_deref().unwrap_or("member");
         let badge = if kind == "invite" {
-            " (invited)".yellow().to_string()
+            format!(" ({})", tr("member-invited")).yellow().to_string()
         } else {
             String::new()
         };
-        println!("  {name:<24} {email:<30} [{role}]{badge}");
+        println!(
+            "  {name:<24} {email:<30} [{} | {}]{badge}",
+            role_label(role),
+            member_type_label(kind)
+        );
     }
 }
 
@@ -320,17 +510,20 @@ pub fn print_search(results: &SearchResults) {
     if let Some(ref lists) = results.lists {
         if !lists.is_empty() {
             any = true;
-            println!("{}", "Lists:".bold().underline());
+            println!("{}", tr("label-lists").bold().underline());
             for l in lists {
-                let icon = l.icon.as_deref().unwrap_or("📋");
-                println!("  {icon} {} (#{}) ", l.name, l.id);
+                let icon =
+                    colorize_text(l.color.as_deref(), &display_icon(l.icon.as_deref(), "list"));
+                let name = colorize_text(l.color.as_deref(), &l.name);
+                let color_badge = color_dot(l.color.as_deref());
+                println!("  {icon} {name} (#{}){color_badge} ", l.id);
             }
         }
     }
     if let Some(ref items) = results.items {
         if !items.is_empty() {
             any = true;
-            println!("{}", "Items:".bold().underline());
+            println!("{}", tr("label-items").bold().underline());
             for i in items {
                 let check = if i.is_done.unwrap_or(false) {
                     "✓"
@@ -338,12 +531,17 @@ pub fn print_search(results: &SearchResults) {
                     "○"
                 };
                 let ln = i.list_name.as_deref().unwrap_or("?");
-                println!("  {check} {} (#{}) in {ln}", i.text, i.id);
+                println!(
+                    "  {check} {} (#{}) {}",
+                    i.text,
+                    i.id,
+                    tr_args("search-in-list", &[("list", ln.to_string())])
+                );
             }
         }
     }
     if !any {
-        println!("{}", "No results.".dimmed());
+        println!("{}", tr("output-no-results").dimmed());
     }
 }
 
@@ -356,13 +554,44 @@ fn activity_detail_text(detail: Option<&serde_json::Value>) -> String {
     match detail {
         serde_json::Value::Null => String::new(),
         serde_json::Value::String(s) => s.clone(),
-        _ => serde_json::to_string(detail).unwrap_or_default(),
+        serde_json::Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(serde_json::Value::as_str) {
+                return format!("{}: {text}", tr("label-text"));
+            }
+            if let Some(changes) = map.get("changes").and_then(serde_json::Value::as_array) {
+                let entries: Vec<String> = changes
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect();
+                if !entries.is_empty() {
+                    return format!("{}: {}", tr("label-changes"), entries.join("; "));
+                }
+            }
+
+            let pairs: Vec<String> = map
+                .iter()
+                .map(|(key, value)| {
+                    let rendered = value
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| value.to_string());
+                    format!("{key}={rendered}")
+                })
+                .collect();
+            if pairs.is_empty() {
+                String::new()
+            } else {
+                pairs.join(", ")
+            }
+        }
+        _ => detail.to_string(),
     }
 }
 
 pub fn print_activity(entries: &[ActivityEntry]) {
     if entries.is_empty() {
-        println!("{}", "No activity.".dimmed());
+        println!("{}", tr("output-no-activity").dimmed());
         return;
     }
     for a in entries {
@@ -371,7 +600,11 @@ pub fn print_activity(entries: &[ActivityEntry]) {
             .as_deref()
             .or(a.user_name.as_deref())
             .unwrap_or("?");
-        let action = a.action.as_deref().unwrap_or("?");
+        let action = a
+            .action
+            .as_deref()
+            .map(activity_action_label)
+            .unwrap_or_else(|| "?".to_string());
         let detail = activity_detail_text(a.detail.as_ref());
         let when = a.created_at.as_deref().unwrap_or("");
         println!(

@@ -1,13 +1,14 @@
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE, RETRY_AFTER};
 use reqwest::{Client, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::Config;
+use crate::i18n::{current_locale_code, tr_args};
 use crate::models::ApiError;
 
 pub struct ApiClient {
@@ -29,7 +30,7 @@ impl ApiClient {
         Self::ensure_secure_base_url(&base_url)?;
         let client = Client::builder()
             .build()
-            .map_err(|e| format!("HTTP client error: {e}"))?;
+            .map_err(|e| tr_args("api-http-client-error", &[("error", e.to_string())]))?;
         Ok(Self {
             client,
             base_url,
@@ -58,10 +59,14 @@ impl ApiClient {
         if is_loopback {
             return Ok(());
         }
-        Err(format!(
-            "Refusing to send your API key over plaintext HTTP to '{host_only}'. \
-             Use an https:// server URL (plain http:// is only allowed for localhost)."
+        Err(tr_args(
+            "api-insecure-http",
+            &[("host", host_only.to_string())],
         ))
+    }
+
+    fn preferred_language() -> String {
+        current_locale_code()
     }
 
     fn read_rate_limit_interval() -> Duration {
@@ -114,7 +119,7 @@ impl ApiClient {
             let resp = build_request()
                 .send()
                 .await
-                .map_err(|e| format!("Network error: {e}"))?;
+                .map_err(|e| tr_args("api-network-error", &[("error", e.to_string())]))?;
 
             if resp.status() != StatusCode::TOO_MANY_REQUESTS {
                 return Ok(resp);
@@ -134,6 +139,9 @@ impl ApiClient {
         if let Ok(v) = HeaderValue::from_str(&self.api_key) {
             h.insert("X-API-Key", v);
         }
+        if let Ok(v) = HeaderValue::from_str(&Self::preferred_language()) {
+            h.insert(ACCEPT_LANGUAGE, v);
+        }
         h
     }
 
@@ -145,18 +153,27 @@ impl ApiClient {
         let status = resp.status();
         if status.is_success() {
             let text = resp.text().await.map_err(|e| e.to_string())?;
-            serde_json::from_str::<T>(&text)
-                .map_err(|e| format!("Could not parse response: {e}\nBody: {text}"))
+            serde_json::from_str::<T>(&text).map_err(|e| {
+                tr_args(
+                    "api-parse-response-error",
+                    &[("error", e.to_string()), ("body", text.clone())],
+                )
+            })
         } else {
             let text = resp.text().await.unwrap_or_default();
             if let Ok(err) = serde_json::from_str::<ApiError>(&text) {
-                Err(format!(
-                    "API error ({}): {}",
-                    status.as_u16(),
-                    err.error.unwrap_or(text)
+                Err(tr_args(
+                    "api-error",
+                    &[
+                        ("status", status.as_u16().to_string()),
+                        ("message", err.error.unwrap_or(text)),
+                    ],
                 ))
             } else {
-                Err(format!("API error ({}): {}", status.as_u16(), text))
+                Err(tr_args(
+                    "api-error",
+                    &[("status", status.as_u16().to_string()), ("message", text)],
+                ))
             }
         }
     }
@@ -269,7 +286,10 @@ impl ApiClient {
             Ok(true)
         } else {
             let text = resp.text().await.unwrap_or_default();
-            Err(format!("API error ({}): {}", status.as_u16(), text))
+            Err(tr_args(
+                "api-error",
+                &[("status", status.as_u16().to_string()), ("message", text)],
+            ))
         }
     }
 }

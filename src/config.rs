@@ -6,6 +6,8 @@ use std::process::Command;
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::{tr, tr_args};
+
 const DEFAULT_BASE_URL: &str = "https://kramli.de";
 const KEYRING_SERVICE: &str = "kramli-cli";
 const KEYRING_API_KEY: &str = "api-key";
@@ -46,17 +48,18 @@ impl Config {
         let path = Self::path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
-                .map_err(|e| format!("Could not create config directory: {e}"))?;
+                .map_err(|e| tr_args("config-create-dir-error", &[("error", e.to_string())]))?;
         }
         let data = serde_json::to_string_pretty(&self.file).map_err(|e| e.to_string())?;
-        fs::write(&path, &data).map_err(|e| format!("Could not save config: {e}"))?;
+        fs::write(&path, &data)
+            .map_err(|e| tr_args("config-save-error", &[("error", e.to_string())]))?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o600);
             fs::set_permissions(&path, perms)
-                .map_err(|e| format!("Could not set file permissions: {e}"))?;
+                .map_err(|e| tr_args("config-permissions-error", &[("error", e.to_string())]))?;
         }
         Ok(())
     }
@@ -83,7 +86,8 @@ impl Config {
     // ── Keychain-backed API key (env override: KRAMLI_API_KEY) ──
 
     fn keyring_entry(key: &str) -> Result<Entry, String> {
-        Entry::new(KEYRING_SERVICE, key).map_err(|e| format!("Keychain error: {e}"))
+        Entry::new(KEYRING_SERVICE, key)
+            .map_err(|e| tr_args("config-keychain-error", &[("error", e.to_string())]))
     }
 
     fn keychain_api_key() -> Result<Option<String>, String> {
@@ -104,7 +108,10 @@ impl Config {
                         return Ok(Some(key));
                     }
                 }
-                Err(format!("Could not read API key from keychain: {error}"))
+                Err(tr_args(
+                    "config-read-key-error",
+                    &[("error", error.to_string())],
+                ))
             }
         }
     }
@@ -147,7 +154,7 @@ impl Config {
     pub fn set_api_key(&self, key: &str) -> Result<(), String> {
         Self::keyring_entry(KEYRING_API_KEY)?
             .set_password(key)
-            .map_err(|e| format!("Could not store API key in keychain: {e}"))
+            .map_err(|e| tr_args("config-store-key-error", &[("error", e.to_string())]))
     }
 
     pub fn delete_api_key(&self) -> Result<(), String> {
@@ -165,7 +172,7 @@ impl Config {
         }
         match Self::keychain_api_key()? {
             Some(key) => Ok(key),
-            None => Err("Not logged in. Run `kramli login` or set KRAMLI_API_KEY.".into()),
+            None => Err(tr("config-not-logged-in")),
         }
     }
 

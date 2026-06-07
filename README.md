@@ -51,6 +51,22 @@ kramli search "dark mode"
 
 Create an API key at [kramli.de/settings#api-keys](https://kramli.de/settings#api-keys) if you prefer `kramli login --api-key`.
 
+## Localization
+
+- Default/fallback language is English (`en`).
+- Locale priority: `KRAMLI_LANG` -> profile language (`/api/profile.lang`) -> `LC_ALL` -> `LC_MESSAGES` -> `LANG` -> `en`.
+- Supported language codes: `en`, `de`, `fr`, `es`, `it`, `nl`, `pl`, `pt`, `ru`, `tr`, `uk`, `ar`, `ja`, `ko`, `zh`.
+- Icon style for terminal output: `KRAMLI_ICON_STYLE=label` (default), `emoji`, or `raw`.
+
+Examples:
+
+```bash
+KRAMLI_LANG=de kramli status
+KRAMLI_LANG=fr kramli lists list
+KRAMLI_LANG=pt_BR kramli profile
+KRAMLI_ICON_STYLE=emoji kramli lists list
+```
+
 ## License
 
 MIT

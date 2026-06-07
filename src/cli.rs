@@ -8,13 +8,14 @@ use serde_json::{json, Value};
 
 use crate::api::ApiClient;
 use crate::config::Config;
+use crate::i18n::{apply_profile_locale, current_locale_code, is_explicit_lang_set, tr, tr_args};
 use crate::models::*;
 use crate::output;
 
 #[derive(Parser)]
 #[command(
     name = "kramli",
-    about = "Kramli \u{2013} shopping list & todo CLI",
+    about = "Kramli - shopping list and todo CLI",
     version,
     propagate_version = true
 )]
@@ -29,7 +30,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Log in with an API key (generate one at kramli.de/settings#api-keys)
+    /// Log in with an API key (create one at kramli.de/settings#api-keys)
     Login {
         /// Server URL (default: https://kramli.de)
         #[arg(long)]
@@ -69,7 +70,7 @@ pub enum Commands {
     },
     /// Search across all lists and items
     Search {
-        /// Search query (min 2 characters)
+        /// Search query (minimum 2 characters)
         query: String,
     },
     /// Show activity feed for a list
@@ -89,14 +90,14 @@ pub enum Commands {
         #[command(subcommand)]
         action: HandoffCmd,
     },
-    /// Show your profile
+    /// Show profile
     Profile,
     /// Account security level and login confirmation
     Security {
         #[command(subcommand)]
         action: SecurityCmd,
     },
-    /// Accept pending legal terms/privacy documents
+    /// Accept pending terms/privacy documents
     #[command(name = "accept-terms")]
     AcceptTerms {
         /// Optional document keys (comma-separated): agb,privacy
@@ -129,14 +130,14 @@ pub enum Commands {
 
 #[derive(Subcommand)]
 pub enum ListCmd {
-    /// Show all lists
+    /// List all lists
     #[command(alias = "ls")]
     List,
     /// Resolve a list reference (ID, /lists/l/<slug>, or full URL)
     Resolve { reference: String },
     /// Show list details
     Show { id: i64 },
-    /// Create a new list
+    /// Create a list
     Create {
         name: String,
         #[arg(short, long)]
@@ -146,7 +147,7 @@ pub enum ListCmd {
         #[arg(short, long)]
         folder: Option<i64>,
         /// Custom states as CSV (e.g. "Open,In Progress,Review,Done")
-        /// or JSON array (e.g. '[{"name":"Review","color":"#7c3aed"}]').
+        /// or as JSON array (e.g. '[{"name":"Review","color":"#7c3aed"}]').
         #[arg(long)]
         states: Option<String>,
     },
@@ -160,17 +161,17 @@ pub enum ListCmd {
         #[arg(short, long)]
         color: Option<String>,
         /// Custom states as CSV (e.g. "Open,In Progress,Review,Done")
-        /// or JSON array (e.g. '[{"name":"Review","color":"#7c3aed"}]').
+        /// or as JSON array (e.g. '[{"name":"Review","color":"#7c3aed"}]').
         #[arg(long)]
         states: Option<String>,
     },
     /// Delete a list
     #[command(alias = "rm")]
     Delete { id: i64 },
-    /// Move a list into a folder
+    /// Move a list to a folder
     Move {
         id: i64,
-        /// Folder ID (omit to remove from folder)
+        /// Folder ID (omit to remove the list from a folder)
         folder_id: Option<i64>,
     },
 }
@@ -216,7 +217,7 @@ fn extract_slug_from_reference(reference: &str) -> Option<String> {
 fn resolve_list_reference(reference: &str) -> Result<i64, String> {
     let raw = reference.trim();
     if raw.is_empty() {
-        return Err("List reference is empty.".into());
+        return Err(tr("cli-list-reference-empty"));
     }
 
     if let Ok(id) = raw.parse::<i64>() {
@@ -229,9 +230,7 @@ fn resolve_list_reference(reference: &str) -> Result<i64, String> {
         }
     }
 
-    Err(
-        "Could not resolve list reference. Use a numeric ID, a slug like '1eSwyM', or a URL like https://kramli.de/lists/l/1eSwyM".into(),
-    )
+    Err(tr("cli-list-reference-invalid"))
 }
 
 #[cfg(test)]
@@ -275,7 +274,7 @@ mod tests {
 
 #[derive(Subcommand)]
 pub enum ItemCmd {
-    /// Show all items in a list
+    /// List all items in a list
     #[command(alias = "ls")]
     List {
         list_id: i64,
@@ -285,14 +284,14 @@ pub enum ItemCmd {
         /// Show only completed items
         #[arg(long, conflicts_with = "open")]
         completed: bool,
-        /// Filter by custom state/progress label
+        /// Filter by custom state
         #[arg(long)]
         state: Option<String>,
-        /// Filter by case-insensitive text match in item title
+        /// Filter by title text (case-insensitive)
         #[arg(long)]
         contains: Option<String>,
     },
-    /// Show detailed view of a single item (notes, images, comments)
+    /// Show item details (notes, images, comments)
     Show { id: i64 },
     /// Add a new item
     Add {
@@ -310,13 +309,13 @@ pub enum ItemCmd {
         notes: Option<String>,
         #[arg(long)]
         parent: Option<i64>,
-        /// Assign to user IDs (comma-separated)
+        /// Assign user IDs (comma-separated)
         #[arg(short, long)]
         assign: Option<String>,
-        /// Item colour (hex, e.g. #ff4d4f)
+        /// Item color (hex, e.g. #ff4d4f)
         #[arg(long)]
         color: Option<String>,
-        /// Item state / progress label (e.g. "In Progress", "Review")
+        /// Item state (e.g. "In Progress", "Review")
         #[arg(long, alias = "state")]
         progress: Option<String>,
     },
@@ -335,20 +334,20 @@ pub enum ItemCmd {
         tags: Option<String>,
         #[arg(short, long)]
         notes: Option<String>,
-        /// Assign to user IDs (comma-separated)
+        /// Assign user IDs (comma-separated)
         #[arg(short, long)]
         assign: Option<String>,
-        /// Item colour (hex)
+        /// Item color (hex)
         #[arg(long)]
         color: Option<String>,
-        /// Item state / progress label (e.g. "In Progress", "Review")
+        /// Item state (e.g. "In Progress", "Review")
         #[arg(long, alias = "state")]
         progress: Option<String>,
     },
-    /// Toggle item done/undone
+    /// Toggle an item between done and not done
     #[command(alias = "check")]
     Done { id: i64 },
-    /// Toggle upvote on an item
+    /// Add or remove your vote on an item
     #[command(alias = "upvote")]
     Vote { id: i64 },
     /// Delete an item
@@ -412,7 +411,7 @@ pub enum MemberCmd {
         user_id: i64,
         role: String,
     },
-    /// Generate a reusable invite link
+    /// Create a reusable invite link
     #[command(name = "invite-link")]
     InviteLink {
         list_id: i64,
@@ -428,12 +427,12 @@ pub enum MemberCmd {
 
 #[derive(Subcommand)]
 pub enum KeyCmd {
-    /// List your API keys
+    /// List API keys
     #[command(alias = "ls")]
     List,
     /// Create a new API key
     Create {
-        /// Human-readable name for the key
+        /// Human-readable key name
         name: String,
         /// Scopes (comma-separated). Available: lists:read, lists:write,
         /// folders:read, folders:write, sharing, profile:read, profile:write,
@@ -447,9 +446,9 @@ pub enum KeyCmd {
 
 #[derive(Subcommand)]
 pub enum SecurityCmd {
-    /// Security level, factors, and login-alert email preference
+    /// Security level, factors, and login alert emails
     Status,
-    /// Confirm an unusual login (token from email or security notice)
+    /// Confirm an unusual login (token from email/security notice)
     Ack {
         /// Signed ack token (or set KRAMLI_ACK_TOKEN)
         token: Option<String>,
@@ -463,20 +462,20 @@ pub enum HandoffCmd {
         list_id: i64,
         #[arg(long)]
         list_name: Option<String>,
-        /// Optional device label shown on other clients
+        /// Optional device label for other clients
         #[arg(long)]
         device: Option<String>,
     },
-    /// Ask your other devices to continue with this list
+    /// Ask other devices to continue with this list
     Continue {
         list_id: i64,
         #[arg(long)]
         list_name: Option<String>,
-        /// Optional device label shown on other clients
+        /// Optional device label for other clients
         #[arg(long)]
         device: Option<String>,
     },
-    /// Clear the current handoff viewing state
+    /// Clear current handoff presence state
     Clear,
 }
 
@@ -487,6 +486,8 @@ pub async fn run(cli: Cli) -> Result<(), String> {
     if std::env::var("NO_COLOR").is_ok() || cli.json {
         set_override(false);
     }
+
+    maybe_apply_profile_locale(&cli.command).await;
 
     match cli.command {
         Commands::Login { url } => run_login(url).await,
@@ -517,6 +518,97 @@ pub async fn run(cli: Cli) -> Result<(), String> {
     }
 }
 
+fn command_supports_profile_locale(command: &Commands) -> bool {
+    !matches!(
+        command,
+        Commands::Login { .. } | Commands::Completions { .. }
+    )
+}
+
+async fn maybe_apply_profile_locale(command: &Commands) {
+    if is_explicit_lang_set() || !command_supports_profile_locale(command) {
+        return;
+    }
+
+    let cfg = Config::load();
+    if !cfg.has_api_key() {
+        return;
+    }
+
+    let Ok(api) = ApiClient::new(&cfg) else {
+        return;
+    };
+
+    let Ok(profile) = api.get::<Profile>("/profile").await else {
+        return;
+    };
+
+    apply_profile_locale(profile.lang.as_deref());
+}
+
+fn profile_lang(profile: &Profile) -> Option<String> {
+    profile
+        .lang
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn effective_lang_source(profile: &Profile) -> &'static str {
+    if is_explicit_lang_set() {
+        return "env";
+    }
+
+    fn primary_lang(raw: &str) -> String {
+        raw.trim()
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .split('@')
+            .next()
+            .unwrap_or("")
+            .split(['-', '_'])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+    }
+
+    if let Some(profile_lang) = profile_lang(profile) {
+        let profile_primary = primary_lang(&profile_lang);
+        let current_primary = primary_lang(&current_locale_code());
+        if !profile_primary.is_empty() && profile_primary == current_primary {
+            return "profile";
+        }
+    }
+
+    "resolved"
+}
+
+fn apply_profile_locale_now(profile: &Profile) {
+    if !is_explicit_lang_set() {
+        apply_profile_locale(profile.lang.as_deref());
+    }
+}
+
+fn profile_json_with_lang(profile: &Profile) -> Value {
+    let mut out = serde_json::to_value(profile).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = out.as_object_mut() {
+        let source = effective_lang_source(profile);
+        let profile_lang = profile_lang(profile);
+        obj.insert("lang".to_string(), Value::String(current_locale_code()));
+        if let Some(lang) = profile_lang {
+            obj.insert("profile_lang".to_string(), Value::String(lang));
+        }
+        obj.insert("lang_source".to_string(), Value::String(source.to_string()));
+    }
+    out
+}
+
 // ─── Login ───
 
 async fn run_login(url: Option<String>) -> Result<(), String> {
@@ -527,18 +619,24 @@ async fn run_login(url: Option<String>) -> Result<(), String> {
     }
 
     println!(
-        "Generate an API key at {}/settings#api-keys",
-        cfg.base_url().trim_end_matches('/')
+        "{}",
+        tr_args(
+            "cli-login-generate-api-key",
+            &[(
+                "url",
+                format!("{}/settings#api-keys", cfg.base_url().trim_end_matches('/')),
+            )],
+        )
     );
 
     let key: String = dialoguer::Password::new()
-        .with_prompt("API Key")
+        .with_prompt(tr("cli-api-key-label"))
         .interact()
-        .map_err(|e| format!("Input error: {e}"))?;
+        .map_err(|e| tr_args("cli-input-error", &[("error", e.to_string())]))?;
 
     let key = key.trim().to_string();
     if !key.starts_with("kramli_") {
-        return Err("Invalid API key format. Keys start with 'kramli_'.".into());
+        return Err(tr("cli-api-key-invalid-format"));
     }
 
     cfg.set_api_key(&key)?;
@@ -547,16 +645,18 @@ async fn run_login(url: Option<String>) -> Result<(), String> {
     let api = ApiClient::new(&cfg)?;
     match api.get::<Profile>("/profile").await {
         Ok(p) => {
+            apply_profile_locale_now(&p);
             let name = p
                 .display_name
-                .as_deref()
-                .unwrap_or(p.email.as_deref().unwrap_or("(unknown)"));
-            println!("{} Logged in as {}", "✓".green(), name.bold());
-            println!("  API key stored in system keychain.");
+                .clone()
+                .or(p.email.clone())
+                .unwrap_or_else(|| tr("common-unknown"));
+            println!("{} {} {}", "✓".green(), tr("cli-logged-in-as"), name.bold());
+            println!("  {}", tr("cli-api-key-stored"));
         }
         Err(e) => {
             cfg.delete_api_key()?;
-            return Err(format!("Invalid API key: {e}"));
+            return Err(tr_args("cli-api-key-invalid", &[("error", e)]));
         }
     }
     Ok(())
@@ -565,7 +665,7 @@ async fn run_login(url: Option<String>) -> Result<(), String> {
 fn run_logout() -> Result<(), String> {
     let cfg = Config::load();
     cfg.delete_api_key()?;
-    println!("{} Logged out. API key removed from keychain.", "✓".green());
+    println!("{} {}", "✓".green(), tr("cli-logged-out"));
     Ok(())
 }
 
@@ -580,34 +680,48 @@ async fn run_status(as_json: bool) -> Result<(), String> {
         if cfg.has_api_key() {
             let api = ApiClient::new(&cfg)?;
             if let Ok(p) = api.get::<Profile>("/profile").await {
-                out["profile"] = serde_json::to_value(&p).unwrap_or_default();
+                out["profile"] = profile_json_with_lang(&p);
             }
         }
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
         return Ok(());
     }
     if cfg.has_api_key() {
-        println!("Server:  {}", cfg.base_url());
+        println!("{}        {}", tr("label-server"), cfg.base_url());
         let src = if cfg.api_key_from_env() {
-            "env KRAMLI_API_KEY"
+            tr("cli-key-source-env")
         } else {
-            "keychain"
+            tr("cli-key-source-keychain")
         };
-        println!("API Key: {} ({})", "stored".green(), src);
+        println!(
+            "{} {} ({})",
+            tr("label-api-key"),
+            tr("label-stored").green(),
+            src
+        );
         let api = ApiClient::new(&cfg)?;
         match api.get::<Profile>("/profile").await {
             Ok(p) => {
+                let display_name = p
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| tr("common-unknown"));
+                println!("{}          {}", tr("label-name"), display_name);
                 println!(
-                    "Name:    {}",
-                    p.display_name.as_deref().unwrap_or("(unknown)")
+                    "{}        {}",
+                    tr("label-email"),
+                    p.email.as_deref().unwrap_or("-")
                 );
-                println!("Email:   {}", p.email.as_deref().unwrap_or("-"));
             }
-            Err(e) => println!("{} {e}", "Profile unavailable:".yellow()),
+            Err(e) => println!("{} {e}", tr("cli-profile-unavailable").yellow()),
         }
     } else {
-        println!("Status:  {}", "not logged in".red());
-        println!("  Run `kramli login` or set KRAMLI_API_KEY.");
+        println!(
+            "{}        {}",
+            tr("label-status"),
+            tr("cli-not-logged-in").red()
+        );
+        println!("  {}", tr("cli-login-hint"));
     }
     Ok(())
 }
@@ -624,10 +738,10 @@ fn parse_states_arg(raw: &str) -> Result<Value, String> {
     }
 
     if trimmed.starts_with('[') {
-        let parsed: Value =
-            serde_json::from_str(trimmed).map_err(|e| format!("Invalid --states JSON: {e}"))?;
+        let parsed: Value = serde_json::from_str(trimmed)
+            .map_err(|e| tr_args("cli-states-invalid-json", &[("error", e.to_string())]))?;
         if !parsed.is_array() {
-            return Err("--states JSON must be an array.".into());
+            return Err(tr("cli-states-json-must-array"));
         }
         return Ok(parsed);
     }
@@ -652,7 +766,7 @@ fn parse_states_arg(raw: &str) -> Result<Value, String> {
     }
 
     if states.is_empty() {
-        return Err("No valid states provided for --states.".into());
+        return Err(tr("cli-states-empty"));
     }
 
     Ok(Value::Array(states))
@@ -678,7 +792,15 @@ async fn fetch_item_from_list(
     items
         .into_iter()
         .find(|item| item.id == item_id)
-        .ok_or_else(|| format!("Item #{item_id} not found in list #{list_id}."))
+        .ok_or_else(|| {
+            tr_args(
+                "cli-item-not-found-in-list",
+                &[
+                    ("item_id", item_id.to_string()),
+                    ("list_id", list_id.to_string()),
+                ],
+            )
+        })
 }
 
 async fn find_item_across_lists(
@@ -803,9 +925,9 @@ async fn run_lists(cmd: ListCmd, as_json: bool) -> Result<(), String> {
                 "canonical_path": format!("/lists/{id}"),
             });
             json_or!(as_json, payload, {
-                println!("{} list reference resolved", "✓".green());
-                println!("  list_id: {id}");
-                println!("  canonical: /lists/{id}");
+                println!("{} {}", "✓".green(), tr("cli-list-reference-resolved"));
+                println!("  {}: {id}", tr("label-list-id"));
+                println!("  {}: /lists/{id}", tr("label-canonical"));
             });
         }
         ListCmd::Show { id } => {
@@ -837,7 +959,11 @@ async fn run_lists(cmd: ListCmd, as_json: bool) -> Result<(), String> {
                     serde_json::to_string_pretty(&list).unwrap_or_default()
                 );
             } else {
-                println!("{} Created list #{}", "✓".green(), list.id);
+                println!(
+                    "{} {}",
+                    "✓".green(),
+                    tr_args("cli-list-created", &[("id", list.id.to_string())])
+                );
                 output::print_list_detail(&list);
             }
         }
@@ -862,11 +988,11 @@ async fn run_lists(cmd: ListCmd, as_json: bool) -> Result<(), String> {
                 body.insert("states".into(), parse_states_arg(&states_raw)?);
             }
             if body.is_empty() {
-                return Err("No changes specified.".into());
+                return Err(tr("cli-no-changes"));
             }
             let list: ShoppingList = api.put(&format!("/lists/{id}"), &body).await?;
             json_or!(as_json, list, {
-                println!("{} List updated.", "✓".green());
+                println!("{} {}", "✓".green(), tr("cli-list-updated"));
                 output::print_list_detail(&list);
             });
         }
@@ -878,9 +1004,9 @@ async fn run_lists(cmd: ListCmd, as_json: bool) -> Result<(), String> {
                     serde_json::to_string_pretty(&resp).unwrap_or_default()
                 );
             } else {
-                println!("{} List deleted.", "✓".green());
+                println!("{} {}", "✓".green(), tr("cli-list-deleted"));
                 if let Some(t) = resp.undo_token {
-                    println!("  Undo token: {t}");
+                    println!("  {}: {t}", tr("label-undo-token"));
                 }
             }
         }
@@ -894,8 +1020,19 @@ async fn run_lists(cmd: ListCmd, as_json: bool) -> Result<(), String> {
                 );
             } else {
                 match folder_id {
-                    Some(fid) => println!("{} Moved list #{id} to folder #{fid}.", "✓".green()),
-                    None => println!("{} Removed list #{id} from folder.", "✓".green()),
+                    Some(fid) => println!(
+                        "{} {}",
+                        "✓".green(),
+                        tr_args(
+                            "cli-list-moved-folder",
+                            &[("id", id.to_string()), ("folder_id", fid.to_string())],
+                        )
+                    ),
+                    None => println!(
+                        "{} {}",
+                        "✓".green(),
+                        tr_args("cli-list-removed-folder", &[("id", id.to_string())])
+                    ),
                 }
             }
         }
@@ -965,7 +1102,7 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
                 api.get(&format!("/items/{id}/comments")).await?;
             let (item, _) = find_item_across_lists(&api, id)
                 .await?
-                .ok_or_else(|| format!("Item #{id} not found."))?;
+                .ok_or_else(|| tr_args("cli-item-not-found", &[("id", id.to_string())]))?;
             if as_json {
                 let mut val = serde_json::to_value(&item).unwrap_or_default();
                 val["comments"] = serde_json::to_value(&comments).unwrap_or_default();
@@ -1023,7 +1160,11 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
                     serde_json::to_string_pretty(&item).unwrap_or_default()
                 );
             } else {
-                println!("{} Item created #{}", "✓".green(), item.id);
+                println!(
+                    "{} {}",
+                    "✓".green(),
+                    tr_args("cli-item-created", &[("id", item.id.to_string())])
+                );
             }
         }
         ItemCmd::Update {
@@ -1077,13 +1218,17 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
                 body.insert("assigned_to".into(), Value::Array(ids));
             }
             if body.is_empty() {
-                return Err("No changes specified.".into());
+                return Err(tr("cli-no-changes"));
             }
             let mut item: ListItem = api.put(&format!("/items/{id}"), &body).await?;
             if !tags_provided {
                 enrich_item_tags_from_list(&api, &mut item).await;
             }
-            json_or!(as_json, item, println!("{} Item updated.", "✓".green()));
+            json_or!(
+                as_json,
+                item,
+                println!("{} {}", "✓".green(), tr("cli-item-updated"))
+            );
         }
         ItemCmd::Done { id } => {
             let mut resp: Value = api
@@ -1096,7 +1241,7 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
                     serde_json::to_string_pretty(&resp).unwrap_or_default()
                 );
             } else {
-                println!("{} Toggled.", "✓".green());
+                println!("{} {}", "✓".green(), tr("cli-item-toggled"));
             }
         }
         ItemCmd::Vote { id } => {
@@ -1119,17 +1264,21 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
                     .unwrap_or(0);
                 if upvoted_by_me {
                     println!(
-                        "{} Upvoted item #{} ({} votes).",
+                        "{} {}",
                         "✓".green(),
-                        id,
-                        upvote_count
+                        tr_args(
+                            "cli-item-upvoted",
+                            &[("id", id.to_string()), ("count", upvote_count.to_string())],
+                        )
                     );
                 } else {
                     println!(
-                        "{} Removed vote on item #{} ({} votes).",
+                        "{} {}",
                         "✓".green(),
-                        id,
-                        upvote_count
+                        tr_args(
+                            "cli-item-vote-removed",
+                            &[("id", id.to_string()), ("count", upvote_count.to_string())],
+                        )
                     );
                 }
             }
@@ -1142,9 +1291,9 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
                     serde_json::to_string_pretty(&resp).unwrap_or_default()
                 );
             } else {
-                println!("{} Item deleted.", "✓".green());
+                println!("{} {}", "✓".green(), tr("cli-item-deleted"));
                 if let Some(t) = resp.undo_token {
-                    println!("  Undo token: {t}");
+                    println!("  {}: {t}", tr("label-undo-token"));
                 }
             }
         }
@@ -1160,7 +1309,7 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
                     serde_json::to_string_pretty(&done).unwrap_or_default()
                 );
             } else if done.is_empty() {
-                println!("{}", "No completed items.".dimmed());
+                println!("{}", tr("cli-no-completed-items").dimmed());
             } else {
                 output::print_items(&done);
             }
@@ -1176,7 +1325,7 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
                     serde_json::to_string_pretty(&resp).unwrap_or_default()
                 );
             } else {
-                println!("{} Comment added.", "✓".green());
+                println!("{} {}", "✓".green(), tr("cli-comment-added"));
             }
         }
         ItemCmd::CheckAll { list_id } => {
@@ -1189,7 +1338,7 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
                     serde_json::to_string_pretty(&resp).unwrap_or_default()
                 );
             } else {
-                println!("{} All items marked done.", "✓".green());
+                println!("{} {}", "✓".green(), tr("cli-check-all-done"));
             }
         }
         ItemCmd::ClearDone { list_id } => {
@@ -1203,7 +1352,11 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
                 );
             } else {
                 let count = resp.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-                println!("{} {count} completed items deleted.", "✓".green());
+                println!(
+                    "{} {}",
+                    "✓".green(),
+                    tr_args("cli-clear-done", &[("count", count.to_string())])
+                );
             }
         }
     }
@@ -1225,7 +1378,11 @@ async fn run_folders(cmd: FolderCmd, as_json: bool) -> Result<(), String> {
             if as_json {
                 println!("{}", serde_json::to_string_pretty(&f).unwrap_or_default());
             } else {
-                println!("{} Folder created #{}", "✓".green(), f.id);
+                println!(
+                    "{} {}",
+                    "✓".green(),
+                    tr_args("cli-folder-created", &[("id", f.id.to_string())])
+                );
             }
         }
         FolderCmd::Update {
@@ -1245,14 +1402,18 @@ async fn run_folders(cmd: FolderCmd, as_json: bool) -> Result<(), String> {
                 body.insert("color".into(), Value::String(c));
             }
             if body.is_empty() {
-                return Err("No changes specified.".into());
+                return Err(tr("cli-no-changes"));
             }
             let f: Folder = api.put(&format!("/folders/{id}"), &body).await?;
-            json_or!(as_json, f, println!("{} Folder updated.", "✓".green()));
+            json_or!(
+                as_json,
+                f,
+                println!("{} {}", "✓".green(), tr("cli-folder-updated"))
+            );
         }
         FolderCmd::Delete { id } => {
             let _: OkResponse = api.delete(&format!("/folders/{id}")).await?;
-            println!("{} Folder deleted.", "✓".green());
+            println!("{} {}", "✓".green(), tr("cli-folder-deleted"));
         }
     }
     Ok(())
@@ -1278,12 +1439,16 @@ async fn run_members(cmd: MemberCmd, as_json: bool) -> Result<(), String> {
                     &json!({"email": email, "role": role}),
                 )
                 .await?;
-            println!("{} Invitation sent to {email}", "✓".green());
+            println!(
+                "{} {}",
+                "✓".green(),
+                tr_args("cli-member-invited", &[("email", email)])
+            );
         }
         MemberCmd::Remove { list_id, user_id } => {
             api.delete_ok(&format!("/lists/{list_id}/members/{user_id}"))
                 .await?;
-            println!("{} Member removed.", "✓".green());
+            println!("{} {}", "✓".green(), tr("cli-member-removed"));
         }
         MemberCmd::Role {
             list_id,
@@ -1296,7 +1461,7 @@ async fn run_members(cmd: MemberCmd, as_json: bool) -> Result<(), String> {
                     &json!({"role": role}),
                 )
                 .await?;
-            println!("{} Role updated.", "✓".green());
+            println!("{} {}", "✓".green(), tr("cli-member-role-updated"));
         }
         MemberCmd::InviteLink { list_id } => {
             let resp: Value = api
@@ -1308,7 +1473,13 @@ async fn run_members(cmd: MemberCmd, as_json: bool) -> Result<(), String> {
                     serde_json::to_string_pretty(&resp).unwrap_or_default()
                 );
             } else if let Some(token) = resp.get("token").and_then(|v| v.as_str()) {
-                println!("Invite link: https://kram.li/i/{token}");
+                println!(
+                    "{}",
+                    tr_args(
+                        "cli-invite-link",
+                        &[("url", format!("https://kram.li/i/{token}"))],
+                    )
+                );
             } else {
                 println!(
                     "{}",
@@ -1318,19 +1489,38 @@ async fn run_members(cmd: MemberCmd, as_json: bool) -> Result<(), String> {
         }
         MemberCmd::Unshare { list_id } => {
             api.delete_ok(&format!("/lists/{list_id}/share")).await?;
-            println!("{} Public link removed.", "✓".green());
+            println!("{} {}", "✓".green(), tr("cli-public-link-removed"));
         }
         MemberCmd::Leave { list_id } => {
             let _: Value = api
                 .post(&format!("/lists/{list_id}/leave"), &json!({}))
                 .await?;
-            println!("{} Left the list.", "✓".green());
+            println!("{} {}", "✓".green(), tr("cli-list-left"));
         }
     }
     Ok(())
 }
 
 // ─── API Keys ───
+
+fn display_api_key_scopes(scopes: &ApiKeyScopes) -> String {
+    let map_scope = |scope: &str| {
+        if scope.trim().eq_ignore_ascii_case("all") {
+            tr("label-all")
+        } else {
+            scope.trim().to_string()
+        }
+    };
+
+    match scopes {
+        ApiKeyScopes::Single(value) => map_scope(value),
+        ApiKeyScopes::Multiple(values) => values
+            .iter()
+            .map(|value| map_scope(value))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
 
 async fn run_keys(cmd: KeyCmd, as_json: bool) -> Result<(), String> {
     let api = get_api()?;
@@ -1343,21 +1533,27 @@ async fn run_keys(cmd: KeyCmd, as_json: bool) -> Result<(), String> {
                     serde_json::to_string_pretty(&keys).unwrap_or_default()
                 );
             } else if keys.is_empty() {
-                println!("{}", "No API keys.".dimmed());
+                println!("{}", tr("cli-no-api-keys").dimmed());
             } else {
                 for k in &keys {
                     let active = if k.is_active.unwrap_or(true) {
-                        "active".green().to_string()
+                        tr("label-active").green().to_string()
                     } else {
-                        "revoked".red().to_string()
+                        tr("label-revoked").red().to_string()
                     };
-                    let scopes = k.scopes.as_deref().unwrap_or("all");
-                    let label = k.name.as_deref().unwrap_or("(no name)");
-                    let last = k.last_used_at.as_deref().unwrap_or("never");
+                    let scopes = k
+                        .scopes
+                        .as_ref()
+                        .map(display_api_key_scopes)
+                        .unwrap_or_else(|| tr("label-all"));
+                    let label = k.name.clone().unwrap_or_else(|| tr("label-no-name"));
+                    let last = k.last_used_at.clone().unwrap_or_else(|| tr("label-never"));
                     println!(
-                        "  #{:<4} {:<20} [{active}]  scopes: {scopes}  last used: {last}",
+                        "  #{:<4} {:<20} [{active}]  {}: {scopes}  {}: {last}",
                         k.id,
                         label.bold(),
+                        tr("label-scopes"),
+                        tr("label-last-used"),
                     );
                 }
             }
@@ -1380,14 +1576,11 @@ async fn run_keys(cmd: KeyCmd, as_json: bool) -> Result<(), String> {
                 );
             } else {
                 if let Some(raw) = resp.get("key").and_then(|v| v.as_str()) {
-                    println!("{} API key created:", "✓".green());
+                    println!("{} {}", "✓".green(), tr("cli-api-key-created"));
                     println!();
                     println!("  {}", raw.bold());
                     println!();
-                    println!(
-                        "  {} Store this key securely. It will not be shown again.",
-                        "!".yellow()
-                    );
+                    println!("  {} {}", "!".yellow(), tr("cli-api-key-save-warning"));
                 } else {
                     println!(
                         "{}",
@@ -1398,7 +1591,11 @@ async fn run_keys(cmd: KeyCmd, as_json: bool) -> Result<(), String> {
         }
         KeyCmd::Revoke { key_id } => {
             let _: Value = api.delete(&format!("/api-keys/{key_id}")).await?;
-            println!("{} API key #{key_id} revoked.", "✓".green());
+            println!(
+                "{} {}",
+                "✓".green(),
+                tr_args("cli-api-key-revoked", &[("id", key_id.to_string())])
+            );
         }
     }
     Ok(())
@@ -1412,13 +1609,13 @@ async fn run_search(query: &str, as_json: bool) -> Result<(), String> {
     let response_for_json = if as_json {
         Some(
             SearchResponse::from_value(raw.clone())
-                .map_err(|e| format!("Could not parse search response: {e}"))?,
+                .map_err(|e| tr_args("cli-search-parse-error", &[("error", e)]))?,
         )
     } else {
         None
     };
     let grouped = SearchResponse::from_value(raw)
-        .map_err(|e| format!("Could not parse search response: {e}"))?;
+        .map_err(|e| tr_args("cli-search-parse-error", &[("error", e)]))?;
 
     let mut grouped = grouped.into_grouped();
     let mut fallback_applied = false;
@@ -1481,7 +1678,7 @@ async fn run_undo(list_id: i64) -> Result<(), String> {
     let _: Value = api
         .post(&format!("/lists/{list_id}/undo"), &json!({}))
         .await?;
-    println!("{} Undone.", "✓".green());
+    println!("{} {}", "✓".green(), tr("cli-undo-done"));
     Ok(())
 }
 
@@ -1490,7 +1687,7 @@ async fn run_redo(list_id: i64) -> Result<(), String> {
     let _: Value = api
         .post(&format!("/lists/{list_id}/redo"), &json!({}))
         .await?;
-    println!("{} Redone.", "✓".green());
+    println!("{} {}", "✓".green(), tr("cli-redo-done"));
     Ok(())
 }
 
@@ -1540,7 +1737,7 @@ async fn run_handoff(cmd: HandoffCmd, as_json: bool) -> Result<(), String> {
             json_or!(
                 as_json,
                 resp,
-                println!("{} Handoff viewing sent.", "✓".green())
+                println!("{} {}", "✓".green(), tr("cli-handoff-viewing-sent"))
             );
         }
         HandoffCmd::Continue {
@@ -1562,12 +1759,16 @@ async fn run_handoff(cmd: HandoffCmd, as_json: bool) -> Result<(), String> {
             json_or!(
                 as_json,
                 resp,
-                println!("{} Continue-on-device handoff sent.", "✓".green())
+                println!("{} {}", "✓".green(), tr("cli-handoff-continue-sent"))
             );
         }
         HandoffCmd::Clear => {
             let resp: Value = api.post("/activity/clear", &json!({})).await?;
-            json_or!(as_json, resp, println!("{} Handoff cleared.", "✓".green()));
+            json_or!(
+                as_json,
+                resp,
+                println!("{} {}", "✓".green(), tr("cli-handoff-cleared"))
+            );
         }
     }
 
@@ -1576,7 +1777,7 @@ async fn run_handoff(cmd: HandoffCmd, as_json: bool) -> Result<(), String> {
 
 async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), String> {
     if as_json {
-        return Err("`kramli batch` does not support --json yet.".into());
+        return Err(tr("cli-batch-json-not-supported"));
     }
 
     let source = if file == "-" {
@@ -1591,11 +1792,15 @@ async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), St
         tokio::io::stdin()
             .read_to_string(&mut buffer)
             .await
-            .map_err(|e| format!("Could not read batch commands from stdin: {e}"))?;
+            .map_err(|e| tr_args("cli-batch-read-stdin-error", &[("error", e.to_string())]))?;
         buffer
     } else {
-        fs::read_to_string(file)
-            .map_err(|e| format!("Could not read batch file '{}': {e}", file))?
+        fs::read_to_string(file).map_err(|e| {
+            tr_args(
+                "cli-batch-read-file-error",
+                &[("file", file.to_string()), ("error", e.to_string())],
+            )
+        })?
     };
 
     let mut executed = 0usize;
@@ -1614,7 +1819,14 @@ async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), St
         let mut args = match shell_words::split(line) {
             Ok(parsed) => parsed,
             Err(e) => {
-                let err = format!("Batch parse error in {source}:{line_no}: {e}");
+                let err = tr_args(
+                    "cli-batch-parse-error",
+                    &[
+                        ("source", source.clone()),
+                        ("line", line_no.to_string()),
+                        ("error", e.to_string()),
+                    ],
+                );
                 failed += 1;
                 if first_error.is_none() {
                     first_error = Some(err.clone());
@@ -1641,7 +1853,14 @@ async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), St
         let mut nested_cli = match Cli::try_parse_from(&argv) {
             Ok(parsed) => parsed,
             Err(e) => {
-                let err = format!("Batch parse error in {source}:{line_no}: {e}");
+                let err = tr_args(
+                    "cli-batch-parse-error",
+                    &[
+                        ("source", source.clone()),
+                        ("line", line_no.to_string()),
+                        ("error", e.to_string()),
+                    ],
+                );
                 failed += 1;
                 if first_error.is_none() {
                     first_error = Some(err.clone());
@@ -1655,7 +1874,10 @@ async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), St
         };
 
         if matches!(nested_cli.command, Commands::Batch { .. }) {
-            let err = format!("Nested `batch` command is not supported ({source}:{line_no}).");
+            let err = tr_args(
+                "cli-batch-nested-not-supported",
+                &[("source", source.clone()), ("line", line_no.to_string())],
+            );
             failed += 1;
             if first_error.is_none() {
                 first_error = Some(err.clone());
@@ -1685,18 +1907,29 @@ async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), St
     let succeeded = executed.saturating_sub(failed);
     if failed == 0 {
         println!(
-            "{} Batch finished: {succeeded} command(s) succeeded.",
-            "✓".green()
+            "{} {}",
+            "✓".green(),
+            tr_args(
+                "cli-batch-complete-success",
+                &[("count", succeeded.to_string())]
+            )
         );
         return Ok(());
     }
 
     println!(
-        "{} Batch finished: {succeeded} succeeded, {failed} failed.",
-        "!".yellow()
+        "{} {}",
+        "!".yellow(),
+        tr_args(
+            "cli-batch-complete-partial",
+            &[
+                ("success", succeeded.to_string()),
+                ("failed", failed.to_string()),
+            ],
+        )
     );
 
-    Err(first_error.unwrap_or_else(|| "Batch failed.".to_string()))
+    Err(first_error.unwrap_or_else(|| tr("cli-batch-failed")))
 }
 
 async fn run_security(cmd: SecurityCmd, as_json: bool) -> Result<(), String> {
@@ -1722,18 +1955,23 @@ async fn run_security(cmd: SecurityCmd, as_json: bool) -> Result<(), String> {
                 .get("max_score")
                 .and_then(Value::as_u64)
                 .unwrap_or(100);
-            println!("Security level: {}", level.bold());
-            println!("Score:          {score}/{max_score}");
+            println!("{} {}", tr("label-security-level"), level.bold());
+            println!("{}        {score}/{max_score}", tr("label-score"));
             let login_alerts = data
                 .get("security_email_login_alerts")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
             println!(
-                "Login emails:   {}",
-                if login_alerts { "on" } else { "off" }
+                "{}   {}",
+                tr("label-login-emails"),
+                if login_alerts {
+                    tr("label-on")
+                } else {
+                    tr("label-off")
+                }
             );
             if let Some(factors) = summary.get("factors").and_then(Value::as_array) {
-                println!("\nFactors:");
+                println!("\n{}", tr("label-factors"));
                 for factor in factors {
                     let label = factor.get("label").and_then(Value::as_str).unwrap_or("?");
                     let met = factor.get("met").and_then(Value::as_bool).unwrap_or(false);
@@ -1751,9 +1989,7 @@ async fn run_security(cmd: SecurityCmd, as_json: bool) -> Result<(), String> {
                 .map(str::to_owned)
                 .or_else(|| std::env::var("KRAMLI_ACK_TOKEN").ok());
             let Some(token) = token else {
-                return Err(
-                    "Missing ack token: pass as argument or set KRAMLI_ACK_TOKEN".to_string(),
-                );
+                return Err(tr("cli-security-ack-token-missing"));
             };
             let body = json!({ "token": token });
             let data: Value = api.post("/security/login-ack", &body).await?;
@@ -1765,18 +2001,20 @@ async fn run_security(cmd: SecurityCmd, as_json: bool) -> Result<(), String> {
                 return Ok(());
             }
             if data.get("ok").and_then(Value::as_bool) == Some(true) {
+                let default_message = tr("cli-security-ack-confirmed");
                 let message = data
                     .get("message")
                     .and_then(Value::as_str)
-                    .unwrap_or("Login confirmed.");
+                    .unwrap_or(default_message.as_str());
                 println!("{} {}", "✓".green(), message);
                 Ok(())
             } else {
+                let default_message = tr("cli-security-ack-failed");
                 let message = data
                     .get("error")
                     .or_else(|| data.get("message"))
                     .and_then(Value::as_str)
-                    .unwrap_or("Ack failed.");
+                    .unwrap_or(default_message.as_str());
                 Err(message.to_string())
             }
         }
@@ -1787,19 +2025,30 @@ async fn run_profile(as_json: bool) -> Result<(), String> {
     let api = get_api()?;
     let p: Profile = api.get("/profile").await?;
     if as_json {
-        println!("{}", serde_json::to_string_pretty(&p).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&profile_json_with_lang(&p)).unwrap_or_default()
+        );
         return Ok(());
     }
     println!(
-        "Name:   {}",
-        p.display_name.as_deref().unwrap_or("(unknown)").bold()
+        "{}   {}",
+        tr("label-name"),
+        p.display_name
+            .clone()
+            .unwrap_or_else(|| tr("common-unknown"))
+            .bold()
     );
-    println!("Email:  {}", p.email.as_deref().unwrap_or("-"));
+    println!(
+        "{} {}",
+        tr("label-email"),
+        p.email.as_deref().unwrap_or("-")
+    );
     if let Some(id) = p.id {
-        println!("ID:     {id}");
+        println!("{}     {id}", tr("label-id"));
     }
     if p.is_anonymous.unwrap_or(false) {
-        println!("        (guest account)");
+        println!("        {}", tr("label-guest-account"));
     }
     Ok(())
 }
@@ -1819,7 +2068,8 @@ async fn run_accept_terms(docs: Option<Vec<String>>, as_json: bool) -> Result<()
         for value in values {
             if value != "agb" && value != "privacy" {
                 return Err(format!(
-                    "Invalid doc key '{value}'. Use --docs agb,privacy (or omit to accept all pending)."
+                    "{}",
+                    tr_args("cli-invalid-doc-key", &[("value", value.to_string())])
                 ));
             }
         }
@@ -1852,11 +2102,15 @@ async fn run_accept_terms(docs: Option<Vec<String>>, as_json: bool) -> Result<()
         .unwrap_or(0);
 
     if pending_count == 0 {
-        println!("{} Terms and privacy accepted.", "✓".green());
+        println!("{} {}", "✓".green(), tr("cli-accepted-terms-all"));
     } else {
         println!(
-            "{} Updated legal acceptance, but {pending_count} document(s) are still pending.",
-            "✓".green()
+            "{} {}",
+            "✓".green(),
+            tr_args(
+                "cli-accepted-terms-pending",
+                &[("count", pending_count.to_string())],
+            )
         );
     }
 
@@ -1871,7 +2125,7 @@ async fn run_ping(as_json: bool) -> Result<(), String> {
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
+        .map_err(|e| tr_args("api-network-error", &[("error", e.to_string())]))?;
     let ms = start.elapsed().as_millis();
     let ok = resp.status().is_success();
     if as_json {
@@ -1882,9 +2136,20 @@ async fn run_ping(as_json: bool) -> Result<(), String> {
         return Ok(());
     }
     if ok {
-        println!("{} Server reachable ({ms}ms)", "✓".green());
+        println!(
+            "{} {}",
+            "✓".green(),
+            tr_args("cli-ping-ok", &[("ms", ms.to_string())])
+        );
     } else {
-        println!("{} Server returned {}", "✗".red(), resp.status());
+        println!(
+            "{} {}",
+            "✗".red(),
+            tr_args(
+                "cli-ping-failed",
+                &[("status", resp.status().as_u16().to_string())]
+            )
+        );
     }
     Ok(())
 }
@@ -1901,20 +2166,26 @@ fn run_config(as_json: bool) -> Result<(), String> {
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
         return Ok(());
     }
-    println!("Config:  {}", Config::path().display());
-    println!("Server:  {}", cfg.base_url());
+    println!(
+        "{}  {}",
+        tr("label-configuration"),
+        Config::path().display()
+    );
+    println!("{}         {}", tr("label-server"), cfg.base_url());
     let src = if cfg.api_key_from_env() {
-        " (env)"
+        format!(" ({})", tr("label-environment"))
     } else {
-        " (keychain)"
+        format!(" ({})", tr("label-keychain"))
     };
     println!(
-        "API Key: {}{src}",
+        "{} {}{}",
+        tr("label-api-key"),
         if cfg.has_api_key() {
-            "stored".green().to_string()
+            tr("label-stored").green().to_string()
         } else {
-            "not set".red().to_string()
-        }
+            tr("label-not-set").red().to_string()
+        },
+        src
     );
     Ok(())
 }

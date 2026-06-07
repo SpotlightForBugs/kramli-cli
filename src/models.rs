@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::{tr, tr_args};
+
 // ── List ──
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -146,6 +148,8 @@ pub struct Profile {
     pub id: Option<i64>,
     pub display_name: Option<String>,
     pub email: Option<String>,
+    #[serde(default, alias = "language", alias = "locale")]
+    pub lang: Option<String>,
     pub is_anonymous: Option<bool>,
     pub created_at: Option<String>,
 }
@@ -206,10 +210,11 @@ impl SearchResponse {
                     return Ok(Self::Flat(vec![hit]));
                 }
 
-                Err("Unsupported search response object shape".to_string())
+                Err(tr("models-search-object-shape-unsupported"))
             }
             other => Err(format!(
-                "Unsupported search response type: {}",
+                "{}: {}",
+                tr("models-search-type-unsupported"),
                 match other {
                     serde_json::Value::Bool(_) => "bool",
                     serde_json::Value::Number(_) => "number",
@@ -266,7 +271,7 @@ impl SearchResponse {
             return Ok(Self::Flat(flat_hits));
         }
 
-        Err("Unsupported search response array shape".to_string())
+        Err(tr("models-search-array-shape-unsupported"))
     }
 
     pub fn into_grouped(self) -> SearchResults {
@@ -280,12 +285,17 @@ impl SearchResponse {
                     match hit.hit_type.as_deref() {
                         Some("list") => lists.push(SearchListHit {
                             id: hit.id,
-                            name: hit.name.unwrap_or_else(|| format!("List #{}", hit.id)),
+                            name: hit.name.unwrap_or_else(|| {
+                                tr_args("models-list-fallback-name", &[("id", hit.id.to_string())])
+                            }),
                             icon: hit.icon.or(hit.list_icon),
+                            color: None,
                         }),
                         Some("item") => items.push(SearchItemHit {
                             id: hit.id,
-                            text: hit.text.unwrap_or_else(|| format!("Item #{}", hit.id)),
+                            text: hit.text.unwrap_or_else(|| {
+                                tr_args("models-item-fallback-name", &[("id", hit.id.to_string())])
+                            }),
                             list_id: hit.list_id,
                             list_name: hit.list_name,
                             is_done: hit.is_done,
@@ -305,7 +315,7 @@ impl SearchResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::SearchResponse;
+    use super::{ApiKey, ApiKeyScopes, Profile, SearchResponse};
 
     #[test]
     fn parse_search_response_accepts_empty_array() {
@@ -335,6 +345,56 @@ mod tests {
         assert_eq!(items[0].id, 42);
         assert_eq!(items[0].text, "Sample");
     }
+
+    #[test]
+    fn parse_profile_lang_aliases() {
+        let from_lang: Profile = serde_json::from_value(serde_json::json!({"lang": "fr"}))
+            .expect("profile with lang should parse");
+        assert_eq!(from_lang.lang.as_deref(), Some("fr"));
+
+        let from_language: Profile =
+            serde_json::from_value(serde_json::json!({"language": "pt-BR"}))
+                .expect("profile with language should parse");
+        assert_eq!(from_language.lang.as_deref(), Some("pt-BR"));
+
+        let from_locale: Profile = serde_json::from_value(serde_json::json!({"locale": "de_DE"}))
+            .expect("profile with locale should parse");
+        assert_eq!(from_locale.lang.as_deref(), Some("de_DE"));
+    }
+
+    #[test]
+    fn parse_api_key_scopes_array() {
+        let key: ApiKey = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "name": "CLI",
+            "scopes": ["all", "lists:read"],
+            "is_active": true
+        }))
+        .expect("api key with array scopes should parse");
+
+        match key.scopes {
+            Some(ApiKeyScopes::Multiple(values)) => {
+                assert_eq!(values, vec!["all", "lists:read"]);
+            }
+            _ => panic!("expected multiple scopes"),
+        }
+    }
+
+    #[test]
+    fn parse_api_key_scopes_string() {
+        let key: ApiKey = serde_json::from_value(serde_json::json!({
+            "id": 2,
+            "name": "Legacy",
+            "scopes": "all",
+            "is_active": true
+        }))
+        .expect("api key with string scopes should parse");
+
+        match key.scopes {
+            Some(ApiKeyScopes::Single(value)) => assert_eq!(value, "all"),
+            _ => panic!("expected single scope"),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -342,6 +402,7 @@ pub struct SearchListHit {
     pub id: i64,
     pub name: String,
     pub icon: Option<String>,
+    pub color: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -393,9 +454,16 @@ pub struct ApiError {
 pub struct ApiKey {
     pub id: i64,
     pub name: Option<String>,
-    pub scopes: Option<String>,
+    pub scopes: Option<ApiKeyScopes>,
     pub is_active: Option<bool>,
     pub last_used_at: Option<String>,
     pub usage_count: Option<i64>,
     pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ApiKeyScopes {
+    Single(String),
+    Multiple(Vec<String>),
 }
