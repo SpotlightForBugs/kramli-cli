@@ -2067,9 +2067,9 @@ async fn run_accept_terms(docs: Option<Vec<String>>, as_json: bool) -> Result<()
     if let Some(ref values) = normalized_docs {
         for value in values {
             if value != "agb" && value != "privacy" {
-                return Err(format!(
-                    "{}",
-                    tr_args("cli-invalid-doc-key", &[("value", value.to_string())])
+                return Err(tr_args(
+                    "cli-invalid-doc-key",
+                    &[("value", value.to_string())],
                 ));
             }
         }
