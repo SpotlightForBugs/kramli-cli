@@ -22,6 +22,7 @@
 
 ```bash
 brew install SpotlightForBugs/tap/kramli
+brew trust --formula spotlightforbugs/tap/kramli
 ```
 
 **Install script (macOS, Linux, Windows via WSL)**
