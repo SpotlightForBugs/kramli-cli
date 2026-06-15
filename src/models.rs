@@ -11,6 +11,9 @@ pub struct ShoppingList {
     pub icon: Option<String>,
     pub color: Option<String>,
     pub folder_id: Option<i64>,
+    pub folder_name: Option<String>,
+    pub archived: Option<bool>,
+    pub archive_mode: Option<String>,
     pub view_mode: Option<String>,
     pub role: Option<String>,
     pub item_count: Option<i64>,
@@ -148,10 +151,26 @@ pub struct Profile {
     pub id: Option<i64>,
     pub display_name: Option<String>,
     pub email: Option<String>,
+    pub photo_url: Option<String>,
     #[serde(default, alias = "language", alias = "locale")]
     pub lang: Option<String>,
     pub is_anonymous: Option<bool>,
     pub created_at: Option<String>,
+    #[serde(default)]
+    pub legal: Option<ProfileLegalStatus>,
+    #[serde(default)]
+    pub terms_accepted: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileLegalStatus {
+    #[serde(default)]
+    pub pending: Vec<ProfilePendingLegalDoc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfilePendingLegalDoc {
+    pub key: Option<String>,
 }
 
 // ── Search ──
@@ -231,10 +250,6 @@ impl SearchResponse {
         }
 
         let array_value = serde_json::Value::Array(array.clone());
-        if let Ok(flat_hits) = serde_json::from_value::<Vec<SearchHit>>(array_value.clone()) {
-            return Ok(Self::Flat(flat_hits));
-        }
-
         if let Ok(item_hits) = serde_json::from_value::<Vec<SearchItemHit>>(array_value.clone()) {
             let flat_hits = item_hits
                 .into_iter()
@@ -253,7 +268,7 @@ impl SearchResponse {
             return Ok(Self::Flat(flat_hits));
         }
 
-        if let Ok(list_hits) = serde_json::from_value::<Vec<SearchListHit>>(array_value) {
+        if let Ok(list_hits) = serde_json::from_value::<Vec<SearchListHit>>(array_value.clone()) {
             let flat_hits = list_hits
                 .into_iter()
                 .map(|list| SearchHit {
@@ -268,6 +283,10 @@ impl SearchResponse {
                     is_done: None,
                 })
                 .collect();
+            return Ok(Self::Flat(flat_hits));
+        }
+
+        if let Ok(flat_hits) = serde_json::from_value::<Vec<SearchHit>>(array_value) {
             return Ok(Self::Flat(flat_hits));
         }
 
@@ -344,6 +363,44 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, 42);
         assert_eq!(items[0].text, "Sample");
+    }
+
+    #[test]
+    fn parse_search_response_infers_list_arrays_without_type() {
+        let value = serde_json::json!([
+            {
+                "id": 7,
+                "name": "Groceries",
+                "icon": "basket"
+            }
+        ]);
+
+        let parsed = SearchResponse::from_value(value).expect("should parse list hit array");
+        let grouped = parsed.into_grouped();
+        let lists = grouped.lists.expect("lists expected");
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].id, 7);
+        assert_eq!(lists[0].name, "Groceries");
+    }
+
+    #[test]
+    fn parse_search_response_infers_item_arrays_without_type() {
+        let value = serde_json::json!([
+            {
+                "id": 42,
+                "text": "Milk",
+                "list_id": 7,
+                "list_name": "Groceries",
+                "is_done": false
+            }
+        ]);
+
+        let parsed = SearchResponse::from_value(value).expect("should parse item hit array");
+        let grouped = parsed.into_grouped();
+        let items = grouped.items.expect("items expected");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, 42);
+        assert_eq!(items[0].text, "Milk");
     }
 
     #[test]

@@ -45,9 +45,51 @@ Or download a build for your platform from [Releases](https://github.com/Spotlig
 kramli login
 kramli lists list
 kramli items list <LIST_ID> --open
-kramli items add <LIST_ID> "Milch" --priority high
+kramli items list <LIST_ID> --open --newest --limit 11
+kramli items add <LIST_ID> "Milk" --priority high
 kramli search "dark mode"
 ```
+
+### Interactive mode
+
+Use interactive mode if you want a terminal UI:
+
+```bash
+kramli -i
+```
+
+Controls:
+
+```text
+q              quit
+Tab / Shift+Tab switch mode (list / board / calendar)
+1, 2, 3        switch mode directly
+Arrow keys     move selection
+Enter          load list (left pane) or open editor (right pane)
+e              open item editor
+Ctrl+S         save in editor
+Space          toggle done for selected item
+r              refresh lists/items
+Mouse click    tabs, lists, cards, calendar rows, action buttons, editor controls
+```
+
+Notes:
+
+- If an item has an image, the details pane renders an inline terminal preview when the terminal protocol supports it.
+- On unsupported terminals, the app falls back gracefully and keeps item details fully usable.
+- The TUI uses readable text labels for actions and list icons.
+- The TUI footer shows the active shortcut for each action.
+- Remap a TUI action with `KRAMLI_TUI_KEY_<ACTION>`, for example `KRAMLI_TUI_KEY_ADD=n kramli -i`.
+- Supported key values include single characters, `space`, `enter`, `esc`, `tab`, `f1`, and modifiers such as `ctrl+x`.
+- Viewing a list sends the cross-device handoff automatically. There is no manual handoff command.
+- Image protocol detection runs automatically; no user setup is required.
+- Force a specific inline image protocol with `KRAMLI_TUI_IMAGE_PROTOCOL`:
+  - `imgcat` / `iterm2`
+  - `kitty`
+  - `sixel`
+  - `halfblocks`
+  - `auto` (default) or `off`
+- Inline Bootstrap icon color follows `KRAMLI_TUI_THEME=light|dark` or `KRAMLI_TUI_ICON_COLOR=#1f4f8f`.
 
 Create an API key at [kramli.de/settings#api-keys](https://kramli.de/settings#api-keys) if you prefer `kramli login --api-key`.
 
@@ -65,6 +107,25 @@ KRAMLI_LANG=de kramli status
 KRAMLI_LANG=fr kramli lists list
 KRAMLI_LANG=pt_BR kramli profile
 KRAMLI_ICON_STYLE=emoji kramli lists list
+```
+
+## Privacy and update checks
+
+- Crash telemetry is **off by default**.
+- Enable telemetry explicitly with `KRAMLI_TELEMETRY=1`.
+- Force-disable telemetry with `DO_NOT_TRACK=1` or `KRAMLI_NO_TELEMETRY=1`.
+- Telemetry events are scrubbed before sending (API keys, emails, response bodies, and structured context fields).
+
+Check for a new CLI release manually:
+
+```bash
+kramli update-check
+```
+
+Enable automatic daily update checks (disabled by default):
+
+```bash
+KRAMLI_AUTO_UPDATE_CHECK=1 kramli status
 ```
 
 ## License

@@ -18,6 +18,12 @@ const KEYRING_API_KEY: &str = "api-key";
 pub struct ConfigFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_check_last: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_check_latest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_check_url: Option<String>,
 }
 
 // ── Public Config handle ──
@@ -81,6 +87,29 @@ impl Config {
 
     pub fn set_base_url(&mut self, url: Option<String>) {
         self.file.base_url = url;
+    }
+
+    pub fn update_check_last(&self) -> Option<i64> {
+        self.file.update_check_last
+    }
+
+    pub fn update_check_latest(&self) -> Option<String> {
+        self.file.update_check_latest.clone()
+    }
+
+    pub fn update_check_url(&self) -> Option<String> {
+        self.file.update_check_url.clone()
+    }
+
+    pub fn set_update_check_state(
+        &mut self,
+        checked_at: i64,
+        latest: Option<String>,
+        url: Option<String>,
+    ) {
+        self.file.update_check_last = Some(checked_at);
+        self.file.update_check_latest = latest;
+        self.file.update_check_url = url;
     }
 
     // ── Keychain-backed API key (env override: KRAMLI_API_KEY) ──
