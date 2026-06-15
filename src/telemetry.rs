@@ -544,14 +544,14 @@ mod tests {
     #[test]
     fn redacts_common_secret_shapes() {
         let scrubbed = scrub_message(
-            "token=abc123 Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c https://kram.li/i/invite-secret",
+            "token=abc123 Authorization: Bearer redaction-test-bearer-token https://kram.li/i/invite-secret",
         );
         assert!(scrubbed.contains("token=[REDACTED]"));
         assert!(scrubbed.contains("Bearer [REDACTED]"));
         assert!(scrubbed.contains("https://kram.li/i/[REDACTED]"));
         assert!(!scrubbed.contains("abc123"));
         assert!(!scrubbed.contains("invite-secret"));
-        assert!(!scrubbed.contains("eyJhbGci"));
+        assert!(!scrubbed.contains("redaction-test-bearer-token"));
     }
 
     #[test]
