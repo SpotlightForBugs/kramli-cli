@@ -4321,14 +4321,16 @@ fn draw_lists_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let mut list_items: Vec<TuiListItem> = Vec::new();
     for idx in start..end {
         let list = &app.lists[idx];
+        let list_id = list.id;
         let raw_icon = list.icon.clone();
         let name = list.name.clone();
         let total = list.item_count.unwrap_or(0);
         let done = list.done_count.unwrap_or(0);
         let is_archived = list.archived.unwrap_or(false);
         let is_foldered = list_has_folder(list);
+        let row = list_area.y.saturating_add(1 + (idx - start) as u16);
 
-        let icon_asset = list_icon_asset_name(raw_icon.as_deref(), is_foldered);
+        let icon_asset = list_icon_asset_name(raw_icon.as_deref());
         let use_image_icon = list_icon_image_enabled(
             app.bootstrap_icons_enabled,
             app.inline_images_enabled,
@@ -4338,7 +4340,6 @@ fn draw_lists_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         if let Some(asset) = icon_asset.as_deref() {
             if use_image_icon {
                 app.ensure_list_icon_background(asset);
-                let row = list_area.y.saturating_add(1 + (idx - start) as u16);
                 icon_targets.push((
                     asset.to_string(),
                     Rect::new(list_area.x.saturating_add(3), row, 2, 1),
@@ -4349,35 +4350,42 @@ fn draw_lists_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let icon = if use_image_icon {
             "  ".to_string()
         } else {
-            list_icon_for_tui(raw_icon.as_deref(), is_foldered)
+            list_icon_for_tui(raw_icon.as_deref())
         };
-        let archive_image_icon = is_archived
-            && list_icon_image_enabled(
-                app.bootstrap_icons_enabled,
-                app.inline_images_enabled,
-                app.picker.protocol_type(),
-                Some(ARCHIVED_LIST_ICON),
-            );
+        let trailing_base_x = list_area
+            .x
+            .saturating_add(7)
+            .saturating_add(name.chars().count() as u16);
+        let mut trailing_cells = 0;
+        let folder_marker = if is_foldered {
+            trailing_list_icon_marker(
+                app,
+                &mut icon_targets,
+                FOLDER_LIST_ICON,
+                row,
+                trailing_base_x,
+                &mut trailing_cells,
+            )
+        } else {
+            String::new()
+        };
         let archive_marker = if is_archived {
-            if archive_image_icon {
-                app.ensure_list_icon_background(ARCHIVED_LIST_ICON);
-                let row = list_area.y.saturating_add(1 + (idx - start) as u16);
-                let x = list_area
-                    .x
-                    .saturating_add(7)
-                    .saturating_add(name.chars().count() as u16);
-                icon_targets.push((ARCHIVED_LIST_ICON.to_string(), Rect::new(x, row, 2, 1)));
-                "   ".to_string()
-            } else {
-                format!(" {}", archive_icon_for_tui())
-            }
+            trailing_list_icon_marker(
+                app,
+                &mut icon_targets,
+                ARCHIVED_LIST_ICON,
+                row,
+                trailing_base_x,
+                &mut trailing_cells,
+            )
         } else {
             String::new()
         };
         let open = (total - done).max(0);
         let marker = if idx == app.selected_list { ">" } else { " " };
         list_items.push(TuiListItem::new(format!(
-            "{marker} {icon} {name}{archive_marker} ({open}/{total})"
+            "{marker} {icon} {name}{folder_marker}{archive_marker} #{} ({open}/{total})",
+            list_id
         )));
     }
 
@@ -6198,14 +6206,44 @@ fn list_has_folder(list: &ShoppingList) -> bool {
             .is_some_and(|value| !value.is_empty())
 }
 
-#[cfg(test)]
-fn normalize_list_icon(raw_icon: Option<&str>) -> String {
-    list_icon_for_tui(raw_icon, false)
+fn trailing_list_icon_marker(
+    app: &mut App,
+    icon_targets: &mut Vec<(String, Rect)>,
+    asset: &str,
+    row: u16,
+    base_x: u16,
+    used_cells: &mut u16,
+) -> String {
+    let marker = if list_icon_image_enabled(
+        app.bootstrap_icons_enabled,
+        app.inline_images_enabled,
+        app.picker.protocol_type(),
+        Some(asset),
+    ) {
+        app.ensure_list_icon_background(asset);
+        icon_targets.push((
+            asset.to_string(),
+            Rect::new(base_x.saturating_add(*used_cells), row, 2, 1),
+        ));
+        "   ".to_string()
+    } else {
+        format!(
+            " {}",
+            bootstrap_icon_for_tui(&format!("bi-{asset}"), tui_icon_style())
+        )
+    };
+    *used_cells = (*used_cells).saturating_add(marker.chars().count() as u16);
+    marker
 }
 
-fn list_icon_for_tui(raw_icon: Option<&str>, is_foldered: bool) -> String {
+#[cfg(test)]
+fn normalize_list_icon(raw_icon: Option<&str>) -> String {
+    list_icon_for_tui(raw_icon)
+}
+
+fn list_icon_for_tui(raw_icon: Option<&str>) -> String {
     let style = tui_icon_style();
-    let icon = list_icon_asset_name(raw_icon, is_foldered);
+    let icon = list_icon_asset_name(raw_icon);
 
     if style == TuiIconStyle::Raw {
         let Some(raw_icon) = raw_icon.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -6220,21 +6258,8 @@ fn list_icon_for_tui(raw_icon: Option<&str>, is_foldered: bool) -> String {
         .unwrap_or_else(empty_icon_slot)
 }
 
-fn list_icon_asset_name(raw_icon: Option<&str>, is_foldered: bool) -> Option<String> {
-    bootstrap_icon_asset_name(raw_icon).or_else(|| {
-        Some(
-            if is_foldered {
-                FOLDER_LIST_ICON
-            } else {
-                DEFAULT_LIST_ICON
-            }
-            .to_string(),
-        )
-    })
-}
-
-fn archive_icon_for_tui() -> String {
-    bootstrap_icon_for_tui(&format!("bi-{ARCHIVED_LIST_ICON}"), tui_icon_style())
+fn list_icon_asset_name(raw_icon: Option<&str>) -> Option<String> {
+    bootstrap_icon_asset_name(raw_icon).or_else(|| Some(DEFAULT_LIST_ICON.to_string()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6823,14 +6848,15 @@ mod tests {
     }
 
     #[test]
-    fn foldered_lists_use_folder_icon_as_leading_fallback() {
+    fn foldered_lists_keep_list_icon_slot_and_use_trailing_folder_icon() {
         let folder_id_only = test_shopping_list(1, "Groceries", None, Some(83), None, false);
         assert!(list_has_folder(&folder_id_only));
+        assert_eq!(list_icon_asset_name(None), Some("tag".to_string()));
+        assert_eq!(list_icon_for_tui(None), "[tag]");
         assert_eq!(
-            list_icon_asset_name(None, true),
-            Some("folder2-open".to_string())
+            bootstrap_icon_for_tui(&format!("bi-{FOLDER_LIST_ICON}"), TuiIconStyle::Label),
+            "[folder2-open]"
         );
-        assert_eq!(list_icon_for_tui(None, true), "[folder2-open]");
 
         let named_folder = test_shopping_list(
             2,
@@ -6842,7 +6868,7 @@ mod tests {
         );
         assert!(list_has_folder(&named_folder));
         assert_eq!(
-            list_icon_asset_name(named_folder.icon.as_deref(), true),
+            list_icon_asset_name(named_folder.icon.as_deref()),
             Some("cart-fill".to_string())
         );
     }
@@ -6906,28 +6932,23 @@ mod tests {
             bootstrap_icon_for_tui("bi-unknown-icon", TuiIconStyle::Raw),
             "bi-unknown-icon"
         );
-        assert_eq!(list_icon_asset_name(None, false), Some("tag".to_string()));
+        assert_eq!(list_icon_asset_name(None), Some("tag".to_string()));
         assert_eq!(
-            list_icon_asset_name(Some(r#"<i class="bi bi-basket-fill"></i>"#), false),
+            list_icon_asset_name(Some(r#"<i class="bi bi-basket-fill"></i>"#)),
             Some("basket-fill".to_string())
         );
         assert_eq!(
-            list_icon_asset_name(Some("bi bi-cart-fill"), true),
+            list_icon_asset_name(Some("bi bi-cart-fill")),
             Some("cart-fill".to_string())
-        );
-        assert_eq!(
-            list_icon_asset_name(None, true),
-            Some("folder2-open".to_string())
         );
         assert_eq!(normalize_list_icon(Some("bi bi-cart-fill")), "[cart-fill]");
         assert_eq!(normalize_list_icon(None), "[tag]");
         assert_eq!(normalize_list_icon(Some("not an icon?")), "[tag]");
-        assert_eq!(list_icon_for_tui(None, true), "[folder2-open]");
+        assert_eq!(list_icon_for_tui(Some("bi bi-cart-fill")), "[cart-fill]");
         assert_eq!(
-            list_icon_for_tui(Some("bi bi-cart-fill"), true),
-            "[cart-fill]"
+            bootstrap_icon_for_tui(&format!("bi-{ARCHIVED_LIST_ICON}"), TuiIconStyle::Label),
+            "[archive]"
         );
-        assert_eq!(archive_icon_for_tui(), "[archive]");
         assert!(!list_icon_images_supported(ProtocolType::Halfblocks));
         assert!(list_icon_images_supported(ProtocolType::Kitty));
         assert!(list_icon_image_enabled(
