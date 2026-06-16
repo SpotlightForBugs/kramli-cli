@@ -322,8 +322,12 @@ impl ApiClient {
         span.set_tag("api.status_class", telemetry::status_class(status));
     }
 
-    fn format_api_error_message(body: &str) -> String {
-        let trimmed = body.trim();
+    fn format_api_error_message(body: &[u8]) -> String {
+        let Ok(text) = std::str::from_utf8(body) else {
+            return format!("[{} bytes]", body.len());
+        };
+
+        let trimmed = text.trim();
         if trimmed.is_empty() {
             return "(empty response)".to_string();
         }
@@ -334,16 +338,14 @@ impl ApiClient {
             }
         }
 
-        if std::str::from_utf8(body.as_bytes()).is_ok() {
-            let collapsed = trimmed
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-            if !collapsed.is_empty() {
-                return Self::truncate_error_message(&telemetry::scrub_message(&collapsed));
-            }
+        let collapsed = trimmed
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !collapsed.is_empty() {
+            return Self::truncate_error_message(&telemetry::scrub_message(&collapsed));
         }
 
         format!("[{} bytes]", body.len())
@@ -422,7 +424,7 @@ impl ApiClient {
                 "api-error",
                 &[
                     ("status", status.as_u16().to_string()),
-                    ("message", Self::format_api_error_message(&text)),
+                    ("message", Self::format_api_error_message(text.as_bytes())),
                 ],
             ))
         }
@@ -658,7 +660,7 @@ impl ApiClient {
                 "api-error",
                 &[
                     ("status", status.as_u16().to_string()),
-                    ("message", Self::format_api_error_message(&text)),
+                    ("message", Self::format_api_error_message(text.as_bytes())),
                 ],
             ))
         }
@@ -725,12 +727,11 @@ impl ApiClient {
         span.set_data_i64("api.response_bytes", metric_i64(bytes.len()));
         span.set_status(false);
         span.finish();
-        let body = String::from_utf8_lossy(&bytes);
         Err(tr_args(
             "api-error",
             &[
                 ("status", status.as_u16().to_string()),
-                ("message", Self::format_api_error_message(&body)),
+                ("message", Self::format_api_error_message(&bytes)),
             ],
         ))
     }
@@ -843,15 +844,15 @@ mod tests {
     #[test]
     fn api_error_message_extracts_common_json_fields() {
         assert_eq!(
-            ApiClient::format_api_error_message(r#"{"error":"List not found"}"#),
+            ApiClient::format_api_error_message(br#"{"error":"List not found"}"#),
             "List not found"
         );
         assert_eq!(
-            ApiClient::format_api_error_message(r#"{"message":"Forbidden"}"#),
+            ApiClient::format_api_error_message(br#"{"message":"Forbidden"}"#),
             "Forbidden"
         );
         assert_eq!(
-            ApiClient::format_api_error_message(r#"{"detail":"Invalid token"}"#),
+            ApiClient::format_api_error_message(br#"{"detail":"Invalid token"}"#),
             "Invalid token"
         );
     }
@@ -860,7 +861,7 @@ mod tests {
     fn api_error_message_extracts_validation_errors() {
         assert_eq!(
             ApiClient::format_api_error_message(
-                r#"{"errors":[{"message":"name is required"},{"message":"icon is invalid"}]}"#
+                br#"{"errors":[{"message":"name is required"},{"message":"icon is invalid"}]}"#
             ),
             "name is required; icon is invalid"
         );
@@ -869,7 +870,7 @@ mod tests {
     #[test]
     fn api_error_message_uses_plain_text_fallback() {
         assert_eq!(
-            ApiClient::format_api_error_message("Service unavailable"),
+            ApiClient::format_api_error_message(b"Service unavailable"),
             "Service unavailable"
         );
     }
@@ -877,13 +878,24 @@ mod tests {
     #[test]
     fn api_error_message_scrubs_sensitive_values() {
         let scrubbed =
-            ApiClient::format_api_error_message("Invalid API key: kramli_secretvalue rejected");
+            ApiClient::format_api_error_message(b"Invalid API key: kramli_secretvalue rejected");
         assert!(scrubbed.contains("kramli_[REDACTED]"));
         assert!(!scrubbed.contains("kramli_secretvalue"));
     }
 
     #[test]
     fn api_error_message_reports_empty_response() {
-        assert_eq!(ApiClient::format_api_error_message("  \n  "), "(empty response)");
+        assert_eq!(
+            ApiClient::format_api_error_message(b"  \n  "),
+            "(empty response)"
+        );
+    }
+
+    #[test]
+    fn api_error_message_reports_non_utf8_as_byte_count() {
+        assert_eq!(
+            ApiClient::format_api_error_message(&[0xff, 0xfe]),
+            "[2 bytes]"
+        );
     }
 }
