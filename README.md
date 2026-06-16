@@ -109,13 +109,6 @@ KRAMLI_LANG=pt_BR kramli profile
 KRAMLI_ICON_STYLE=emoji kramli lists list
 ```
 
-## Privacy and update checks
-
-- Crash telemetry is **off by default**.
-- Enable telemetry explicitly with `KRAMLI_TELEMETRY=1`.
-- Force-disable telemetry with `DO_NOT_TRACK=1` or `KRAMLI_NO_TELEMETRY=1`.
-- Telemetry events are scrubbed before sending (API keys, emails, response bodies, and structured context fields).
-
 Check for a new CLI release manually:
 
 ```bash
