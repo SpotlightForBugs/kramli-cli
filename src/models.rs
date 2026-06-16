@@ -498,13 +498,6 @@ pub struct OkResponse {
     pub undo_token: Option<String>,
 }
 
-// ── Error ──
-
-#[derive(Debug, Deserialize)]
-pub struct ApiError {
-    pub error: Option<String>,
-}
-
 // ── API Key ──
 
 #[derive(Debug, Serialize, Deserialize)]
