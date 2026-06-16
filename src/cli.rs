@@ -107,6 +107,11 @@ pub enum Commands {
         #[arg(long, value_delimiter = ',')]
         docs: Option<Vec<String>>,
     },
+    /// Send or clear cross-device activity handoff state
+    Handoff {
+        #[command(subcommand)]
+        action: HandoffCmd,
+    },
     /// Check server connectivity
     Ping,
     /// Show CLI configuration
@@ -334,8 +339,30 @@ mod tests {
     }
 
     #[test]
-    fn manual_handoff_command_is_not_exposed() {
-        assert!(Cli::try_parse_from(["kramli", "handoff", "clear"]).is_err());
+    fn parses_manual_handoff_command_for_compatibility() {
+        let cli = Cli::try_parse_from(["kramli", "handoff", "clear"])
+            .expect("handoff clear parse should work");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Handoff {
+                action: HandoffCmd::Clear
+            })
+        ));
+    }
+
+    #[test]
+    fn handoff_payload_does_not_request_integration_open() {
+        let body = handoff_body(42, Some("Groceries".to_string()), "Kramli CLI".to_string());
+        assert_eq!(body.get("list_id"), Some(&Value::from(42)));
+        assert_eq!(
+            body.get("list_name"),
+            Some(&Value::String("Groceries".to_string()))
+        );
+        assert_eq!(
+            body.get("device_label"),
+            Some(&Value::String("Kramli CLI".to_string()))
+        );
+        assert!(body.get("integration").is_none());
     }
 
     #[test]
@@ -563,6 +590,28 @@ pub enum SecurityCmd {
     },
 }
 
+#[derive(Subcommand)]
+pub enum HandoffCmd {
+    /// Mark a list as currently viewed on this device
+    Viewing {
+        list_id: i64,
+        #[arg(long)]
+        list_name: Option<String>,
+        #[arg(long)]
+        device: Option<String>,
+    },
+    /// Ask another device to continue with this list
+    Continue {
+        list_id: i64,
+        #[arg(long)]
+        list_name: Option<String>,
+        #[arg(long)]
+        device: Option<String>,
+    },
+    /// Clear current handoff state
+    Clear,
+}
+
 // ─── Dispatch ───
 
 pub async fn run(cli: Cli) -> Result<(), String> {
@@ -608,8 +657,6 @@ async fn run_inner(cli: Cli) -> Result<(), String> {
         set_override(false);
     }
 
-    maybe_apply_profile_locale(cli.command.as_ref()).await;
-
     if cli.interactive {
         if cli.json {
             return Err(tr("cli-interactive-json-conflict"));
@@ -629,6 +676,8 @@ async fn run_inner(cli: Cli) -> Result<(), String> {
     let Some(command) = cli.command else {
         return Err(tr("cli-missing-command"));
     };
+
+    maybe_apply_profile_locale(Some(&command)).await;
 
     let result = run_command(command, cli.json).await;
     if result.is_ok() && should_auto_update_check {
@@ -654,6 +703,7 @@ fn command_trace_name(command: &Commands) -> &'static str {
         Commands::Profile => "profile",
         Commands::Security { .. } => "security",
         Commands::AcceptTerms { .. } => "accept_terms",
+        Commands::Handoff { .. } => "handoff",
         Commands::Ping => "ping",
         Commands::Config => "config",
         Commands::UpdateCheck => "update_check",
@@ -680,6 +730,7 @@ async fn run_command(command: Commands, as_json: bool) -> Result<(), String> {
         Commands::Profile => run_profile(as_json).await,
         Commands::Security { action } => run_security(action, as_json).await,
         Commands::AcceptTerms { docs } => run_accept_terms(docs, as_json).await,
+        Commands::Handoff { action } => run_handoff(action, as_json).await,
         Commands::Ping => run_ping(as_json).await,
         Commands::Config => run_config(as_json),
         Commands::UpdateCheck => run_update_check(as_json).await,
@@ -1062,6 +1113,24 @@ fn auto_update_check_enabled() -> bool {
     env_flag_enabled("KRAMLI_AUTO_UPDATE_CHECK", false)
 }
 
+fn auto_handoff_enabled() -> bool {
+    env_flag_enabled("KRAMLI_AUTO_HANDOFF", true)
+}
+
+fn handoff_body(
+    list_id: i64,
+    list_name: Option<String>,
+    device_label: String,
+) -> serde_json::Map<String, Value> {
+    let mut body = serde_json::Map::new();
+    body.insert("list_id".into(), Value::from(list_id));
+    body.insert("device_label".into(), Value::String(device_label));
+    if let Some(name) = normalize_optional_text(list_name) {
+        body.insert("list_name".into(), Value::String(name));
+    }
+    body
+}
+
 fn unix_timestamp_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1225,17 +1294,16 @@ async fn maybe_auto_update_notice() {
     );
 }
 
-async fn maybe_auto_handoff(api: &ApiClient, list_id: i64, list_name: Option<&str>) {
-    let mut body = serde_json::Map::new();
-    body.insert("list_id".into(), Value::from(list_id));
-    body.insert(
-        "device_label".into(),
-        Value::String(default_handoff_device_label()),
-    );
-    body.insert("integration".into(), Value::String("cli".to_string()));
-    if let Some(name) = list_name.map(str::trim).filter(|name| !name.is_empty()) {
-        body.insert("list_name".into(), Value::String(name.to_string()));
+async fn maybe_auto_handoff(api: &ApiClient, list_id: i64, list_name: Option<&str>, as_json: bool) {
+    if as_json || !auto_handoff_enabled() {
+        return;
     }
+
+    let body = handoff_body(
+        list_id,
+        list_name.map(str::to_string),
+        default_handoff_device_label(None),
+    );
 
     let _: Result<Value, String> = api.post("/activity/viewing", &body).await;
 }
@@ -1279,7 +1347,7 @@ async fn run_lists(cmd: ListCmd, as_json: bool) -> Result<(), String> {
         ListCmd::Show { id } => {
             let list: ShoppingList = api.get(&format!("/lists/{id}")).await?;
             json_or!(as_json, list, output::print_list_detail(&list));
-            maybe_auto_handoff(&api, id, Some(&list.name)).await;
+            maybe_auto_handoff(&api, id, Some(&list.name), as_json).await;
         }
         ListCmd::Create {
             name,
@@ -1453,7 +1521,7 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
             }
 
             json_or!(as_json, filtered, output::print_items(&filtered));
-            maybe_auto_handoff(&api, list_id, None).await;
+            maybe_auto_handoff(&api, list_id, None, as_json).await;
         }
         ItemCmd::Show { id } => {
             // Fetch item from its list (the items endpoint returns full data)
@@ -1470,7 +1538,7 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
                 output::print_item_detail(&item, &comments);
             }
             if let Some(list_id) = item.list_id {
-                maybe_auto_handoff(&api, list_id, None).await;
+                maybe_auto_handoff(&api, list_id, None, as_json).await;
             }
         }
         ItemCmd::Add {
@@ -1672,7 +1740,7 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
             } else {
                 output::print_items(&done);
             }
-            maybe_auto_handoff(&api, list_id, None).await;
+            maybe_auto_handoff(&api, list_id, None, as_json).await;
         }
         ItemCmd::Comment { id, text } => {
             let resp: Value = api
@@ -2022,7 +2090,7 @@ async fn run_activity(list_id: i64, limit: u32, as_json: bool) -> Result<(), Str
         .get_query(&format!("/lists/{list_id}/activity"), &[("limit", &lim)])
         .await?;
     json_or!(as_json, e, output::print_activity(&e));
-    maybe_auto_handoff(&api, list_id, None).await;
+    maybe_auto_handoff(&api, list_id, None, as_json).await;
     Ok(())
 }
 
@@ -2044,13 +2112,70 @@ async fn run_redo(list_id: i64) -> Result<(), String> {
     Ok(())
 }
 
-fn default_handoff_device_label() -> String {
+fn normalize_optional_text(raw: Option<String>) -> Option<String> {
+    raw.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn default_handoff_device_label(raw: Option<String>) -> String {
+    if let Some(value) = normalize_optional_text(raw) {
+        return value.chars().take(80).collect();
+    }
     if let Ok(value) = std::env::var("KRAMLI_DEVICE_LABEL") {
         if !value.trim().is_empty() {
             return value.trim().chars().take(80).collect();
         }
     }
     "Kramli CLI".to_string()
+}
+
+async fn run_handoff(cmd: HandoffCmd, as_json: bool) -> Result<(), String> {
+    let api = get_api()?;
+
+    match cmd {
+        HandoffCmd::Viewing {
+            list_id,
+            list_name,
+            device,
+        } => {
+            let body = handoff_body(list_id, list_name, default_handoff_device_label(device));
+            let resp: Value = api.post("/activity/viewing", &body).await?;
+            json_or!(
+                as_json,
+                resp,
+                println!("{} {}", "✓".green(), tr("cli-handoff-viewing-sent"))
+            );
+        }
+        HandoffCmd::Continue {
+            list_id,
+            list_name,
+            device,
+        } => {
+            let body = handoff_body(list_id, list_name, default_handoff_device_label(device));
+            let resp: Value = api.post("/activity/continue-on-device", &body).await?;
+            json_or!(
+                as_json,
+                resp,
+                println!("{} {}", "✓".green(), tr("cli-handoff-continue-sent"))
+            );
+        }
+        HandoffCmd::Clear => {
+            let resp: Value = api.post("/activity/clear", &json!({})).await?;
+            json_or!(
+                as_json,
+                resp,
+                println!("{} {}", "✓".green(), tr("cli-handoff-cleared"))
+            );
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), String> {
@@ -2667,6 +2792,7 @@ async fn run_ping(as_json: bool) -> Result<(), String> {
 fn run_config(as_json: bool) -> Result<(), String> {
     let cfg = Config::load();
     let telemetry_enabled = telemetry::is_enabled();
+    let bootstrap_icons_enabled = cfg.bootstrap_icons_enabled();
     let auto_update_enabled = auto_update_check_enabled();
     if as_json {
         let out = json!({
@@ -2675,6 +2801,7 @@ fn run_config(as_json: bool) -> Result<(), String> {
             "api_key_stored": cfg.has_api_key(),
             "api_key_source": if cfg.api_key_from_env() { "env" } else { "keychain" },
             "telemetry_enabled": telemetry_enabled,
+            "bootstrap_icons_enabled": bootstrap_icons_enabled,
             "auto_update_check": auto_update_enabled,
             "last_update_check": cfg.update_check_last(),
             "last_update_version": cfg.update_check_latest(),
@@ -2708,6 +2835,15 @@ fn run_config(as_json: bool) -> Result<(), String> {
         "{} {}",
         tr("label-telemetry"),
         if telemetry_enabled {
+            tr("label-enabled").green().to_string()
+        } else {
+            tr("label-disabled").yellow().to_string()
+        }
+    );
+    println!(
+        "{} {}",
+        tr("label-bootstrap-icons"),
+        if bootstrap_icons_enabled {
             tr("label-enabled").green().to_string()
         } else {
             tr("label-disabled").yellow().to_string()

@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -41,7 +42,11 @@ const SELECTED_BG: Color = Color::Rgb(35, 103, 197);
 const MUTED_TEXT: Color = Color::Reset;
 const CANCEL_BG: Color = Color::Rgb(96, 104, 122);
 const SAVE_BG: Color = Color::Rgb(38, 132, 78);
+const DRAG_TARGET_COLOR: Color = Color::Yellow;
 const BOOTSTRAP_ICON_BASE_URL: &str = "https://icons.getbootstrap.com/assets/icons";
+const DEFAULT_LIST_ICON: &str = "tag";
+const ARCHIVED_LIST_ICON: &str = "archive";
+const FOLDER_LIST_ICON: &str = "folder2-open";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ViewMode {
@@ -112,19 +117,19 @@ impl FooterAction {
 
     fn chip_label(self) -> String {
         match self {
-            Self::Help => "Help".to_string(),
-            Self::Add => "Add".to_string(),
-            Self::Edit => "Edit".to_string(),
-            Self::ToggleDone => "Done".to_string(),
-            Self::Delete => "Delete".to_string(),
-            Self::Filter => "Search".to_string(),
-            Self::Refresh => "Refresh".to_string(),
-            Self::Comment => "Comment".to_string(),
-            Self::OpenImage => "Image".to_string(),
-            Self::Members => "Members".to_string(),
-            Self::Invite => "Invite".to_string(),
-            Self::Undo => "Undo".to_string(),
-            Self::Quit => "Quit".to_string(),
+            Self::Help => tr("tui-footer-help"),
+            Self::Add => tr("tui-footer-add"),
+            Self::Edit => tr("tui-footer-edit"),
+            Self::ToggleDone => tr("tui-footer-done"),
+            Self::Delete => tr("tui-footer-delete"),
+            Self::Filter => tr("tui-footer-search"),
+            Self::Refresh => tr("tui-footer-refresh"),
+            Self::Comment => tr("tui-footer-comment"),
+            Self::OpenImage => tr("tui-footer-image"),
+            Self::Members => tr("tui-footer-members"),
+            Self::Invite => tr("tui-footer-invite"),
+            Self::Undo => tr("tui-footer-undo"),
+            Self::Quit => tr("tui-footer-quit"),
         }
     }
 
@@ -502,6 +507,7 @@ struct App {
     profile_photo_url: Option<String>,
     profile_image: Option<DetailImageState>,
     list_icon_images: HashMap<String, Protocol>,
+    bootstrap_icons_enabled: bool,
     image_runtime_info: Option<String>,
     image_runtime_debug: Vec<String>,
     key_bindings: KeyBindings,
@@ -559,15 +565,14 @@ struct CalendarItemHit {
 #[derive(Debug)]
 struct CalendarLayout {
     title: String,
-    lines: Vec<Line<'static>>,
+    month_title: String,
+    agenda_title: String,
+    month_area: Rect,
+    agenda_area: Rect,
+    month_lines: Vec<Line<'static>>,
+    agenda_lines: Vec<Line<'static>>,
     date_hits: Vec<CalendarDateHit>,
     item_hits: Vec<CalendarItemHit>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CalendarAgendaTarget {
-    Date(SimpleDate),
-    Undated,
 }
 
 const ITEM_EDITOR_FIELDS: [EditorField; 7] = [
@@ -586,8 +591,10 @@ pub async fn run_tui() -> Result<(), String> {
     transaction.set_tag("mode", "interactive");
     let cfg = Config::load();
     let api = ApiClient::new(&cfg)?;
+    let bootstrap_icons_enabled = cfg.bootstrap_icons_enabled();
     let mut terminal = init_terminal()?;
-    let mut app = App::new(api);
+    let mut terminal_guard = TerminalCleanupGuard::new();
+    let mut app = App::new(api, bootstrap_icons_enabled);
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
         .map_err(|e| e.to_string())?;
@@ -606,9 +613,16 @@ pub async fn run_tui() -> Result<(), String> {
         app.image_runtime_info = Some(image_runtime_info);
         app.image_runtime_debug = image_runtime_debug;
     }
+    if !app.initial_load_started {
+        app.initial_load_started = true;
+        app.start_initial_load();
+    }
     app.status = Some(tr("cli-interactive-beta-notice"));
     let result = run_event_loop(&mut terminal, &mut app).await;
     let restore_result = restore_terminal(&mut terminal);
+    if restore_result.is_ok() {
+        terminal_guard.dismiss();
+    }
     let ok = result.is_ok() && restore_result.is_ok();
     transaction.set_tag("outcome", if ok { "ok" } else { "error" });
     transaction.finish(ok);
@@ -619,20 +633,78 @@ pub async fn run_tui() -> Result<(), String> {
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>, String> {
     enable_raw_mode().map_err(|e| e.to_string())?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).map_err(|e| e.to_string())?;
+    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        let _ = disable_raw_mode();
+        return Err(error.to_string());
+    }
     let backend = CrosstermBackend::new(stdout);
-    Terminal::new(backend).map_err(|e| e.to_string())
+    Terminal::new(backend).map_err(|error| {
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(
+            stdout,
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            crossterm::cursor::Show
+        );
+        error.to_string()
+    })
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), String> {
-    disable_raw_mode().map_err(|e| e.to_string())?;
-    execute!(
+    let mut first_error = None;
+    if let Err(error) = disable_raw_mode() {
+        first_error.get_or_insert_with(|| error.to_string());
+    }
+    if let Err(error) = execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
-    )
-    .map_err(|e| e.to_string())?;
-    terminal.show_cursor().map_err(|e| e.to_string())
+    ) {
+        first_error.get_or_insert_with(|| error.to_string());
+    }
+    if let Err(error) = terminal.show_cursor() {
+        first_error.get_or_insert_with(|| error.to_string());
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+struct TerminalCleanupGuard {
+    active: bool,
+}
+
+impl TerminalCleanupGuard {
+    fn new() -> Self {
+        Self { active: true }
+    }
+
+    fn dismiss(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for TerminalCleanupGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(
+            stdout,
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            crossterm::cursor::Show
+        );
+    }
+}
+
+fn is_global_quit_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 async fn run_event_loop(
@@ -663,6 +735,11 @@ async fn run_event_loop(
             match event::read().map_err(|e| e.to_string())? {
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    if is_global_quit_key(key) {
+                        app.should_quit = true;
+                        dirty = true;
                         continue;
                     }
                     let result = if app.requires_beta_consent() {
@@ -712,7 +789,7 @@ async fn run_event_loop(
 }
 
 impl App {
-    fn new(api: ApiClient) -> Self {
+    fn new(api: ApiClient, bootstrap_icons_enabled: bool) -> Self {
         let (tx, rx) = unbounded_channel();
         Self {
             api,
@@ -764,6 +841,7 @@ impl App {
             profile_photo_url: None,
             profile_image: None,
             list_icon_images: HashMap::new(),
+            bootstrap_icons_enabled,
             image_runtime_info: None,
             image_runtime_debug: Vec::new(),
             key_bindings: KeyBindings::from_env(),
@@ -806,7 +884,15 @@ impl App {
         }
 
         self.beta_consent_pending = false;
-        self.status = Some(tr("label-lists"));
+        if self.legal_consent_pending {
+            self.status = Some(tr_args(
+                "tui-legal-consent-pending",
+                &[("docs", self.legal_pending_docs.join(", "))],
+            ));
+        } else {
+            self.status = Some(tr("label-lists"));
+            self.reload_lists_background();
+        }
 
         if !self.initial_load_started {
             self.initial_load_started = true;
@@ -865,10 +951,10 @@ impl App {
     fn handle_legal_consent_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => self.accept_legal_consent(),
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N') => {
-                if !self.legal_accepting {
-                    self.decline_legal_consent();
-                }
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N')
+                if !self.legal_accepting =>
+            {
+                self.decline_legal_consent();
             }
             _ => {}
         }
@@ -981,6 +1067,11 @@ impl App {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string);
             self.refresh_profile_image_background();
+
+            if self.beta_consent_pending {
+                return;
+            }
+
             if self.legal_consent_pending {
                 self.status = Some(tr_args(
                     "tui-legal-consent-pending",
@@ -1077,11 +1168,7 @@ impl App {
             self.items.clear();
             return;
         }
-        lists.sort_by(|a, b| {
-            a.name
-                .to_ascii_lowercase()
-                .cmp(&b.name.to_ascii_lowercase())
-        });
+        sort_lists_for_tui(&mut lists);
         self.items_cache.clear();
         self.lists = lists;
 
@@ -1095,6 +1182,9 @@ impl App {
     }
 
     fn send_auto_handoff_viewing_background(&mut self) {
+        if !auto_handoff_enabled() {
+            return;
+        }
         let Some(list_id) = self.selected_list_id() else {
             return;
         };
@@ -1116,7 +1206,6 @@ impl App {
                 "device_label".to_string(),
                 Value::String(default_handoff_device_label()),
             );
-            body.insert("integration".to_string(), Value::String("cli".to_string()));
             let _: Result<Value, String> =
                 api.post("/activity/viewing", &Value::Object(body)).await;
             LoadMessage::AutoHandoffSent
@@ -1135,6 +1224,11 @@ impl App {
         self.calendar_drag_source_date = None;
         self.calendar_drag_target_date = None;
         self.calendar_drag_started = false;
+    }
+
+    fn clear_drag_state(&mut self) {
+        self.clear_kanban_drag_state();
+        self.clear_calendar_drag_state();
     }
 
     fn sync_calendar_date_to_selected_item(&mut self) {
@@ -1164,11 +1258,6 @@ impl App {
             }
         }
         today_utc()
-    }
-
-    fn calendar_selected_date_has_items(&self) -> bool {
-        self.calendar_selected_date
-            .is_some_and(|date| calendar_date_has_items(&self.items, date))
     }
 
     fn move_calendar_date_selection(&mut self, delta_days: i64) {
@@ -1209,6 +1298,12 @@ impl App {
             self.selected_item = index;
         }
         self.clear_calendar_drag_state();
+    }
+
+    fn pointer_calendar_month(&self) -> SimpleDate {
+        self.calendar_visible_month
+            .or_else(|| self.calendar_selected_date.map(start_of_month))
+            .unwrap_or_else(|| start_of_month(self.default_calendar_date()))
     }
 
     fn load_items_for_selected_list(&mut self, preserve_visible_items: bool) {
@@ -1559,7 +1654,8 @@ impl App {
     }
 
     fn ensure_list_icon_background(&mut self, icon: &str) {
-        if !self.inline_images_enabled
+        if !self.bootstrap_icons_enabled
+            || !self.inline_images_enabled
             || self.list_icon_images.contains_key(icon)
             || self.pending_list_icons.contains(icon)
             || self.failed_list_icons.contains(icon)
@@ -2122,7 +2218,13 @@ impl App {
                 }
                 FocusPane::Items => {
                     if self.mode == ViewMode::Calendar {
-                        self.move_calendar_date_selection(-7);
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            if self.move_selected_item_calendar_hours(-1).await? {
+                                item_changed = true;
+                            }
+                        } else {
+                            self.move_calendar_date_selection(-7);
+                        }
                     } else if self.mode == ViewMode::Kanban {
                         if self.move_kanban_selection_wrapped(-1) {
                             item_changed = true;
@@ -2152,7 +2254,13 @@ impl App {
                 }
                 FocusPane::Items => {
                     if self.mode == ViewMode::Calendar {
-                        self.move_calendar_date_selection(7);
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            if self.move_selected_item_calendar_hours(1).await? {
+                                item_changed = true;
+                            }
+                        } else {
+                            self.move_calendar_date_selection(7);
+                        }
                     } else if self.mode == ViewMode::Kanban {
                         if self.move_kanban_selection_wrapped(1) {
                             item_changed = true;
@@ -2174,18 +2282,22 @@ impl App {
                 if matches!(self.focus, FocusPane::Lists) {
                     list_changed = true;
                     self.focus = FocusPane::Items;
-                } else if self.mode == ViewMode::Calendar
-                    && self.calendar_selected_date.is_some()
-                    && !self.calendar_selected_date_has_items()
-                {
-                    self.open_add_editor()?;
+                } else if self.mode == ViewMode::Calendar && self.calendar_selected_date.is_some() {
+                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                        self.open_editor()?;
+                    } else {
+                        self.open_add_editor()?;
+                    }
                 } else {
                     self.open_editor()?;
                 }
             }
             KeyCode::Esc => {
-                if self.mode == ViewMode::Calendar && self.calendar_selected_date.is_some() {
-                    self.sync_calendar_date_to_selected_item();
+                if self.mode == ViewMode::Calendar && self.calendar_drag_item.is_some() {
+                    self.clear_calendar_drag_state();
+                } else if self.mode == ViewMode::Calendar && self.calendar_selected_date.is_some() {
+                    self.calendar_selected_date = None;
+                    self.clear_calendar_drag_state();
                 }
             }
             KeyCode::Char('?') | KeyCode::F(1) => self.show_help = true,
@@ -2305,13 +2417,12 @@ impl App {
                     active_editor_value_mut(editor).clear();
                 }
             }
-            KeyCode::Char(ch) => {
+            KeyCode::Char(ch)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT)
-                {
-                    if let Some(editor) = self.editor.as_mut() {
-                        active_editor_value_mut(editor).push(ch);
-                    }
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(editor) = self.editor.as_mut() {
+                    active_editor_value_mut(editor).push(ch);
                 }
             }
             _ => {}
@@ -2373,6 +2484,10 @@ impl App {
 
         let layout = ui_layout(area);
 
+        if left_up && !rect_contains(layout.content, mouse.column, mouse.row) {
+            self.clear_drag_state();
+        }
+
         for (idx, rect) in layout.tab_chunks.iter().enumerate() {
             if left_down && rect_contains(*rect, mouse.column, mouse.row) {
                 self.mode = match idx {
@@ -2380,8 +2495,7 @@ impl App {
                     1 => ViewMode::Kanban,
                     _ => ViewMode::Calendar,
                 };
-                self.clear_kanban_drag_state();
-                self.clear_calendar_drag_state();
+                self.clear_drag_state();
                 return Ok(());
             }
         }
@@ -2393,11 +2507,10 @@ impl App {
             }
         }
 
-        let list_rows_area = list_panel_rows_area(layout.lists);
+        let list_rows_area = item_rows_area(list_panel_rows_area(layout.lists));
         if left_down && rect_contains(list_rows_area, mouse.column, mouse.row) {
             self.focus = FocusPane::Lists;
-            let row = self.list_scroll
-                + mouse.row.saturating_sub(list_rows_area.y.saturating_add(1)) as usize;
+            let row = self.list_scroll + mouse.row.saturating_sub(list_rows_area.y) as usize;
             if row < self.lists.len() {
                 self.selected_list = row;
                 self.calendar_selected_date = None;
@@ -2406,21 +2519,29 @@ impl App {
                 self.send_auto_handoff_viewing_background();
                 self.focus = FocusPane::Items;
             }
-            self.clear_kanban_drag_state();
-            self.clear_calendar_drag_state();
+            self.clear_drag_state();
             return Ok(());
         }
 
         if rect_contains(layout.lists, mouse.column, mouse.row) {
+            if left_up {
+                self.clear_drag_state();
+            }
             return Ok(());
         }
 
         if !rect_contains(layout.content, mouse.column, mouse.row) {
+            if left_up {
+                self.clear_drag_state();
+            }
             return Ok(());
         }
 
         self.focus = FocusPane::Items;
         if self.items.is_empty() {
+            if left_up {
+                self.clear_drag_state();
+            }
             self.status = Some(item_placeholder(self));
             return Ok(());
         }
@@ -2432,10 +2553,11 @@ impl App {
                     self.open_selected_image_background()?;
                     return Ok(());
                 }
-                if left_down && rect_contains(list_rect, mouse.column, mouse.row) {
+                let list_items_area = item_rows_area(list_rect);
+                if left_down && rect_contains(list_items_area, mouse.column, mouse.row) {
                     let visible = self.visible_item_indices();
-                    let row = self.item_scroll
-                        + mouse.row.saturating_sub(list_rect.y.saturating_add(1)) as usize;
+                    let row =
+                        self.item_scroll + mouse.row.saturating_sub(list_items_area.y) as usize;
                     if let Some(clicked) = visible.get(row).copied() {
                         self.selected_item = clicked;
                         if self.register_item_click(clicked) {
@@ -2491,10 +2613,11 @@ impl App {
 
                     for (local_index, rect) in chunks.iter().enumerate() {
                         let col_index = start_col + local_index;
-                        if !rect_contains(*rect, mouse.column, mouse.row) {
+                        let column_items_area = item_rows_area(*rect);
+                        if !rect_contains(column_items_area, mouse.column, mouse.row) {
                             continue;
                         }
-                        let row = mouse.row.saturating_sub(rect.y.saturating_add(1)) as usize;
+                        let row = mouse.row.saturating_sub(column_items_area.y) as usize;
                         let max_rows = rect.height.saturating_sub(2) as usize;
                         let total = buckets[col_index].len();
                         let (start, item_count, show_top, _show_bottom) =
@@ -2520,35 +2643,46 @@ impl App {
                 }
             }
             ViewMode::Calendar => {
-                let calendar = self.calendar_layout(layout.content);
-                let hovered_date = calendar_date_at(&calendar, mouse.column, mouse.row);
-                let hovered_item = calendar_item_at(&calendar, mouse.column, mouse.row);
-
                 if left_drag {
                     if self.calendar_drag_item.is_some() {
+                        let month = self.pointer_calendar_month();
                         self.calendar_drag_started = true;
-                        self.calendar_drag_target_date = hovered_date;
+                        self.calendar_drag_target_date =
+                            calendar_pointer_date(layout.content, mouse.column, mouse.row, month);
                     }
                     return Ok(());
                 }
 
                 if left_up {
-                    if let Some(item_index) = self.calendar_drag_item.take() {
-                        let source_date = self.calendar_drag_source_date.take();
-                        let drag_started = self.calendar_drag_started;
-                        self.calendar_drag_started = false;
-                        let target_date = self.calendar_drag_target_date.take().or(hovered_date);
-                        if drag_started {
+                    if self.calendar_drag_started {
+                        if let Some(item_index) = self.calendar_drag_item.take() {
+                            let source_date = self.calendar_drag_source_date.take();
+                            self.calendar_drag_started = false;
+                            let hovered_date = {
+                                let month = self.pointer_calendar_month();
+                                calendar_pointer_date(
+                                    layout.content,
+                                    mouse.column,
+                                    mouse.row,
+                                    month,
+                                )
+                            };
+                            let target_date =
+                                self.calendar_drag_target_date.take().or(hovered_date);
                             if let Some(target_date) = target_date {
                                 self.calendar_selected_date = Some(target_date);
                                 self.calendar_visible_month = Some(start_of_month(target_date));
                                 if source_date != Some(target_date) {
                                     self.move_item_to_calendar_date(item_index, target_date)
                                         .await?;
+                                    self.clear_calendar_drag_state();
                                     return Ok(());
                                 }
                             }
                         }
+                        self.clear_calendar_drag_state();
+                    } else if self.calendar_drag_item.is_some() {
+                        self.status = Some(tr("tui-help-calendar-3"));
                     }
                     return Ok(());
                 }
@@ -2557,26 +2691,84 @@ impl App {
                     return Ok(());
                 }
 
+                let calendar = self.calendar_layout(layout.content);
+                let hovered_date = calendar_date_at(&calendar, mouse.column, mouse.row);
+                let hovered_item = calendar_item_at(&calendar, mouse.column, mouse.row);
+                let clicked_agenda = rect_contains(calendar.agenda_area, mouse.column, mouse.row);
+                let clicked_agenda_header = clicked_agenda && mouse.row == calendar.agenda_area.y;
+                let agenda_inner = calendar.agenda_area.inner(Margin {
+                    vertical: 1,
+                    horizontal: 1,
+                });
+                let clicked_agenda_empty = self.calendar_selected_date.is_some()
+                    && rect_contains(agenda_inner, mouse.column, mouse.row)
+                    && mouse.row.saturating_sub(agenda_inner.y) as usize
+                        >= calendar.agenda_lines.len();
+
+                if clicked_agenda_header && self.calendar_selected_date.is_some() {
+                    self.calendar_selected_date = None;
+                    self.clear_calendar_drag_state();
+                    self.status = Some(tr("tui-help-calendar-2"));
+                    return Ok(());
+                }
+
                 if let Some(item_index) = hovered_item {
                     self.selected_item = item_index;
-                    self.sync_calendar_date_to_selected_item();
                     if self.register_item_click(item_index) {
+                        self.clear_calendar_drag_state();
                         self.open_editor()?;
                         return Ok(());
                     }
-                    self.calendar_drag_item = Some(item_index);
-                    self.calendar_drag_source_date = self.items[item_index]
-                        .due_date
-                        .as_deref()
-                        .and_then(parse_iso_date);
-                    self.calendar_drag_target_date = hovered_date;
-                    self.calendar_drag_started = false;
+                    if clicked_agenda {
+                        self.calendar_drag_item = Some(item_index);
+                        self.calendar_drag_source_date = self.items[item_index]
+                            .due_date
+                            .as_deref()
+                            .and_then(parse_iso_date);
+                        self.calendar_drag_target_date = None;
+                        self.calendar_drag_started = false;
+                        self.status = Some(tr("tui-help-calendar-3"));
+                    } else {
+                        if let Some(date) = self.items[item_index]
+                            .due_date
+                            .as_deref()
+                            .and_then(parse_iso_date)
+                        {
+                            self.calendar_selected_date = Some(date);
+                            self.calendar_visible_month = Some(start_of_month(date));
+                        }
+                        self.clear_calendar_drag_state();
+                    }
                 } else if let Some(date) = hovered_date {
-                    self.calendar_selected_date = Some(date);
+                    if let Some(item_index) = self.calendar_drag_item {
+                        self.selected_item = item_index;
+                        self.calendar_selected_date = Some(date);
+                        self.calendar_visible_month = Some(start_of_month(date));
+                        if self.calendar_drag_source_date != Some(date) {
+                            self.move_item_to_calendar_date(item_index, date).await?;
+                        }
+                        self.clear_calendar_drag_state();
+                        return Ok(());
+                    }
+                    if self.calendar_selected_date == Some(date) {
+                        self.calendar_selected_date = None;
+                        self.status = Some(tr("tui-help-calendar-2"));
+                    } else {
+                        self.calendar_selected_date = Some(date);
+                        self.status = Some(tr("tui-help-calendar-3"));
+                    }
                     self.calendar_visible_month = Some(start_of_month(date));
                     self.clear_calendar_drag_state();
+                } else if clicked_agenda_empty {
+                    self.clear_calendar_drag_state();
+                    self.open_add_editor()?;
+                    return Ok(());
                 }
             }
+        }
+
+        if left_up {
+            self.clear_drag_state();
         }
 
         if self.selected_item != previous_item && self.mode == ViewMode::List {
@@ -2924,21 +3116,69 @@ impl App {
             return Ok(());
         }
 
+        let due_date = due_date_with_preserved_time(item.due_date.as_deref(), target_date);
+        self.update_item_due_date(item_index, due_date).await
+    }
+
+    async fn move_selected_item_calendar_hours(
+        &mut self,
+        delta_hours: i32,
+    ) -> Result<bool, String> {
+        if delta_hours == 0 || self.mode != ViewMode::Calendar {
+            return Ok(false);
+        }
+        let Some(item) = self.items.get(self.selected_item).cloned() else {
+            return Ok(false);
+        };
+
+        let fallback_date = self
+            .calendar_selected_date
+            .or_else(|| item.due_date.as_deref().and_then(parse_iso_date))
+            .unwrap_or_else(today_utc);
+        let due_date =
+            due_date_with_hour_delta(item.due_date.as_deref(), fallback_date, delta_hours);
+        if item.due_date.as_deref() == Some(due_date.as_str()) {
+            return Ok(false);
+        }
+
+        self.update_item_due_date(self.selected_item, due_date)
+            .await?;
+        Ok(true)
+    }
+
+    async fn update_item_due_date(
+        &mut self,
+        item_index: usize,
+        due_date: String,
+    ) -> Result<(), String> {
+        let Some(item) = self.items.get(item_index).cloned() else {
+            return Ok(());
+        };
+        if item.due_date.as_deref() == Some(due_date.as_str()) {
+            return Ok(());
+        }
+
+        let span = crate::telemetry::TraceSpan::child("tui.calendar", "due_date_update");
+        span.set_tag("operation", "due_date_update");
+        span.set_tag("mode", "calendar");
         let mut body = Map::new();
-        body.insert(
-            "due_date".to_string(),
-            Value::String(format_iso_date(target_date)),
-        );
-        let updated: ListItem = self
+        body.insert("due_date".to_string(), Value::String(due_date.clone()));
+        let updated_result: Result<ListItem, String> = self
             .api
             .put(&format!("/items/{}", item.id), &Value::Object(body))
-            .await?;
+            .await;
+        span.set_status(updated_result.is_ok());
+        span.finish();
+        let updated = updated_result?;
+
         if let Some(slot) = self.items.get_mut(item_index) {
             *slot = updated;
         }
         self.selected_item = item_index;
-        self.calendar_selected_date = Some(target_date);
-        self.calendar_visible_month = Some(start_of_month(target_date));
+        if let Some(target_date) = parse_iso_date(&due_date) {
+            self.calendar_selected_date = Some(target_date);
+            self.calendar_visible_month = Some(start_of_month(target_date));
+        }
         if let Some(list_id) = self.selected_list_id() {
             self.items_cache.insert(list_id, self.items.clone());
         }
@@ -2951,7 +3191,7 @@ impl App {
             vertical: 1,
             horizontal: 1,
         });
-        let widths = calendar_cell_widths(inner.width.saturating_sub(6));
+        let (month_area, agenda_area) = calendar_panel_layout(inner);
         let visible_indices = self.visible_item_indices();
         let month = self.calendar_month(&visible_indices);
         let mut dated: BTreeMap<SimpleDate, Vec<usize>> = BTreeMap::new();
@@ -2968,111 +3208,140 @@ impl App {
             }
         }
 
-        let mut lines = Vec::new();
+        let mut month_lines = Vec::new();
+        let mut agenda_lines = Vec::new();
         let mut date_hits = Vec::new();
         let mut item_hits = Vec::new();
-        let max_lines = inner.height as usize;
-        let title = format!(
-            "{} {:04}-{:02}: {}",
-            tr("view-calendar"),
-            month.year,
-            month.month,
-            self.selected_list_name()
-        );
+        let title = format!("{}: {}", tr("view-calendar"), self.selected_list_name());
 
-        if max_lines == 0 || inner.width == 0 {
+        if inner.height == 0 || inner.width == 0 {
             return CalendarLayout {
                 title,
-                lines,
+                month_title: format!("{:04}-{:02}", month.year, month.month),
+                agenda_title: tr("label-items"),
+                month_area,
+                agenda_area,
+                month_lines,
+                agenda_lines,
                 date_hits,
                 item_hits,
             };
         }
 
-        lines.push(Line::styled(
-            calendar_row(["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"], &widths),
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        let selected_date_in_month = self
+            .calendar_selected_date
+            .filter(|date| same_calendar_month(*date, month));
+        let drag_target_date = self
+            .calendar_drag_target_date
+            .filter(|_| self.calendar_drag_started);
 
-        let first_weekday = weekday_monday0(month.year, month.month, 1);
-        let days = days_in_month(month.year, month.month);
-        let mut day = 1_u32;
+        let month_inner = month_area.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        if month_inner.width > 0 && month_inner.height > 0 {
+            let widths = calendar_cell_widths(month_inner.width.saturating_sub(6));
+            let today = today_utc();
+            month_lines.push(Line::styled(
+                calendar_row(["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"], &widths),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
 
-        for week in 0..6 {
-            if lines.len() >= max_lines || day > days {
-                break;
-            }
+            let first_day = start_of_month(month);
+            let first_weekday = weekday_monday0(first_day.year, first_day.month, first_day.day);
+            let grid_start = shifted_date(first_day, -(first_weekday as i64));
+            let week_rows = month_inner.height.saturating_sub(1).min(6) as usize;
 
-            let mut day_cells = Vec::with_capacity(7);
-            let day_row_y = inner.y.saturating_add(lines.len() as u16);
-            let mut x = inner.x;
+            for week in 0..week_rows {
+                let mut day_cells = Vec::with_capacity(7);
+                let day_row_y = month_inner.y.saturating_add(month_lines.len() as u16);
+                let mut x = month_inner.x;
 
-            for weekday in 0..7_u32 {
-                let in_month = !(week == 0 && weekday < first_weekday) && day <= days;
-                if in_month {
-                    let date = SimpleDate {
-                        year: month.year,
-                        month: month.month,
-                        day,
-                    };
-                    let indexes = dated.get(&date).cloned().unwrap_or_default();
-                    let day_label = if indexes.is_empty() {
-                        format!("{:>2}", day)
+                for (weekday, width) in widths.iter().enumerate() {
+                    let date = shifted_date(grid_start, (week * 7 + weekday) as i64);
+                    let in_month = same_calendar_month(date, month);
+                    let indexes: &[usize] = if in_month {
+                        dated.get(&date).map(Vec::as_slice).unwrap_or(&[])
                     } else {
-                        format!("{:>2}({})", day, indexes.len())
+                        &[]
                     };
-                    let selected_here = self.calendar_selected_date == Some(date)
-                        || (self.calendar_selected_date.is_none()
-                            && indexes.contains(&self.selected_item));
-                    let width = widths[weekday as usize];
-                    date_hits.push(CalendarDateHit {
-                        rect: Rect::new(x, day_row_y, width, 1),
+                    let selected_here = calendar_day_is_selected(
                         date,
-                    });
-                    day_cells.push(if selected_here {
-                        format!("[{day_label}]")
-                    } else {
-                        day_label
-                    });
-                    if let Some(item_index) = calendar_hit_item(&indexes, self.selected_item) {
-                        item_hits.push(CalendarItemHit {
-                            rect: Rect::new(x, day_row_y, width, 1),
-                            item_index,
-                        });
-                    }
-                    day += 1;
-                } else {
-                    day_cells.push(String::new());
-                }
-                x = x.saturating_add(widths[weekday as usize].saturating_add(1));
-            }
+                        selected_date_in_month,
+                        indexes.contains(&self.selected_item),
+                        drag_target_date,
+                    );
 
-            lines.push(Line::from(calendar_row(day_cells, &widths)));
+                    day_cells.push(calendar_day_cell_label(
+                        date,
+                        in_month,
+                        indexes.len(),
+                        selected_here,
+                        date == today,
+                    ));
+
+                    if in_month {
+                        date_hits.push(CalendarDateHit {
+                            rect: Rect::new(x, day_row_y, *width, 1),
+                            date,
+                        });
+                        if let Some(item_index) = calendar_hit_item(indexes, self.selected_item) {
+                            item_hits.push(CalendarItemHit {
+                                rect: Rect::new(x, day_row_y, *width, 1),
+                                item_index,
+                            });
+                        }
+                    }
+
+                    x = x.saturating_add(width.saturating_add(1));
+                }
+
+                month_lines.push(Line::from(calendar_row(day_cells, &widths)));
+            }
         }
 
-        if lines.len() + 1 < max_lines {
-            lines.push(Line::from(""));
+        if month_lines.is_empty() {
+            month_lines.push(Line::from(tr("output-no-items")));
+        }
+
+        let agenda_inner = agenda_area.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        if agenda_inner.width > 0 && agenda_inner.height > 0 {
             let agenda =
-                self.calendar_agenda_entries(&dated, &undated, month, max_lines - lines.len());
-            for (text, item_index) in agenda {
-                let y = inner.y.saturating_add(lines.len() as u16);
-                lines.push(Line::from(text));
+                self.calendar_agenda_entries(&dated, &undated, month, agenda_inner.height as usize);
+            for (row, (text, item_index)) in agenda.into_iter().enumerate() {
+                let y = agenda_inner.y.saturating_add(row as u16);
+                agenda_lines.push(Line::from(fit_cell(&text, agenda_inner.width as usize)));
                 if let Some(item_index) = item_index {
                     item_hits.push(CalendarItemHit {
-                        rect: Rect::new(inner.x, y, inner.width, 1),
+                        rect: Rect::new(agenda_inner.x, y, agenda_inner.width, 1),
                         item_index,
                     });
                 }
             }
         }
 
-        if lines.is_empty() {
-            lines.push(Line::from(tr("output-no-items")));
+        if agenda_lines.is_empty() {
+            agenda_lines.push(Line::from(tr("output-no-items")));
         }
+
+        let month_title = format!("{:04}-{:02}", month.year, month.month);
+        let agenda_title = selected_date_in_month
+            .map(|date| format!("{} {}", tr("label-items"), format_iso_date(date)))
+            .unwrap_or_else(|| {
+                format!("{} {:04}-{:02}", tr("label-items"), month.year, month.month)
+            });
 
         CalendarLayout {
             title,
-            lines,
+            month_title,
+            agenda_title,
+            month_area,
+            agenda_area,
+            month_lines,
+            agenda_lines,
             date_hits,
             item_hits,
         }
@@ -3091,18 +3360,11 @@ impl App {
 
         let selected_date = self
             .calendar_selected_date
-            .filter(|date| same_calendar_month(*date, month))
-            .or_else(|| {
-                self.selected_item()
-                    .and_then(|item| item.due_date.as_deref())
-                    .and_then(parse_iso_date)
-                    .filter(|date| same_calendar_month(*date, month))
-            });
-        let selected_undated = selected_date.is_none() && undated.contains(&self.selected_item);
+            .filter(|date| same_calendar_month(*date, month));
 
         let mut out = Vec::new();
-        match calendar_agenda_target(dated, selected_date, selected_undated, !undated.is_empty()) {
-            Some(CalendarAgendaTarget::Date(date)) => {
+        match selected_date {
+            Some(date) => {
                 out.push((
                     tr_args(
                         "tui-calendar-selected-date",
@@ -3120,23 +3382,14 @@ impl App {
                     );
                 }
             }
-            Some(CalendarAgendaTarget::Undated) => {
-                out.push((
-                    tr_args(
-                        "tui-calendar-undated",
-                        &[("count", undated.len().to_string())],
-                    ),
-                    None,
-                ));
-                push_calendar_agenda_items(
-                    &mut out,
-                    undated,
-                    &self.items,
-                    self.selected_item,
-                    max_rows,
-                );
-            }
-            None => {}
+            None => push_calendar_month_agenda_entries(
+                &mut out,
+                dated,
+                undated,
+                &self.items,
+                self.selected_item,
+                max_rows,
+            ),
         }
 
         if out.is_empty() {
@@ -3178,6 +3431,49 @@ impl App {
     }
 }
 
+fn calendar_panel_layout(area: Rect) -> (Rect, Rect) {
+    if area.width >= 72 && area.height >= 10 {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area);
+        return (chunks[0], chunks[1]);
+    }
+
+    let month_height = area.height.saturating_sub(5).clamp(4, 9);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(month_height), Constraint::Min(3)])
+        .split(area);
+    (chunks[0], chunks[1])
+}
+
+fn calendar_day_cell_label(
+    date: SimpleDate,
+    in_month: bool,
+    item_count: usize,
+    selected: bool,
+    is_today: bool,
+) -> String {
+    if !in_month {
+        return format!("({:02})", date.day);
+    }
+
+    let marker = match item_count {
+        0 => ' ',
+        1..=9 => char::from_digit(item_count as u32, 10).unwrap_or('+'),
+        _ => '+',
+    };
+
+    if selected {
+        format!("[{:02}{marker}]", date.day)
+    } else if is_today {
+        format!("*{:02}{marker}", date.day)
+    } else {
+        format!(" {:02}{marker}", date.day)
+    }
+}
+
 fn parse_iso_date(raw: &str) -> Option<SimpleDate> {
     let date = raw.get(0..10)?;
     let mut parts = date.split('-');
@@ -3191,6 +3487,69 @@ fn parse_iso_date(raw: &str) -> Option<SimpleDate> {
         return None;
     }
     Some(SimpleDate { year, month, day })
+}
+
+fn due_date_time_suffix(raw: &str) -> Option<&str> {
+    if raw.len() <= 10 {
+        return None;
+    }
+    let suffix = raw.get(10..)?;
+    if suffix.starts_with('T') || suffix.starts_with(' ') {
+        Some(suffix)
+    } else {
+        None
+    }
+}
+
+fn due_date_with_preserved_time(
+    existing_due_date: Option<&str>,
+    target_date: SimpleDate,
+) -> String {
+    let base = format_iso_date(target_date);
+    if let Some(suffix) = existing_due_date.and_then(due_date_time_suffix) {
+        format!("{base}{suffix}")
+    } else {
+        base
+    }
+}
+
+fn parse_due_time(raw: &str) -> Option<(u32, u32)> {
+    let bytes = raw.as_bytes();
+    if bytes.get(10).copied()? != b'T' && bytes.get(10).copied()? != b' ' {
+        return None;
+    }
+    if bytes.get(13).copied()? != b':' {
+        return None;
+    }
+    let hour = raw.get(11..13)?.parse::<u32>().ok()?;
+    let minute = raw.get(14..16)?.parse::<u32>().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    Some((hour, minute))
+}
+
+fn due_date_with_hour_delta(
+    existing_due_date: Option<&str>,
+    fallback_date: SimpleDate,
+    delta_hours: i32,
+) -> String {
+    let mut date = existing_due_date
+        .and_then(parse_iso_date)
+        .unwrap_or(fallback_date);
+    let (hour, minute) = existing_due_date.and_then(parse_due_time).unwrap_or((9, 0));
+    let mut next_hour = hour as i32 + delta_hours;
+
+    while next_hour < 0 {
+        date = shifted_date(date, -1);
+        next_hour += 24;
+    }
+    while next_hour >= 24 {
+        date = shifted_date(date, 1);
+        next_hour -= 24;
+    }
+
+    format!("{}T{:02}:{:02}", format_iso_date(date), next_hour, minute)
 }
 
 fn format_iso_date(date: SimpleDate) -> String {
@@ -3220,12 +3579,6 @@ fn shifted_month(date: SimpleDate, delta_months: i32) -> SimpleDate {
     let month = total_months.rem_euclid(12) as u32 + 1;
     let day = date.day.min(days_in_month(year, month));
     SimpleDate { year, month, day }
-}
-
-fn calendar_date_has_items(items: &[ListItem], date: SimpleDate) -> bool {
-    items
-        .iter()
-        .any(|item| item.due_date.as_deref().and_then(parse_iso_date) == Some(date))
 }
 
 fn days_in_month(year: i32, month: u32) -> u32 {
@@ -3335,22 +3688,15 @@ fn same_calendar_month(date: SimpleDate, month: SimpleDate) -> bool {
     date.year == month.year && date.month == month.month
 }
 
-fn calendar_agenda_target(
-    dated: &BTreeMap<SimpleDate, Vec<usize>>,
+fn calendar_day_is_selected(
+    date: SimpleDate,
     selected_date: Option<SimpleDate>,
-    selected_undated: bool,
-    has_undated: bool,
-) -> Option<CalendarAgendaTarget> {
-    if let Some(date) = selected_date {
-        return Some(CalendarAgendaTarget::Date(date));
-    }
-    if selected_undated {
-        return Some(CalendarAgendaTarget::Undated);
-    }
-    if let Some(date) = dated.keys().next().copied() {
-        return Some(CalendarAgendaTarget::Date(date));
-    }
-    has_undated.then_some(CalendarAgendaTarget::Undated)
+    selected_item_on_day: bool,
+    drag_target_date: Option<SimpleDate>,
+) -> bool {
+    drag_target_date == Some(date)
+        || selected_date == Some(date)
+        || (selected_date.is_none() && selected_item_on_day)
 }
 
 fn calendar_date_at(layout: &CalendarLayout, column: u16, row: u16) -> Option<SimpleDate> {
@@ -3359,6 +3705,62 @@ fn calendar_date_at(layout: &CalendarLayout, column: u16, row: u16) -> Option<Si
         .iter()
         .find(|hit| rect_contains(hit.rect, column, row))
         .map(|hit| hit.date)
+}
+
+fn calendar_pointer_date(
+    area: Rect,
+    column: u16,
+    row: u16,
+    month: SimpleDate,
+) -> Option<SimpleDate> {
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+
+    let (month_area, _) = calendar_panel_layout(inner);
+    let month_inner = month_area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    if month_inner.width == 0 || month_inner.height == 0 {
+        return None;
+    }
+
+    let day_rows_start = month_inner.y.saturating_add(1);
+    let week_rows = month_inner.height.saturating_sub(1).min(6);
+    if week_rows == 0 || row < day_rows_start || row >= day_rows_start.saturating_add(week_rows) {
+        return None;
+    }
+
+    let widths = calendar_cell_widths(month_inner.width.saturating_sub(6));
+    let mut x = month_inner.x;
+    let mut weekday_index = None;
+    for (idx, width) in widths.iter().enumerate() {
+        if *width > 0 && column >= x && column < x.saturating_add(*width) {
+            weekday_index = Some(idx);
+            break;
+        }
+
+        x = x.saturating_add(*width);
+        if idx + 1 < widths.len() {
+            if column == x {
+                return None;
+            }
+            x = x.saturating_add(1);
+        }
+    }
+
+    let weekday_index = weekday_index?;
+    let week_index = row.saturating_sub(day_rows_start) as usize;
+    let first_day = start_of_month(month);
+    let first_weekday = weekday_monday0(first_day.year, first_day.month, first_day.day);
+    let grid_start = shifted_date(first_day, -(first_weekday as i64));
+    let date = shifted_date(grid_start, (week_index * 7 + weekday_index) as i64);
+    same_calendar_month(date, month).then_some(date)
 }
 
 fn calendar_item_at(layout: &CalendarLayout, column: u16, row: u16) -> Option<usize> {
@@ -3398,6 +3800,38 @@ fn push_calendar_agenda_items(
             tr_args("tui-calendar-more", &[("count", remaining.to_string())]),
             None,
         ));
+    }
+}
+
+fn push_calendar_month_agenda_entries(
+    out: &mut Vec<(String, Option<usize>)>,
+    dated: &BTreeMap<SimpleDate, Vec<usize>>,
+    undated: &[usize],
+    items: &[ListItem],
+    selected_item: usize,
+    max_rows: usize,
+) {
+    if max_rows == 0 {
+        return;
+    }
+
+    for (date, indexes) in dated {
+        if out.len() >= max_rows {
+            return;
+        }
+        out.push((format_iso_date(*date), None));
+        push_calendar_agenda_items(out, indexes, items, selected_item, max_rows);
+    }
+
+    if !undated.is_empty() && out.len() < max_rows {
+        out.push((
+            tr_args(
+                "tui-calendar-undated",
+                &[("count", undated.len().to_string())],
+            ),
+            None,
+        ));
+        push_calendar_agenda_items(out, undated, items, selected_item, max_rows);
     }
 }
 
@@ -3453,6 +3887,19 @@ fn should_send_auto_handoff(
     due_list_id: i64,
 ) -> bool {
     selected_list_id == Some(due_list_id) && pending_list_id == Some(due_list_id)
+}
+
+fn auto_handoff_enabled() -> bool {
+    auto_handoff_enabled_from_value(std::env::var("KRAMLI_AUTO_HANDOFF").ok().as_deref())
+}
+
+fn auto_handoff_enabled_from_value(raw: Option<&str>) -> bool {
+    raw.and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => Some(false),
+        "1" | "true" | "on" | "yes" => Some(true),
+        _ => None,
+    })
+    .unwrap_or(true)
 }
 
 fn editor_fields(mode: EditorMode) -> &'static [EditorField] {
@@ -3626,17 +4073,7 @@ fn footer_buttons(area: Rect, key_bindings: &KeyBindings) -> Vec<(FooterAction, 
 }
 
 fn editor_layout(area: Rect) -> EditorLayout {
-    let width = area.width.saturating_sub(10).clamp(64, 96);
-    let height = 14;
-    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
-    let y = area
-        .y
-        .saturating_add(area.height.saturating_sub(height) / 2);
-    let outer = Rect::new(x, y, width, height);
-    let inner = outer.inner(Margin {
-        vertical: 1,
-        horizontal: 2,
-    });
+    let (outer, inner) = centered_popup(area, 64, 96, 14, 14);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -3672,17 +4109,7 @@ fn editor_layout(area: Rect) -> EditorLayout {
 }
 
 fn beta_consent_layout(area: Rect) -> BetaConsentLayout {
-    let width = area.width.saturating_sub(8).clamp(56, 88);
-    let height = area.height.saturating_sub(6).clamp(10, 14);
-    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
-    let y = area
-        .y
-        .saturating_add(area.height.saturating_sub(height) / 2);
-    let outer = Rect::new(x, y, width, height);
-    let inner = outer.inner(Margin {
-        vertical: 1,
-        horizontal: 2,
-    });
+    let (outer, inner) = centered_popup(area, 56, 88, 10, 14);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -3764,7 +4191,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
     draw_footer(frame, app, layout.footer);
 
     if app.requires_beta_consent() {
-        draw_beta_consent_overlay(frame);
+        draw_beta_consent_overlay(frame, app);
         return;
     }
 
@@ -3898,24 +4325,16 @@ fn draw_lists_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let name = list.name.clone();
         let total = list.item_count.unwrap_or(0);
         let done = list.done_count.unwrap_or(0);
-        let folder = list
-            .folder_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|name| format!(" [folder {name}]"))
-            .or_else(|| list.folder_id.map(|id| format!(" [folder #{id}]")))
-            .unwrap_or_default();
-        let archived = if list.archived.unwrap_or(false) {
-            " [archived]"
-        } else {
-            ""
-        };
+        let is_archived = list.archived.unwrap_or(false);
+        let is_foldered = list_has_folder(list);
 
-        let icon_asset = bootstrap_icon_asset_name(raw_icon.as_deref());
-        let use_image_icon = app.inline_images_enabled
-            && list_icon_images_supported(app.picker.protocol_type())
-            && icon_asset.is_some();
+        let icon_asset = list_icon_asset_name(raw_icon.as_deref(), is_foldered);
+        let use_image_icon = list_icon_image_enabled(
+            app.bootstrap_icons_enabled,
+            app.inline_images_enabled,
+            app.picker.protocol_type(),
+            icon_asset.as_deref(),
+        );
         if let Some(asset) = icon_asset.as_deref() {
             if use_image_icon {
                 app.ensure_list_icon_background(asset);
@@ -3930,12 +4349,35 @@ fn draw_lists_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let icon = if use_image_icon {
             "  ".to_string()
         } else {
-            normalize_list_icon(raw_icon.as_deref())
+            list_icon_for_tui(raw_icon.as_deref(), is_foldered)
+        };
+        let archive_image_icon = is_archived
+            && list_icon_image_enabled(
+                app.bootstrap_icons_enabled,
+                app.inline_images_enabled,
+                app.picker.protocol_type(),
+                Some(ARCHIVED_LIST_ICON),
+            );
+        let archive_marker = if is_archived {
+            if archive_image_icon {
+                app.ensure_list_icon_background(ARCHIVED_LIST_ICON);
+                let row = list_area.y.saturating_add(1 + (idx - start) as u16);
+                let x = list_area
+                    .x
+                    .saturating_add(7)
+                    .saturating_add(name.chars().count() as u16);
+                icon_targets.push((ARCHIVED_LIST_ICON.to_string(), Rect::new(x, row, 2, 1)));
+                "   ".to_string()
+            } else {
+                format!(" {}", archive_icon_for_tui())
+            }
+        } else {
+            String::new()
         };
         let open = (total - done).max(0);
         let marker = if idx == app.selected_list { ">" } else { " " };
         list_items.push(TuiListItem::new(format!(
-            "{marker} {icon} {name}{folder}{archived} ({open}/{total})"
+            "{marker} {icon} {name}{archive_marker} ({open}/{total})"
         )));
     }
 
@@ -3997,6 +4439,13 @@ fn list_panel_rows_area(area: Rect) -> Rect {
     } else {
         area
     }
+}
+
+fn item_rows_area(area: Rect) -> Rect {
+    area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    })
 }
 
 fn draw_list_mode(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -4162,13 +4611,13 @@ fn draw_item_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             )));
         }
         let image_value = if has_detail_image {
-            "inline"
+            tr("tui-image-state-inline")
         } else if let Some(note) = app.detail_image_note.as_deref() {
-            note
+            note.to_string()
         } else if image_source.is_some() {
-            "available"
+            tr("tui-image-state-available")
         } else {
-            "no"
+            tr("tui-image-state-no")
         };
         lines.push(Line::from(format!(
             "{}: {image_value}",
@@ -4277,7 +4726,7 @@ fn draw_kanban_mode(frame: &mut Frame<'_>, app: &App, area: Rect) {
         let border_style =
             if app.kanban_drag_item.is_some() && app.kanban_drag_target_column == Some(col_idx) {
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(DRAG_TARGET_COLOR)
                     .add_modifier(Modifier::BOLD)
             } else if selected_in_column {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
@@ -4319,10 +4768,69 @@ fn draw_calendar_mode(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     }
 
-    let layout = app.calendar_layout(area);
-    let widget = Paragraph::new(layout.lines)
-        .block(Block::default().borders(Borders::ALL).title(layout.title));
-    frame.render_widget(widget, area);
+    let CalendarLayout {
+        title,
+        month_title,
+        agenda_title,
+        month_area,
+        agenda_area,
+        month_lines,
+        agenda_lines,
+        ..
+    } = app.calendar_layout(area);
+    let border_style = if app.focus == FocusPane::Items {
+        Style::default().fg(ACCENT)
+    } else {
+        Style::default()
+    };
+    let calendar_dragging = app.calendar_drag_started && app.calendar_drag_item.is_some();
+    let month_border_style = if calendar_dragging && app.calendar_drag_target_date.is_some() {
+        Style::default()
+            .fg(DRAG_TARGET_COLOR)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let agenda_border_style = if calendar_dragging && app.calendar_drag_target_date.is_none() {
+        Style::default()
+            .fg(DRAG_TARGET_COLOR)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(border_style),
+        area,
+    );
+
+    if month_area.width >= 2 && month_area.height >= 2 {
+        frame.render_widget(
+            Paragraph::new(month_lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(month_border_style)
+                    .title(month_title),
+            ),
+            month_area,
+        );
+    }
+
+    if agenda_area.width >= 2 && agenda_area.height >= 2 {
+        frame.render_widget(
+            Paragraph::new(agenda_lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(agenda_border_style)
+                        .title(agenda_title),
+                )
+                .wrap(Wrap { trim: true }),
+            agenda_area,
+        );
+    }
 }
 
 fn item_placeholder(app: &App) -> String {
@@ -4378,7 +4886,7 @@ fn action_chip_text(action: FooterAction, key_bindings: &KeyBindings) -> String 
     )
 }
 
-fn draw_beta_consent_overlay(frame: &mut Frame<'_>) {
+fn draw_beta_consent_overlay(frame: &mut Frame<'_>, app: &mut App) {
     let layout = beta_consent_layout(frame.area());
     frame.render_widget(Clear, layout.outer);
     frame.render_widget(
@@ -4389,17 +4897,48 @@ fn draw_beta_consent_overlay(frame: &mut Frame<'_>) {
         layout.outer,
     );
 
+    let profile_text = app
+        .profile_name
+        .clone()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| tr("common-unknown"));
     let body = vec![
+        Line::styled(profile_text, Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(""),
         Line::from(tr("cli-interactive-beta-notice")),
         Line::from(""),
         Line::from(tr("tui-beta-consent-body")),
     ];
+    let mut text_area = layout.body;
+    if app.profile_image.is_some() && layout.body.width >= 44 && layout.body.height >= 4 {
+        let image_width = layout.body.height.saturating_mul(2).clamp(8, 16);
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(image_width),
+                Constraint::Length(2),
+                Constraint::Min(20),
+            ])
+            .split(layout.body);
+        if let Some(profile_image) = app.profile_image.as_mut() {
+            frame.render_stateful_widget(
+                StatefulImage::default().resize(Resize::Fit(Some(FilterType::Lanczos3))),
+                chunks[0],
+                &mut profile_image.protocol,
+            );
+        }
+        text_area = chunks[2];
+    }
     frame.render_widget(
         Paragraph::new(body)
-            .alignment(Alignment::Center)
+            .alignment(if text_area == layout.body {
+                Alignment::Center
+            } else {
+                Alignment::Left
+            })
             .wrap(Wrap { trim: true })
             .style(Style::default().fg(Color::Reset)),
-        layout.body,
+        text_area,
     );
 
     frame.render_widget(
@@ -4765,7 +5304,15 @@ fn image_runtime_debug_lines(
             picker.capabilities().len()
         ),
         format!("img term={} term_program={}", term, term_program),
-        format!("img lc_terminal={}", lc_terminal),
+        format!(
+            "img lc_terminal={} iterm_session={}",
+            lc_terminal,
+            if std::env::var("ITERM_SESSION_ID").is_ok() {
+                "set"
+            } else {
+                "unset"
+            }
+        ),
         format!(
             "img env protocol={} images={}",
             explicit_protocol, explicit_images
@@ -4788,6 +5335,7 @@ fn autodetect_protocol_fallback() -> Option<ProtocolType> {
         &term_program,
         &lc_terminal,
         std::env::var("KITTY_WINDOW_ID").is_ok(),
+        std::env::var("ITERM_SESSION_ID").is_ok(),
         std::env::var("WT_SESSION").is_ok(),
     )
 }
@@ -4797,6 +5345,7 @@ fn detected_protocol_from_env_values(
     term_program: &str,
     lc_terminal: &str,
     has_kitty_window: bool,
+    has_iterm_session: bool,
     has_windows_terminal: bool,
 ) -> Option<ProtocolType> {
     if term.contains("alacritty") || term_program.contains("alacritty") {
@@ -4822,7 +5371,8 @@ fn detected_protocol_from_env_values(
     {
         return Some(ProtocolType::Sixel);
     }
-    if term_program.contains("iterm")
+    if has_iterm_session
+        || term_program.contains("iterm")
         || lc_terminal.contains("iterm")
         || term_program.contains("wezterm")
         || term.contains("wezterm")
@@ -4856,11 +5406,15 @@ fn build_image_picker(preference: ImageProtocolPreference) -> (Picker, bool, Str
                 let mut picker =
                     Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
                 let mut suffix = "probe";
-                if matches!(picker.protocol_type(), ProtocolType::Halfblocks) {
-                    if let Some(fallback) = autodetect_protocol_fallback() {
-                        picker.set_protocol_type(fallback);
-                        suffix = "probe+env";
-                    }
+                if let Some(protocol) = env_override_for_probed_protocol(
+                    picker.protocol_type(),
+                    autodetect_protocol_fallback(),
+                ) {
+                    picker.set_protocol_type(protocol);
+                    suffix = match protocol {
+                        ProtocolType::Iterm2 => "probe+iterm",
+                        _ => "probe+env",
+                    };
                 }
                 let summary = format!(
                     "{label} auto={} ({suffix})",
@@ -4896,6 +5450,17 @@ fn build_image_picker(preference: ImageProtocolPreference) -> (Picker, bool, Str
     }
 }
 
+fn env_override_for_probed_protocol(
+    probed: ProtocolType,
+    env_protocol: Option<ProtocolType>,
+) -> Option<ProtocolType> {
+    match (probed, env_protocol) {
+        (ProtocolType::Halfblocks, Some(protocol)) => Some(protocol),
+        (ProtocolType::Kitty, Some(ProtocolType::Iterm2)) => Some(ProtocolType::Iterm2),
+        _ => None,
+    }
+}
+
 fn should_probe_terminal_images() -> bool {
     if std::env::var("KRAMLI_TUI_IMAGES").is_ok_and(|value| value == "0") {
         return false;
@@ -4919,6 +5484,7 @@ fn should_probe_terminal_images() -> bool {
         &term_program,
         &lc_terminal,
         std::env::var("KITTY_WINDOW_ID").is_ok(),
+        std::env::var("ITERM_SESSION_ID").is_ok(),
         std::env::var("WT_SESSION").is_ok(),
     )
     .is_some()
@@ -5591,19 +6157,84 @@ fn item_short_text(item: &ListItem) -> String {
     out
 }
 
+fn sort_lists_for_tui(lists: &mut [ShoppingList]) {
+    lists.sort_by(compare_lists_for_tui);
+}
+
+fn compare_lists_for_tui(a: &ShoppingList, b: &ShoppingList) -> Ordering {
+    list_folder_sort_key(a)
+        .cmp(&list_folder_sort_key(b))
+        .then_with(|| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+        })
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+fn list_folder_sort_key(list: &ShoppingList) -> (u8, String) {
+    if let Some(name) = list
+        .folder_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return (0, name.to_ascii_lowercase());
+    }
+
+    if let Some(id) = list.folder_id {
+        return (0, format!("#{id:020}"));
+    }
+
+    (1, String::new())
+}
+
+fn list_has_folder(list: &ShoppingList) -> bool {
+    list.folder_id.is_some()
+        || list
+            .folder_name
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+}
+
+#[cfg(test)]
 fn normalize_list_icon(raw_icon: Option<&str>) -> String {
+    list_icon_for_tui(raw_icon, false)
+}
+
+fn list_icon_for_tui(raw_icon: Option<&str>, is_foldered: bool) -> String {
     let style = tui_icon_style();
-    let Some(raw_icon) = raw_icon.map(str::trim).filter(|value| !value.is_empty()) else {
-        return empty_icon_slot();
-    };
+    let icon = list_icon_asset_name(raw_icon, is_foldered);
 
     if style == TuiIconStyle::Raw {
+        let Some(raw_icon) = raw_icon.map(str::trim).filter(|value| !value.is_empty()) else {
+            return icon
+                .map(|icon| bootstrap_icon_for_tui(&format!("bi-{icon}"), style))
+                .unwrap_or_else(empty_icon_slot);
+        };
         return raw_icon.to_string();
     }
 
-    bootstrap_icon_asset_name(Some(raw_icon))
-        .map(|icon| bootstrap_icon_for_tui(&format!("bi-{icon}"), style))
+    icon.map(|icon| bootstrap_icon_for_tui(&format!("bi-{icon}"), style))
         .unwrap_or_else(empty_icon_slot)
+}
+
+fn list_icon_asset_name(raw_icon: Option<&str>, is_foldered: bool) -> Option<String> {
+    bootstrap_icon_asset_name(raw_icon).or_else(|| {
+        Some(
+            if is_foldered {
+                FOLDER_LIST_ICON
+            } else {
+                DEFAULT_LIST_ICON
+            }
+            .to_string(),
+        )
+    })
+}
+
+fn archive_icon_for_tui() -> String {
+    bootstrap_icon_for_tui(&format!("bi-{ARCHIVED_LIST_ICON}"), tui_icon_style())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5639,6 +6270,18 @@ fn bootstrap_icon_for_tui(icon: &str, style: TuiIconStyle) -> String {
 
 fn list_icon_images_supported(protocol: ProtocolType) -> bool {
     !matches!(protocol, ProtocolType::Halfblocks)
+}
+
+fn list_icon_image_enabled(
+    bootstrap_icons_enabled: bool,
+    inline_images_enabled: bool,
+    protocol: ProtocolType,
+    icon_asset: Option<&str>,
+) -> bool {
+    bootstrap_icons_enabled
+        && inline_images_enabled
+        && list_icon_images_supported(protocol)
+        && icon_asset.is_some()
 }
 
 fn bootstrap_icon_asset_name(raw_icon: Option<&str>) -> Option<String> {
@@ -6152,6 +6795,80 @@ mod tests {
         );
     }
 
+    fn test_shopping_list(
+        id: i64,
+        name: &str,
+        icon: Option<&str>,
+        folder_id: Option<i64>,
+        folder_name: Option<&str>,
+        archived: bool,
+    ) -> ShoppingList {
+        ShoppingList {
+            id,
+            name: name.to_string(),
+            icon: icon.map(str::to_string),
+            color: None,
+            folder_id,
+            folder_name: folder_name.map(str::to_string),
+            archived: Some(archived),
+            archive_mode: None,
+            view_mode: None,
+            role: None,
+            item_count: None,
+            done_count: None,
+            state_config: None,
+            states: None,
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn foldered_lists_use_folder_icon_as_leading_fallback() {
+        let folder_id_only = test_shopping_list(1, "Groceries", None, Some(83), None, false);
+        assert!(list_has_folder(&folder_id_only));
+        assert_eq!(
+            list_icon_asset_name(None, true),
+            Some("folder2-open".to_string())
+        );
+        assert_eq!(list_icon_for_tui(None, true), "[folder2-open]");
+
+        let named_folder = test_shopping_list(
+            2,
+            "Milk",
+            Some("bi bi-cart-fill"),
+            Some(83),
+            Some("Home"),
+            false,
+        );
+        assert!(list_has_folder(&named_folder));
+        assert_eq!(
+            list_icon_asset_name(named_folder.icon.as_deref(), true),
+            Some("cart-fill".to_string())
+        );
+    }
+
+    #[test]
+    fn sort_lists_for_tui_groups_by_folder_then_name() {
+        let mut lists = vec![
+            test_shopping_list(1, "Zed", None, None, None, false),
+            test_shopping_list(2, "Bananas", None, Some(20), Some("Work"), false),
+            test_shopping_list(3, "Apples", None, Some(10), Some("Home"), false),
+            test_shopping_list(4, "Avocado", None, Some(20), Some("Work"), false),
+            test_shopping_list(5, "Alpha", None, None, None, false),
+        ];
+
+        sort_lists_for_tui(&mut lists);
+        let ordered_names = lists
+            .iter()
+            .map(|list| list.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ordered_names,
+            vec!["Apples", "Avocado", "Bananas", "Alpha", "Zed"]
+        );
+    }
+
     #[test]
     fn bootstrap_icons_use_asset_names_and_text_fallbacks_without_emoji() {
         assert_eq!(
@@ -6189,11 +6906,60 @@ mod tests {
             bootstrap_icon_for_tui("bi-unknown-icon", TuiIconStyle::Raw),
             "bi-unknown-icon"
         );
+        assert_eq!(list_icon_asset_name(None, false), Some("tag".to_string()));
+        assert_eq!(
+            list_icon_asset_name(Some(r#"<i class="bi bi-basket-fill"></i>"#), false),
+            Some("basket-fill".to_string())
+        );
+        assert_eq!(
+            list_icon_asset_name(Some("bi bi-cart-fill"), true),
+            Some("cart-fill".to_string())
+        );
+        assert_eq!(
+            list_icon_asset_name(None, true),
+            Some("folder2-open".to_string())
+        );
         assert_eq!(normalize_list_icon(Some("bi bi-cart-fill")), "[cart-fill]");
-        assert_eq!(normalize_list_icon(None), "  ");
-        assert_eq!(normalize_list_icon(Some("not an icon?")), "  ");
+        assert_eq!(normalize_list_icon(None), "[tag]");
+        assert_eq!(normalize_list_icon(Some("not an icon?")), "[tag]");
+        assert_eq!(list_icon_for_tui(None, true), "[folder2-open]");
+        assert_eq!(
+            list_icon_for_tui(Some("bi bi-cart-fill"), true),
+            "[cart-fill]"
+        );
+        assert_eq!(archive_icon_for_tui(), "[archive]");
         assert!(!list_icon_images_supported(ProtocolType::Halfblocks));
         assert!(list_icon_images_supported(ProtocolType::Kitty));
+        assert!(list_icon_image_enabled(
+            true,
+            true,
+            ProtocolType::Kitty,
+            Some("cart-fill")
+        ));
+        assert!(!list_icon_image_enabled(
+            false,
+            true,
+            ProtocolType::Kitty,
+            Some("cart-fill")
+        ));
+        assert!(!list_icon_image_enabled(
+            true,
+            false,
+            ProtocolType::Kitty,
+            Some("cart-fill")
+        ));
+        assert!(!list_icon_image_enabled(
+            true,
+            true,
+            ProtocolType::Halfblocks,
+            Some("cart-fill")
+        ));
+        assert!(!list_icon_image_enabled(
+            true,
+            true,
+            ProtocolType::Kitty,
+            None
+        ));
     }
 
     #[test]
@@ -6322,6 +7088,48 @@ mod tests {
     }
 
     #[test]
+    fn preserves_due_time_suffix_when_moving_dates() {
+        let target = SimpleDate {
+            year: 2026,
+            month: 6,
+            day: 20,
+        };
+        assert_eq!(
+            due_date_with_preserved_time(Some("2026-06-14T08:30:00Z"), target),
+            "2026-06-20T08:30:00Z"
+        );
+        assert_eq!(
+            due_date_with_preserved_time(Some("2026-06-14 08:30"), target),
+            "2026-06-20 08:30"
+        );
+        assert_eq!(
+            due_date_with_preserved_time(Some("2026-06-14"), target),
+            "2026-06-20"
+        );
+    }
+
+    #[test]
+    fn due_date_with_hour_delta_wraps_across_days() {
+        let fallback = SimpleDate {
+            year: 2026,
+            month: 6,
+            day: 14,
+        };
+        assert_eq!(
+            due_date_with_hour_delta(Some("2026-06-14T23:15"), fallback, 2),
+            "2026-06-15T01:15"
+        );
+        assert_eq!(
+            due_date_with_hour_delta(Some("2026-06-14T00:15"), fallback, -2),
+            "2026-06-13T22:15"
+        );
+        assert_eq!(
+            due_date_with_hour_delta(None, fallback, 0),
+            "2026-06-14T09:00"
+        );
+    }
+
+    #[test]
     fn calendar_date_helpers_use_monday_first_weeks() {
         assert_eq!(days_in_month(2024, 2), 29);
         assert_eq!(days_in_month(2026, 2), 28);
@@ -6350,6 +7158,63 @@ mod tests {
             calendar_row(["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"], &[2; 7]),
             "Mo│Di│Mi│Do│Fr│Sa│So"
         );
+    }
+
+    #[test]
+    fn calendar_panel_layout_switches_between_wide_and_stacked_modes() {
+        let (month_wide, agenda_wide) = calendar_panel_layout(Rect::new(0, 0, 100, 20));
+        assert_eq!(month_wide.y, agenda_wide.y);
+        assert!(month_wide.width > agenda_wide.width);
+
+        let (month_narrow, agenda_narrow) = calendar_panel_layout(Rect::new(0, 0, 60, 20));
+        assert!(month_narrow.y < agenda_narrow.y);
+        assert_eq!(month_narrow.x, agenda_narrow.x);
+    }
+
+    #[test]
+    fn calendar_day_cell_labels_show_selection_today_and_overflow() {
+        let date = SimpleDate {
+            year: 2026,
+            month: 6,
+            day: 14,
+        };
+        assert_eq!(calendar_day_cell_label(date, true, 0, false, false), " 14 ");
+        assert_eq!(calendar_day_cell_label(date, true, 3, false, true), "*143");
+        assert_eq!(
+            calendar_day_cell_label(date, true, 12, true, false),
+            "[14+]"
+        );
+        assert_eq!(
+            calendar_day_cell_label(date, false, 0, false, false),
+            "(14)"
+        );
+    }
+
+    #[test]
+    fn calendar_day_selection_prefers_drag_target_and_selected_day() {
+        let date = SimpleDate {
+            year: 2026,
+            month: 6,
+            day: 14,
+        };
+        let other = SimpleDate {
+            year: 2026,
+            month: 6,
+            day: 15,
+        };
+
+        assert!(calendar_day_is_selected(date, None, true, None));
+        assert!(!calendar_day_is_selected(other, None, false, None));
+
+        assert!(calendar_day_is_selected(other, Some(other), false, None));
+        assert!(!calendar_day_is_selected(date, Some(other), true, None));
+
+        assert!(calendar_day_is_selected(
+            date,
+            Some(other),
+            false,
+            Some(date)
+        ));
     }
 
     #[test]
@@ -6449,28 +7314,6 @@ mod tests {
     }
 
     #[test]
-    fn calendar_date_has_items_checks_due_dates_only() {
-        let mut item = sample_item(1, "Milk");
-        item.due_date = Some("2026-06-14".to_string());
-        assert!(calendar_date_has_items(
-            &[item.clone()],
-            SimpleDate {
-                year: 2026,
-                month: 6,
-                day: 14,
-            },
-        ));
-        assert!(!calendar_date_has_items(
-            &[item],
-            SimpleDate {
-                year: 2026,
-                month: 6,
-                day: 15,
-            },
-        ));
-    }
-
-    #[test]
     fn calendar_hit_helpers_return_dates_and_items() {
         let date = SimpleDate {
             year: 2026,
@@ -6479,7 +7322,12 @@ mod tests {
         };
         let layout = CalendarLayout {
             title: "test".to_string(),
-            lines: Vec::new(),
+            month_title: "month".to_string(),
+            agenda_title: "agenda".to_string(),
+            month_area: Rect::new(0, 0, 40, 10),
+            agenda_area: Rect::new(41, 0, 20, 10),
+            month_lines: Vec::new(),
+            agenda_lines: Vec::new(),
             date_hits: vec![CalendarDateHit {
                 rect: Rect::new(4, 5, 8, 1),
                 date,
@@ -6494,6 +7342,46 @@ mod tests {
         assert_eq!(calendar_date_at(&layout, 20, 5), None);
         assert_eq!(calendar_item_at(&layout, 10, 8), Some(7));
         assert_eq!(calendar_item_at(&layout, 10, 9), None);
+    }
+
+    #[test]
+    fn calendar_pointer_date_matches_rendered_grid_cells() {
+        let content = Rect::new(0, 0, 80, 20);
+        let month = SimpleDate {
+            year: 2026,
+            month: 6,
+            day: 1,
+        };
+
+        let inner = content.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let (month_area, _) = calendar_panel_layout(inner);
+        let month_inner = month_area.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let widths = calendar_cell_widths(month_inner.width.saturating_sub(6));
+        let monday_row = month_inner.y.saturating_add(1);
+
+        assert_eq!(
+            calendar_pointer_date(content, month_inner.x, monday_row, month),
+            Some(SimpleDate {
+                year: 2026,
+                month: 6,
+                day: 1,
+            })
+        );
+        assert_eq!(
+            calendar_pointer_date(
+                content,
+                month_inner.x.saturating_add(widths[0]),
+                monday_row,
+                month
+            ),
+            None
+        );
     }
 
     #[test]
@@ -6523,57 +7411,81 @@ mod tests {
     }
 
     #[test]
-    fn calendar_agenda_target_prefers_selected_date() {
-        let first = SimpleDate {
-            year: 2026,
-            month: 6,
-            day: 4,
-        };
-        let selected = SimpleDate {
-            year: 2026,
-            month: 6,
-            day: 14,
-        };
-        let mut dated = BTreeMap::new();
-        dated.insert(first, vec![1]);
-        dated.insert(selected, vec![2]);
+    fn calendar_month_agenda_groups_dates_and_undated_items() {
+        let mut items = vec![
+            sample_item(1, "Milk"),
+            sample_item(2, "Bread"),
+            sample_item(3, "Apples"),
+            sample_item(4, "No date"),
+        ];
+        items[0].due_date = Some("2026-06-04".to_string());
+        items[1].due_date = Some("2026-06-04".to_string());
+        items[2].due_date = Some("2026-06-14".to_string());
 
-        assert_eq!(
-            calendar_agenda_target(&dated, Some(selected), false, false),
-            Some(CalendarAgendaTarget::Date(selected))
+        let mut dated = BTreeMap::new();
+        dated.insert(
+            SimpleDate {
+                year: 2026,
+                month: 6,
+                day: 4,
+            },
+            vec![0, 1],
         );
-        let selected_empty_day = SimpleDate {
-            year: 2026,
-            month: 6,
-            day: 20,
-        };
-        assert_eq!(
-            calendar_agenda_target(&dated, Some(selected_empty_day), false, false),
-            Some(CalendarAgendaTarget::Date(selected_empty_day))
+        dated.insert(
+            SimpleDate {
+                year: 2026,
+                month: 6,
+                day: 14,
+            },
+            vec![2],
         );
+
+        let mut out = Vec::new();
+        push_calendar_month_agenda_entries(&mut out, &dated, &[3], &items, 2, 20);
+
+        assert_eq!(out[0], ("2026-06-04".to_string(), None));
+        assert_eq!(out[1], ("  Milk".to_string(), Some(0)));
+        assert_eq!(out[2], ("  Bread".to_string(), Some(1)));
+        assert_eq!(out[3], ("2026-06-14".to_string(), None));
+        assert_eq!(out[4], ("> Apples".to_string(), Some(2)));
+        assert_eq!(
+            out[5],
+            (
+                tr_args("tui-calendar-undated", &[("count", "1".to_string())]),
+                None
+            )
+        );
+        assert_eq!(out[6], ("  No date".to_string(), Some(3)));
     }
 
     #[test]
-    fn calendar_agenda_target_keeps_selected_undated_items_visible() {
-        let dated_day = SimpleDate {
-            year: 2026,
-            month: 6,
-            day: 4,
-        };
-        let mut dated = BTreeMap::new();
-        dated.insert(dated_day, vec![1]);
+    fn calendar_month_agenda_respects_max_rows() {
+        let mut items = vec![sample_item(1, "Milk"), sample_item(2, "Bread")];
+        items[0].due_date = Some("2026-06-04".to_string());
+        items[1].due_date = Some("2026-06-04".to_string());
 
-        assert_eq!(
-            calendar_agenda_target(&dated, None, true, true),
-            Some(CalendarAgendaTarget::Undated)
+        let mut dated = BTreeMap::new();
+        dated.insert(
+            SimpleDate {
+                year: 2026,
+                month: 6,
+                day: 4,
+            },
+            vec![0, 1],
         );
+
+        let mut out = Vec::new();
+        push_calendar_month_agenda_entries(&mut out, &dated, &[], &items, 0, 3);
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], ("2026-06-04".to_string(), None));
+        assert_eq!(out[1], ("> Milk".to_string(), Some(0)));
         assert_eq!(
-            calendar_agenda_target(&BTreeMap::new(), None, false, true),
-            Some(CalendarAgendaTarget::Undated)
-        );
-        assert_eq!(
-            calendar_agenda_target(&BTreeMap::new(), None, false, false),
-            None
+            out[2],
+            (
+                tr_args("tui-calendar-more", &[("count", "1".to_string())]),
+                None
+            )
         );
     }
 
@@ -6606,51 +7518,113 @@ mod tests {
     }
 
     #[test]
+    fn editor_layout_stays_inside_small_terminals() {
+        let area = Rect::new(0, 0, 40, 10);
+        let layout = editor_layout(area);
+
+        assert!(layout.outer.width <= area.width);
+        assert!(layout.outer.height <= area.height);
+        assert!(layout.outer.x + layout.outer.width <= area.x + area.width);
+        assert!(layout.outer.y + layout.outer.height <= area.y + area.height);
+    }
+
+    #[test]
+    fn beta_consent_layout_stays_inside_small_terminals() {
+        let area = Rect::new(0, 0, 32, 8);
+        let layout = beta_consent_layout(area);
+
+        assert!(layout.outer.width <= area.width);
+        assert!(layout.outer.height <= area.height);
+        assert!(layout.outer.x + layout.outer.width <= area.x + area.width);
+        assert!(layout.outer.y + layout.outer.height <= area.y + area.height);
+    }
+
+    #[test]
+    fn item_rows_area_rejects_block_borders() {
+        let block = Rect::new(10, 5, 20, 8);
+        let rows = item_rows_area(block);
+
+        assert!(!rect_contains(rows, 11, 5));
+        assert!(!rect_contains(rows, 10, 6));
+        assert!(rect_contains(rows, 11, 6));
+    }
+
+    #[test]
     fn detects_supported_image_protocols_from_terminal_env() {
+        assert!(
+            detected_protocol_from_env_values("alacritty", "", "", false, false, false).is_none()
+        );
         assert!(matches!(
-            detected_protocol_from_env_values("alacritty", "", "", false, false),
-            None
-        ));
-        assert!(matches!(
-            detected_protocol_from_env_values("xterm-kitty", "", "", false, false),
+            detected_protocol_from_env_values("xterm-kitty", "", "", false, false, false),
             Some(ProtocolType::Kitty)
         ));
         assert!(matches!(
-            detected_protocol_from_env_values("xterm-256color", "ghostty", "", false, false),
+            detected_protocol_from_env_values("xterm-256color", "ghostty", "", false, false, false),
             Some(ProtocolType::Kitty)
         ));
         assert!(matches!(
-            detected_protocol_from_env_values("konsole", "", "", false, false),
+            detected_protocol_from_env_values("konsole", "", "", false, false, false),
             Some(ProtocolType::Kitty)
         ));
         assert!(matches!(
-            detected_protocol_from_env_values("xterm-256color", "", "", true, false),
+            detected_protocol_from_env_values("xterm-256color", "", "", true, false, false),
             Some(ProtocolType::Kitty)
         ));
         assert!(matches!(
-            detected_protocol_from_env_values("foot", "", "", false, false),
+            detected_protocol_from_env_values("foot", "", "", false, false, false),
             Some(ProtocolType::Sixel)
         ));
         assert!(matches!(
-            detected_protocol_from_env_values("xterm-sixel", "", "", false, false),
+            detected_protocol_from_env_values("xterm-sixel", "", "", false, false, false),
             Some(ProtocolType::Sixel)
         ));
         assert!(matches!(
-            detected_protocol_from_env_values("xterm-256color", "", "", false, true),
+            detected_protocol_from_env_values("xterm-256color", "", "", false, false, true),
             Some(ProtocolType::Sixel)
         ));
         assert!(matches!(
-            detected_protocol_from_env_values("xterm-256color", "wezterm", "", false, false),
+            detected_protocol_from_env_values("xterm-256color", "wezterm", "", false, false, false),
             Some(ProtocolType::Iterm2)
         ));
         assert!(matches!(
-            detected_protocol_from_env_values("xterm-256color", "iterm.app", "", false, false),
+            detected_protocol_from_env_values(
+                "xterm-256color",
+                "iterm.app",
+                "",
+                false,
+                false,
+                false
+            ),
             Some(ProtocolType::Iterm2)
         ));
         assert!(matches!(
-            detected_protocol_from_env_values("vscode", "", "", false, false),
+            detected_protocol_from_env_values("xterm-256color", "", "", false, true, false),
             Some(ProtocolType::Iterm2)
         ));
+        assert!(matches!(
+            detected_protocol_from_env_values("vscode", "", "", false, false, false),
+            Some(ProtocolType::Iterm2)
+        ));
+    }
+
+    #[test]
+    fn iterm_env_overrides_bad_kitty_probe_result() {
+        assert!(matches!(
+            env_override_for_probed_protocol(ProtocolType::Kitty, Some(ProtocolType::Iterm2)),
+            Some(ProtocolType::Iterm2)
+        ));
+        assert!(matches!(
+            env_override_for_probed_protocol(ProtocolType::Halfblocks, Some(ProtocolType::Iterm2)),
+            Some(ProtocolType::Iterm2)
+        ));
+        assert!(
+            env_override_for_probed_protocol(ProtocolType::Kitty, Some(ProtocolType::Kitty))
+                .is_none()
+        );
+        assert!(
+            env_override_for_probed_protocol(ProtocolType::Sixel, Some(ProtocolType::Iterm2))
+                .is_none()
+        );
     }
 
     #[test]
@@ -6803,6 +7777,15 @@ mod tests {
         assert!(!should_send_auto_handoff(Some(43), Some(42), 42));
         assert!(!should_send_auto_handoff(Some(42), Some(43), 42));
         assert!(!should_send_auto_handoff(None, Some(42), 42));
+    }
+
+    #[test]
+    fn auto_handoff_env_flag_defaults_on_and_can_disable() {
+        assert!(auto_handoff_enabled_from_value(None));
+        assert!(auto_handoff_enabled_from_value(Some("invalid")));
+        assert!(!auto_handoff_enabled_from_value(Some("0")));
+        assert!(!auto_handoff_enabled_from_value(Some("no")));
+        assert!(auto_handoff_enabled_from_value(Some("yes")));
     }
 
     #[test]

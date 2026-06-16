@@ -19,6 +19,10 @@ pub struct ConfigFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_icons_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub update_check_last: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update_check_latest: Option<String>,
@@ -87,6 +91,34 @@ impl Config {
 
     pub fn set_base_url(&mut self, url: Option<String>) {
         self.file.base_url = url;
+    }
+
+    pub fn telemetry_enabled(&self) -> bool {
+        telemetry_env_override()
+            .or(self.file.telemetry_enabled)
+            .unwrap_or(false)
+    }
+
+    pub fn telemetry_preference_set(&self) -> bool {
+        telemetry_env_override().is_some() || self.file.telemetry_enabled.is_some()
+    }
+
+    pub fn set_telemetry_enabled(&mut self, enabled: bool) {
+        self.file.telemetry_enabled = Some(enabled);
+    }
+
+    pub fn bootstrap_icons_enabled(&self) -> bool {
+        bootstrap_icons_env_override()
+            .or(self.file.bootstrap_icons_enabled)
+            .unwrap_or(false)
+    }
+
+    pub fn bootstrap_icons_preference_set(&self) -> bool {
+        bootstrap_icons_env_override().is_some() || self.file.bootstrap_icons_enabled.is_some()
+    }
+
+    pub fn set_bootstrap_icons_enabled(&mut self, enabled: bool) {
+        self.file.bootstrap_icons_enabled = Some(enabled);
     }
 
     pub fn update_check_last(&self) -> Option<i64> {
@@ -214,5 +246,92 @@ impl Config {
         std::env::var("KRAMLI_API_KEY")
             .map(|k| !k.is_empty())
             .unwrap_or(false)
+    }
+}
+
+pub fn parse_env_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+pub fn env_is_truthy(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let v = raw.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "off" && v != "no"
+        }
+        Err(_) => false,
+    }
+}
+
+fn telemetry_env_override() -> Option<bool> {
+    if env_is_truthy("DO_NOT_TRACK") || env_is_truthy("KRAMLI_NO_TELEMETRY") {
+        return Some(false);
+    }
+    std::env::var("KRAMLI_TELEMETRY")
+        .ok()
+        .as_deref()
+        .and_then(parse_env_bool)
+}
+
+fn bootstrap_icons_env_override() -> Option<bool> {
+    [
+        "KRAMLI_BOOTSTRAP_ICONS",
+        "KRAMLI_TUI_BOOTSTRAP_ICONS",
+        "KRAMLI_LOAD_BOOTSTRAP_ICONS",
+    ]
+    .into_iter()
+    .find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .and_then(|raw| parse_env_bool(&raw))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_file(
+        telemetry_enabled: Option<bool>,
+        bootstrap_icons_enabled: Option<bool>,
+    ) -> Config {
+        Config {
+            file: ConfigFile {
+                telemetry_enabled,
+                bootstrap_icons_enabled,
+                ..ConfigFile::default()
+            },
+        }
+    }
+
+    #[test]
+    fn unset_preferences_are_disabled_until_user_answers() {
+        let cfg = config_file(None, None);
+        assert!(!cfg.telemetry_enabled());
+        assert!(!cfg.bootstrap_icons_enabled());
+    }
+
+    #[test]
+    fn saved_preferences_control_telemetry_and_bootstrap_icons() {
+        let cfg = config_file(Some(true), Some(true));
+        assert!(cfg.telemetry_enabled());
+        assert!(cfg.bootstrap_icons_enabled());
+
+        let cfg = config_file(Some(false), Some(false));
+        assert!(!cfg.telemetry_enabled());
+        assert!(!cfg.bootstrap_icons_enabled());
+    }
+
+    #[test]
+    fn env_bool_parser_accepts_common_forms() {
+        assert_eq!(parse_env_bool("1"), Some(true));
+        assert_eq!(parse_env_bool(" yes "), Some(true));
+        assert_eq!(parse_env_bool("0"), Some(false));
+        assert_eq!(parse_env_bool("off"), Some(false));
+        assert_eq!(parse_env_bool("later"), None);
     }
 }

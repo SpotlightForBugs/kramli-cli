@@ -23,6 +23,7 @@ pub struct ApiClient {
 
 const DEFAULT_RATE_LIMIT_MS: u64 = 120;
 const MAX_429_RETRIES: u32 = 3;
+const MAX_RESOURCE_BYTES: usize = 8 * 1024 * 1024;
 
 fn metric_i64(value: impl TryInto<i64>) -> i64 {
     value.try_into().unwrap_or(i64::MAX)
@@ -212,6 +213,102 @@ impl ApiClient {
             h.insert(ACCEPT_LANGUAGE, v);
         }
         h
+    }
+
+    fn external_resources_enabled() -> bool {
+        Self::external_resources_enabled_from(
+            std::env::var("KRAMLI_ALLOW_EXTERNAL_RESOURCES")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    fn external_resources_enabled_from(raw: Option<&str>) -> bool {
+        raw.and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => Some(true),
+            "0" | "false" | "off" | "no" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(false)
+    }
+
+    fn public_https_resource_allowed(url: &str) -> bool {
+        let Ok(parsed) = Url::parse(url) else {
+            return false;
+        };
+        if parsed.scheme() != "https" {
+            return false;
+        }
+        let Some(host) = parsed.host_str() else {
+            return false;
+        };
+        Self::public_resource_host_allowed(host)
+    }
+
+    fn public_resource_host_allowed(host: &str) -> bool {
+        let host = host
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        if host.is_empty() || host == "localhost" || host.ends_with(".localhost") {
+            return false;
+        }
+        match host.parse::<IpAddr>() {
+            Ok(ip) => Self::public_resource_ip_allowed(ip),
+            Err(_) => true,
+        }
+    }
+
+    fn public_resource_ip_allowed(ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(addr) => {
+                let [first, second, third, _] = addr.octets();
+                !(addr.is_private()
+                    || addr.is_loopback()
+                    || addr.is_link_local()
+                    || addr.is_broadcast()
+                    || addr.is_documentation()
+                    || addr.is_unspecified()
+                    || addr.is_multicast()
+                    || first == 0
+                    || first >= 240
+                    || (first == 100 && (64..=127).contains(&second))
+                    || (first == 198 && (18..=19).contains(&second))
+                    || (first == 192 && second == 0 && third == 0))
+            }
+            IpAddr::V6(addr) => {
+                let segments = addr.segments();
+                !(addr.is_loopback()
+                    || addr.is_unspecified()
+                    || addr.is_multicast()
+                    || (segments[0] & 0xfe00) == 0xfc00
+                    || (segments[0] & 0xffc0) == 0xfe80
+                    || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+            }
+        }
+    }
+
+    async fn read_limited_bytes(mut resp: Response, limit: usize) -> Result<Vec<u8>, String> {
+        if resp
+            .content_length()
+            .is_some_and(|length| length > limit as u64)
+        {
+            return Err(format!("resource exceeds {limit} bytes"));
+        }
+
+        let mut out = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| tr_args("api-network-error", &[("error", e.to_string())]))?
+        {
+            if out.len().saturating_add(chunk.len()) > limit {
+                return Err(format!("resource exceeds {limit} bytes"));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
     }
 
     fn request_span(&self, method: &'static str, path: &str) -> telemetry::TraceSpan {
@@ -510,9 +607,24 @@ impl ApiClient {
         let span = telemetry::TraceSpan::child("http.client", "api.resource");
         span.set_tag("api.method", "GET");
         span.set_tag("api.route", "resource");
-        let headers = if self.is_same_origin(&url) {
+        let same_origin = self.is_same_origin(&url);
+        let explicit_external_resources = Self::external_resources_enabled();
+        let public_https_resource = Self::public_https_resource_allowed(&url);
+        if !same_origin && !explicit_external_resources && !public_https_resource {
+            span.set_tag("operation", "external_resource_blocked");
+            span.set_status(false);
+            span.finish();
+            return Err(
+                "external resource is not a public HTTPS URL; set KRAMLI_ALLOW_EXTERNAL_RESOURCES=1 to allow it"
+                    .to_string(),
+            );
+        }
+        let headers = if same_origin {
             span.set_tag("operation", "same_origin");
             self.headers()
+        } else if public_https_resource && !explicit_external_resources {
+            span.set_tag("operation", "external_public_https_resource");
+            Self::language_headers()
         } else {
             span.set_tag("operation", "external_resource");
             Self::language_headers()
@@ -536,26 +648,27 @@ impl ApiClient {
         let status = resp.status();
         self.finish_response_span(&span, status.as_u16());
         if status.is_success() {
-            let result = resp
-                .bytes()
-                .await
-                .map(|bytes| {
-                    span.set_data_i64("api.response_bytes", metric_i64(bytes.len()));
-                    bytes.to_vec()
-                })
-                .map_err(|e| tr_args("api-network-error", &[("error", e.to_string())]));
+            let result = Self::read_limited_bytes(resp, MAX_RESOURCE_BYTES).await;
+            if let Ok(bytes) = &result {
+                span.set_data_i64("api.response_bytes", metric_i64(bytes.len()));
+            }
             span.set_status(result.is_ok());
             span.finish();
             return result;
         }
 
-        let text = resp.text().await.unwrap_or_default();
-        span.set_data_i64("api.response_bytes", metric_i64(text.len()));
+        let bytes = Self::read_limited_bytes(resp, MAX_RESOURCE_BYTES)
+            .await
+            .unwrap_or_default();
+        span.set_data_i64("api.response_bytes", metric_i64(bytes.len()));
         span.set_status(false);
         span.finish();
         Err(tr_args(
             "api-error",
-            &[("status", status.as_u16().to_string()), ("message", text)],
+            &[
+                ("status", status.as_u16().to_string()),
+                ("message", format!("[{} bytes]", bytes.len())),
+            ],
         ))
     }
 }
@@ -619,5 +732,48 @@ mod tests {
         let client = test_client("https://kramli.de");
         assert!(client.is_same_origin("https://kramli.de/uploads/file.jpg"));
         assert!(!client.is_same_origin("https://example.com/file.jpg"));
+    }
+
+    #[test]
+    fn external_resources_are_opt_in() {
+        assert!(!ApiClient::external_resources_enabled_from(None));
+        assert!(!ApiClient::external_resources_enabled_from(Some("invalid")));
+        assert!(!ApiClient::external_resources_enabled_from(Some("0")));
+        assert!(ApiClient::external_resources_enabled_from(Some("true")));
+    }
+
+    #[test]
+    fn public_https_resources_are_allowed_by_default() {
+        assert!(ApiClient::public_https_resource_allowed(
+            "https://cdn.example.com/avatar.png"
+        ));
+        assert!(ApiClient::public_https_resource_allowed(
+            "https://93.184.216.34/avatar.png"
+        ));
+    }
+
+    #[test]
+    fn unsafe_external_resources_are_not_allowed_by_default() {
+        assert!(!ApiClient::public_https_resource_allowed(
+            "http://cdn.example.com/avatar.png"
+        ));
+        assert!(!ApiClient::public_https_resource_allowed(
+            "https://localhost/avatar.png"
+        ));
+        assert!(!ApiClient::public_https_resource_allowed(
+            "https://api.localhost/avatar.png"
+        ));
+        assert!(!ApiClient::public_https_resource_allowed(
+            "https://127.0.0.1/avatar.png"
+        ));
+        assert!(!ApiClient::public_https_resource_allowed(
+            "https://10.0.0.5/avatar.png"
+        ));
+        assert!(!ApiClient::public_https_resource_allowed(
+            "https://[::1]/avatar.png"
+        ));
+        assert!(!ApiClient::public_https_resource_allowed(
+            "https://[fd00::1]/avatar.png"
+        ));
     }
 }

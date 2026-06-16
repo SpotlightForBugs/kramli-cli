@@ -1,10 +1,11 @@
 //! Privacy controls for crash/error telemetry and performance tracing.
 //!
-//! Telemetry is opt-in: unless explicitly enabled by the user, no Sentry events
-//! are sent. Whatever is sent is scrubbed of credentials and payload details
+//! Telemetry follows the user's saved first-run preference or explicit env
+//! overrides. Whatever is sent is scrubbed of credentials and payload details
 //! first. We also disable Sentry's `send_default_pii`, so OS usernames, IP
 //! addresses, and hostnames are not attached to events.
 
+use crate::config::Config;
 use sentry::protocol::{Event, SpanStatus, Value};
 
 const SAFE_TAG_KEYS: &[&str] = &[
@@ -20,26 +21,17 @@ const SAFE_TAG_KEYS: &[&str] = &[
     "view",
 ];
 
-/// Returns `true` only when telemetry was explicitly enabled by the user.
+/// Returns `true` when telemetry should be active.
 ///
 /// Honoured signals:
 /// - `DO_NOT_TRACK` (cross-tool convention) truthy -> force disable
 /// - `KRAMLI_NO_TELEMETRY` truthy -> force disable
-/// - `KRAMLI_TELEMETRY` must be truthy (`1`/`true`/`on`/`yes`) to enable
+/// - `KRAMLI_TELEMETRY` can explicitly enable/disable with
+///   `1`/`true`/`on`/`yes` and `0`/`false`/`off`/`no`
 ///
-/// Privacy-first default: if `KRAMLI_TELEMETRY` is missing or invalid, telemetry
-/// stays disabled.
+/// Default: disabled until the user answers the first-run prompt.
 pub fn is_enabled() -> bool {
-    if env_is_truthy("DO_NOT_TRACK") || env_is_truthy("KRAMLI_NO_TELEMETRY") {
-        return false;
-    }
-    matches!(
-        std::env::var("KRAMLI_TELEMETRY")
-            .ok()
-            .as_deref()
-            .and_then(parse_env_bool),
-        Some(true)
-    )
+    Config::load().telemetry_enabled()
 }
 
 pub fn traces_sample_rate() -> f32 {
@@ -49,24 +41,6 @@ pub fn traces_sample_rate() -> f32 {
         .filter(|value| value.is_finite())
         .map(|value| value.clamp(0.0, 1.0))
         .unwrap_or(1.0)
-}
-
-fn parse_env_bool(raw: &str) -> Option<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "on" | "yes" => Some(true),
-        "0" | "false" | "off" | "no" => Some(false),
-        _ => None,
-    }
-}
-
-fn env_is_truthy(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(raw) => {
-            let v = raw.trim().to_ascii_lowercase();
-            !v.is_empty() && v != "0" && v != "false" && v != "off" && v != "no"
-        }
-        Err(_) => false,
-    }
 }
 
 /// Remove credentials and response payloads from a free-text error/message
@@ -125,14 +99,30 @@ fn marks_following_secret(token: &str) -> bool {
     let normalized = secret_marker(token);
     matches!(
         normalized.as_str(),
-        "bearer" | "token" | "secret" | "authorization" | "api-key" | "apikey" | "key"
+        "bearer"
+            | "bearer:"
+            | "bearer="
+            | "token"
+            | "secret"
+            | "authorization"
+            | "authorization:"
+            | "authorization="
+            | "authorization:bearer"
+            | "authorization=bearer"
+            | "api-key"
+            | "apikey"
+            | "key"
     ) || normalized.ends_with(":token")
         || normalized.ends_with(":secret")
         || normalized.ends_with(":authorization")
+        || normalized.ends_with(":bearer")
 }
 
 fn is_bearer_marker(token: &str) -> bool {
-    secret_marker(token) == "bearer"
+    matches!(
+        secret_marker(token).as_str(),
+        "bearer" | "bearer:" | "bearer="
+    )
 }
 
 fn secret_marker(token: &str) -> String {
@@ -440,15 +430,30 @@ fn redact_token(token: &str) -> String {
     }
     let lower = token.to_ascii_lowercase();
     for marker in [
+        "authorization:bearer",
+        "authorization=bearer",
         "token=",
         "secret=",
         "authorization=",
+        "authorization:",
+        "bearer:",
+        "bearer=",
         "api_key=",
         "apikey=",
         "key=",
     ] {
         if let Some(pos) = lower.find(marker) {
             let end = pos + marker.len();
+            let trailing = &token[end..];
+            if marker == "authorization:" && trailing.eq_ignore_ascii_case("bearer") {
+                continue;
+            }
+            if trailing
+                .trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
+                .is_empty()
+            {
+                continue;
+            }
             return format!("{}[REDACTED]", &token[..end]);
         }
     }
@@ -483,6 +488,7 @@ fn looks_like_jwt(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::parse_env_bool;
     use sentry::protocol::{Event, Exception, LogEntry, Map};
 
     fn is_enabled_from_values(
@@ -499,21 +505,24 @@ mod tests {
         {
             return false;
         }
-        matches!(telemetry.and_then(parse_env_bool), Some(true))
+        telemetry.and_then(parse_env_bool).unwrap_or(false)
     }
 
     #[test]
-    fn telemetry_is_opt_in() {
+    fn telemetry_is_disabled_until_consent_or_env_enable() {
         assert!(!is_enabled_from_values(None, None, None));
         assert!(!is_enabled_from_values(None, None, Some("invalid")));
         assert!(!is_enabled_from_values(None, None, Some("0")));
+        assert!(!is_enabled_from_values(None, None, Some("false")));
         assert!(is_enabled_from_values(None, None, Some("true")));
     }
 
     #[test]
-    fn dnt_and_no_telemetry_override_opt_in() {
+    fn dnt_and_no_telemetry_override_explicit_enable() {
+        assert!(!is_enabled_from_values(Some("1"), None, None));
+        assert!(!is_enabled_from_values(Some("maybe"), None, None));
+        assert!(!is_enabled_from_values(None, Some("yes"), None));
         assert!(!is_enabled_from_values(Some("1"), None, Some("true")));
-        assert!(!is_enabled_from_values(Some("maybe"), None, Some("true")));
         assert!(!is_enabled_from_values(None, Some("yes"), Some("true")));
     }
 
@@ -555,6 +564,19 @@ mod tests {
     }
 
     #[test]
+    fn redacts_compact_authorization_headers() {
+        let scrubbed = scrub_message(
+            "Authorization:Bearer compact-secret Authorization:BearerInlineSecret bearer=another-secret",
+        );
+        assert!(scrubbed.contains("Authorization:Bearer [REDACTED]"));
+        assert!(scrubbed.contains("Authorization:Bearer[REDACTED]"));
+        assert!(scrubbed.contains("bearer=[REDACTED]"));
+        assert!(!scrubbed.contains("compact-secret"));
+        assert!(!scrubbed.contains("BearerInlineSecret"));
+        assert!(!scrubbed.contains("another-secret"));
+    }
+
+    #[test]
     fn keeps_plain_messages() {
         assert_eq!(
             scrub_message("Network error: timeout"),
@@ -583,13 +605,15 @@ mod tests {
 
     #[test]
     fn scrub_event_keeps_only_safe_trace_tags() {
-        let mut event = Event::default();
-        event.transaction = Some("cli.command".to_string());
-        event.tags = Map::from_iter([
-            (String::from("command"), String::from("items")),
-            (String::from("email"), String::from("user@example.com")),
-            (String::from("api.route"), String::from("/lists/{id}/items")),
-        ]);
+        let event = Event {
+            transaction: Some("cli.command".to_string()),
+            tags: Map::from_iter([
+                (String::from("command"), String::from("items")),
+                (String::from("email"), String::from("user@example.com")),
+                (String::from("api.route"), String::from("/lists/{id}/items")),
+            ]),
+            ..Event::default()
+        };
 
         let scrubbed = scrub_event(event).expect("event should be kept");
         assert_eq!(scrubbed.transaction.as_deref(), Some("cli.command"));
@@ -606,21 +630,23 @@ mod tests {
 
     #[test]
     fn scrub_event_drops_sensitive_structured_fields() {
-        let mut event = Event::default();
-        event.message = Some("Failed for user@example.com".to_string());
-        event.server_name = Some("my-host".into());
-        event.tags = Map::from_iter([(String::from("email"), String::from("user@example.com"))]);
-        event.contexts = Map::from_iter([(
-            String::from("os"),
-            sentry::protocol::Context::Other(Map::from_iter([(
-                String::from("name"),
-                sentry::protocol::Value::from("macOS"),
-            )])),
-        )]);
-        event.logentry = Some(LogEntry {
-            message: "api key kramli_abc123".to_string(),
-            params: vec![sentry::protocol::Value::from("secret")],
-        });
+        let mut event = Event {
+            message: Some("Failed for user@example.com".to_string()),
+            server_name: Some("my-host".into()),
+            tags: Map::from_iter([(String::from("email"), String::from("user@example.com"))]),
+            contexts: Map::from_iter([(
+                String::from("os"),
+                sentry::protocol::Context::Other(Map::from_iter([(
+                    String::from("name"),
+                    sentry::protocol::Value::from("macOS"),
+                )])),
+            )]),
+            logentry: Some(LogEntry {
+                message: "api key kramli_abc123".to_string(),
+                params: vec![sentry::protocol::Value::from("secret")],
+            }),
+            ..Event::default()
+        };
         event.exception.values.push(Exception {
             ty: "error".to_string(),
             value: Some("boom for user@example.com".to_string()),
