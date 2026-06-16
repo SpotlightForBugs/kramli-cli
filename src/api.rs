@@ -10,7 +10,6 @@ use serde_json::Value;
 
 use crate::config::Config;
 use crate::i18n::{current_locale_code, tr_args};
-use crate::models::ApiError;
 use crate::telemetry;
 
 #[derive(Clone)]
@@ -24,6 +23,7 @@ pub struct ApiClient {
 const DEFAULT_RATE_LIMIT_MS: u64 = 120;
 const MAX_429_RETRIES: u32 = 3;
 const MAX_RESOURCE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ERROR_MESSAGE_CHARS: usize = 500;
 
 fn metric_i64(value: impl TryInto<i64>) -> i64 {
     value.try_into().unwrap_or(i64::MAX)
@@ -322,6 +322,78 @@ impl ApiClient {
         span.set_tag("api.status_class", telemetry::status_class(status));
     }
 
+    fn format_api_error_message(body: &str) -> String {
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            return "(empty response)".to_string();
+        }
+
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            if let Some(message) = Self::extract_json_error_message(&value) {
+                return Self::truncate_error_message(&telemetry::scrub_message(&message));
+            }
+        }
+
+        if std::str::from_utf8(body.as_bytes()).is_ok() {
+            let collapsed = trimmed
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !collapsed.is_empty() {
+                return Self::truncate_error_message(&telemetry::scrub_message(&collapsed));
+            }
+        }
+
+        format!("[{} bytes]", body.len())
+    }
+
+    fn extract_json_error_message(value: &Value) -> Option<String> {
+        for key in ["error", "message", "detail", "title", "description"] {
+            if let Some(message) = value
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                return Some(message.to_string());
+            }
+        }
+
+        if let Some(errors) = value.get("errors").and_then(Value::as_array) {
+            let parts = errors
+                .iter()
+                .filter_map(|entry| match entry {
+                    Value::String(text) => Some(text.trim().to_string()),
+                    Value::Object(obj) => obj
+                        .get("message")
+                        .or_else(|| obj.get("error"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_string),
+                    _ => None,
+                })
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>();
+            if !parts.is_empty() {
+                return Some(parts.join("; "));
+            }
+        }
+
+        None
+    }
+
+    fn truncate_error_message(message: &str) -> String {
+        if message.chars().count() <= MAX_ERROR_MESSAGE_CHARS {
+            message.to_string()
+        } else {
+            let truncated: String = message.chars().take(MAX_ERROR_MESSAGE_CHARS).collect();
+            format!("{truncated}…")
+        }
+    }
+
     async fn handle<T: DeserializeOwned>(
         resp: Response,
         span: Option<&telemetry::TraceSpan>,
@@ -346,23 +418,13 @@ impl ApiClient {
             if let Some(span) = span {
                 span.set_data_i64("api.response_bytes", metric_i64(text.len()));
             }
-            if let Ok(err) = serde_json::from_str::<ApiError>(&text) {
-                Err(tr_args(
-                    "api-error",
-                    &[
-                        ("status", status.as_u16().to_string()),
-                        ("message", err.error.unwrap_or(text)),
-                    ],
-                ))
-            } else {
-                Err(tr_args(
-                    "api-error",
-                    &[
-                        ("status", status.as_u16().to_string()),
-                        ("message", format!("[{} bytes]", text.len())),
-                    ],
-                ))
-            }
+            Err(tr_args(
+                "api-error",
+                &[
+                    ("status", status.as_u16().to_string()),
+                    ("message", Self::format_api_error_message(&text)),
+                ],
+            ))
         }
     }
 
@@ -596,7 +658,7 @@ impl ApiClient {
                 "api-error",
                 &[
                     ("status", status.as_u16().to_string()),
-                    ("message", format!("[{} bytes]", text.len())),
+                    ("message", Self::format_api_error_message(&text)),
                 ],
             ))
         }
@@ -663,11 +725,12 @@ impl ApiClient {
         span.set_data_i64("api.response_bytes", metric_i64(bytes.len()));
         span.set_status(false);
         span.finish();
+        let body = String::from_utf8_lossy(&bytes);
         Err(tr_args(
             "api-error",
             &[
                 ("status", status.as_u16().to_string()),
-                ("message", format!("[{} bytes]", bytes.len())),
+                ("message", Self::format_api_error_message(&body)),
             ],
         ))
     }
@@ -775,5 +838,52 @@ mod tests {
         assert!(!ApiClient::public_https_resource_allowed(
             "https://[fd00::1]/avatar.png"
         ));
+    }
+
+    #[test]
+    fn api_error_message_extracts_common_json_fields() {
+        assert_eq!(
+            ApiClient::format_api_error_message(r#"{"error":"List not found"}"#),
+            "List not found"
+        );
+        assert_eq!(
+            ApiClient::format_api_error_message(r#"{"message":"Forbidden"}"#),
+            "Forbidden"
+        );
+        assert_eq!(
+            ApiClient::format_api_error_message(r#"{"detail":"Invalid token"}"#),
+            "Invalid token"
+        );
+    }
+
+    #[test]
+    fn api_error_message_extracts_validation_errors() {
+        assert_eq!(
+            ApiClient::format_api_error_message(
+                r#"{"errors":[{"message":"name is required"},{"message":"icon is invalid"}]}"#
+            ),
+            "name is required; icon is invalid"
+        );
+    }
+
+    #[test]
+    fn api_error_message_uses_plain_text_fallback() {
+        assert_eq!(
+            ApiClient::format_api_error_message("Service unavailable"),
+            "Service unavailable"
+        );
+    }
+
+    #[test]
+    fn api_error_message_scrubs_sensitive_values() {
+        let scrubbed =
+            ApiClient::format_api_error_message("Invalid API key: kramli_secretvalue rejected");
+        assert!(scrubbed.contains("kramli_[REDACTED]"));
+        assert!(!scrubbed.contains("kramli_secretvalue"));
+    }
+
+    #[test]
+    fn api_error_message_reports_empty_response() {
+        assert_eq!(ApiClient::format_api_error_message("  \n  "), "(empty response)");
     }
 }

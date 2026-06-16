@@ -40,7 +40,7 @@ fn main() -> ExitCode {
 
     if let Err(e) = runtime.block_on(cli::run(cli)) {
         if guard.is_some() {
-            sentry::capture_message("cli.command.failed", sentry::Level::Error);
+            sentry::capture_message(&telemetry::scrub_message(&e), sentry::Level::Error);
         }
         eprintln!("\x1b[31m{}\x1b[0m {e}", tr("main-error-prefix"));
         return ExitCode::FAILURE;
