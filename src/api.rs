@@ -1,8 +1,9 @@
+use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE, RETRY_AFTER};
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Client, Response, StatusCode, Url};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
@@ -10,7 +11,9 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::i18n::{current_locale_code, tr_args};
 use crate::models::ApiError;
+use crate::telemetry;
 
+#[derive(Clone)]
 pub struct ApiClient {
     client: Client,
     base_url: String,
@@ -20,6 +23,11 @@ pub struct ApiClient {
 
 const DEFAULT_RATE_LIMIT_MS: u64 = 120;
 const MAX_429_RETRIES: u32 = 3;
+const MAX_RESOURCE_BYTES: usize = 8 * 1024 * 1024;
+
+fn metric_i64(value: impl TryInto<i64>) -> i64 {
+    value.try_into().unwrap_or(i64::MAX)
+}
 
 static LAST_REQUEST_AT: OnceLock<tokio::sync::Mutex<Option<Instant>>> = OnceLock::new();
 
@@ -29,6 +37,8 @@ impl ApiClient {
         let base_url = config.base_url().trim_end_matches('/').to_string();
         Self::ensure_secure_base_url(&base_url)?;
         let client = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
             .build()
             .map_err(|e| tr_args("api-http-client-error", &[("error", e.to_string())]))?;
         Ok(Self {
@@ -43,26 +53,27 @@ impl ApiClient {
     /// (sent in the `X-API-Key` header) is never transmitted in the clear.
     /// `http://localhost`/`127.0.0.1`/`::1` stay allowed for local development.
     fn ensure_secure_base_url(base_url: &str) -> Result<(), String> {
-        let lower = base_url.trim().to_ascii_lowercase();
-        let Some(rest) = lower.strip_prefix("http://") else {
+        let parsed = Url::parse(base_url).map_err(|_| {
+            tr_args(
+                "api-insecure-http",
+                &[("host", base_url.trim().to_string())],
+            )
+        })?;
+        if parsed.scheme() != "http" {
             return Ok(());
         };
-        let authority = rest.split('/').next().unwrap_or("");
-        // Drop any userinfo (user:pass@host) before inspecting the host.
-        let host = authority.rsplit('@').next().unwrap_or(authority);
-        let host_only = host.split(':').next().unwrap_or(host);
-        let is_loopback = host_only == "localhost"
-            || host_only.ends_with(".localhost")
-            || host_only.starts_with("127.")
-            || host_only == "::1"
-            || host.contains("[::1]");
+        let host = parsed.host_str().unwrap_or_default();
+        let ip_host = host.trim_start_matches('[').trim_end_matches(']');
+        let is_loopback = host == "localhost"
+            || host.ends_with(".localhost")
+            || ip_host
+                .parse::<IpAddr>()
+                .map(|addr| addr.is_loopback())
+                .unwrap_or(false);
         if is_loopback {
             return Ok(());
         }
-        Err(tr_args(
-            "api-insecure-http",
-            &[("host", host_only.to_string())],
-        ))
+        Err(tr_args("api-insecure-http", &[("host", host.to_string())]))
     }
 
     fn preferred_language() -> String {
@@ -81,19 +92,23 @@ impl ApiClient {
         LAST_REQUEST_AT.get_or_init(|| tokio::sync::Mutex::new(None))
     }
 
-    async fn wait_for_rate_limit(&self) {
+    async fn wait_for_rate_limit(&self) -> u128 {
         if self.min_request_interval.is_zero() {
-            return;
+            return 0;
         }
 
         let mut gate = Self::limiter().lock().await;
+        let mut waited_ms = 0;
         if let Some(previous) = *gate {
             let elapsed = previous.elapsed();
             if elapsed < self.min_request_interval {
-                tokio::time::sleep(self.min_request_interval - elapsed).await;
+                let wait = self.min_request_interval - elapsed;
+                waited_ms = wait.as_millis();
+                tokio::time::sleep(wait).await;
             }
         }
         *gate = Some(Instant::now());
+        waited_ms
     }
 
     fn retry_delay(resp: &Response, attempt: u32) -> Duration {
@@ -109,22 +124,42 @@ impl ApiClient {
         Duration::from_millis(250_u64.saturating_mul(multiplier))
     }
 
-    async fn send_with_retry<F>(&self, mut build_request: F) -> Result<Response, String>
+    async fn send_with_retry<F>(
+        &self,
+        mut build_request: F,
+        span: Option<&telemetry::TraceSpan>,
+    ) -> Result<Response, String>
     where
         F: FnMut() -> reqwest::RequestBuilder,
     {
         let mut attempt = 0;
+        let mut wait_ms = 0_u128;
         loop {
-            self.wait_for_rate_limit().await;
-            let resp = build_request()
-                .send()
-                .await
-                .map_err(|e| tr_args("api-network-error", &[("error", e.to_string())]))?;
+            wait_ms = wait_ms.saturating_add(self.wait_for_rate_limit().await);
+            let resp = match build_request().send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if let Some(span) = span {
+                        span.set_data_i64("api.retry_count", metric_i64(attempt));
+                        span.set_data_i64("api.rate_limit_wait_ms", metric_i64(wait_ms));
+                        span.set_status(false);
+                    }
+                    return Err(tr_args("api-network-error", &[("error", e.to_string())]));
+                }
+            };
 
             if resp.status() != StatusCode::TOO_MANY_REQUESTS {
+                if let Some(span) = span {
+                    span.set_data_i64("api.retry_count", metric_i64(attempt));
+                    span.set_data_i64("api.rate_limit_wait_ms", metric_i64(wait_ms));
+                }
                 return Ok(resp);
             }
             if attempt >= MAX_429_RETRIES {
+                if let Some(span) = span {
+                    span.set_data_i64("api.retry_count", metric_i64(attempt));
+                    span.set_data_i64("api.rate_limit_wait_ms", metric_i64(wait_ms));
+                }
                 return Ok(resp);
             }
 
@@ -149,18 +184,168 @@ impl ApiClient {
         format!("{}/api{}", self.base_url, path)
     }
 
-    async fn handle<T: DeserializeOwned>(resp: Response) -> Result<T, String> {
+    fn resource_url(&self, path_or_url: &str) -> String {
+        let value = path_or_url.trim();
+        if value.starts_with("http://") || value.starts_with("https://") {
+            return value.to_string();
+        }
+        if value.starts_with('/') {
+            return format!("{}{}", self.base_url, value);
+        }
+        format!("{}/{}", self.base_url, value)
+    }
+
+    fn is_same_origin(&self, url: &str) -> bool {
+        let Ok(target) = Url::parse(url) else {
+            return false;
+        };
+        let Ok(base) = Url::parse(&self.base_url) else {
+            return false;
+        };
+        target.scheme() == base.scheme()
+            && target.host_str() == base.host_str()
+            && target.port_or_known_default() == base.port_or_known_default()
+    }
+
+    fn language_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Ok(v) = HeaderValue::from_str(&Self::preferred_language()) {
+            h.insert(ACCEPT_LANGUAGE, v);
+        }
+        h
+    }
+
+    fn external_resources_enabled() -> bool {
+        Self::external_resources_enabled_from(
+            std::env::var("KRAMLI_ALLOW_EXTERNAL_RESOURCES")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    fn external_resources_enabled_from(raw: Option<&str>) -> bool {
+        raw.and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => Some(true),
+            "0" | "false" | "off" | "no" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(false)
+    }
+
+    fn public_https_resource_allowed(url: &str) -> bool {
+        let Ok(parsed) = Url::parse(url) else {
+            return false;
+        };
+        if parsed.scheme() != "https" {
+            return false;
+        }
+        let Some(host) = parsed.host_str() else {
+            return false;
+        };
+        Self::public_resource_host_allowed(host)
+    }
+
+    fn public_resource_host_allowed(host: &str) -> bool {
+        let host = host
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        if host.is_empty() || host == "localhost" || host.ends_with(".localhost") {
+            return false;
+        }
+        match host.parse::<IpAddr>() {
+            Ok(ip) => Self::public_resource_ip_allowed(ip),
+            Err(_) => true,
+        }
+    }
+
+    fn public_resource_ip_allowed(ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(addr) => {
+                let [first, second, third, _] = addr.octets();
+                !(addr.is_private()
+                    || addr.is_loopback()
+                    || addr.is_link_local()
+                    || addr.is_broadcast()
+                    || addr.is_documentation()
+                    || addr.is_unspecified()
+                    || addr.is_multicast()
+                    || first == 0
+                    || first >= 240
+                    || (first == 100 && (64..=127).contains(&second))
+                    || (first == 198 && (18..=19).contains(&second))
+                    || (first == 192 && second == 0 && third == 0))
+            }
+            IpAddr::V6(addr) => {
+                let segments = addr.segments();
+                !(addr.is_loopback()
+                    || addr.is_unspecified()
+                    || addr.is_multicast()
+                    || (segments[0] & 0xfe00) == 0xfc00
+                    || (segments[0] & 0xffc0) == 0xfe80
+                    || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+            }
+        }
+    }
+
+    async fn read_limited_bytes(mut resp: Response, limit: usize) -> Result<Vec<u8>, String> {
+        if resp
+            .content_length()
+            .is_some_and(|length| length > limit as u64)
+        {
+            return Err(format!("resource exceeds {limit} bytes"));
+        }
+
+        let mut out = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| tr_args("api-network-error", &[("error", e.to_string())]))?
+        {
+            if out.len().saturating_add(chunk.len()) > limit {
+                return Err(format!("resource exceeds {limit} bytes"));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+
+    fn request_span(&self, method: &'static str, path: &str) -> telemetry::TraceSpan {
+        let span = telemetry::TraceSpan::child("http.client", "api.request");
+        span.set_tag("api.method", method);
+        span.set_tag("api.route", telemetry::route_template(path));
+        span
+    }
+
+    fn finish_response_span(&self, span: &telemetry::TraceSpan, status: u16) {
+        span.set_tag("api.status_class", telemetry::status_class(status));
+    }
+
+    async fn handle<T: DeserializeOwned>(
+        resp: Response,
+        span: Option<&telemetry::TraceSpan>,
+    ) -> Result<T, String> {
         let status = resp.status();
         if status.is_success() {
             let text = resp.text().await.map_err(|e| e.to_string())?;
+            if let Some(span) = span {
+                span.set_data_i64("api.response_bytes", metric_i64(text.len()));
+            }
             serde_json::from_str::<T>(&text).map_err(|e| {
                 tr_args(
                     "api-parse-response-error",
-                    &[("error", e.to_string()), ("body", text.clone())],
+                    &[
+                        ("error", e.to_string()),
+                        ("body", format!("[{} bytes]", text.len())),
+                    ],
                 )
             })
         } else {
             let text = resp.text().await.unwrap_or_default();
+            if let Some(span) = span {
+                span.set_data_i64("api.response_bytes", metric_i64(text.len()));
+            }
             if let Ok(err) = serde_json::from_str::<ApiError>(&text) {
                 Err(tr_args(
                     "api-error",
@@ -172,19 +357,38 @@ impl ApiClient {
             } else {
                 Err(tr_args(
                     "api-error",
-                    &[("status", status.as_u16().to_string()), ("message", text)],
+                    &[
+                        ("status", status.as_u16().to_string()),
+                        ("message", format!("[{} bytes]", text.len())),
+                    ],
                 ))
             }
         }
     }
 
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+        let span = self.request_span("GET", path);
         let url = self.url(path);
         let headers = self.headers();
-        let resp = self
-            .send_with_retry(|| self.client.get(&url).headers(headers.clone()))
-            .await?;
-        Self::handle(resp).await
+        let resp = match self
+            .send_with_retry(
+                || self.client.get(&url).headers(headers.clone()),
+                Some(&span),
+            )
+            .await
+        {
+            Ok(resp) => resp,
+            Err(error) => {
+                span.set_status(false);
+                span.finish();
+                return Err(error);
+            }
+        };
+        self.finish_response_span(&span, resp.status().as_u16());
+        let result = Self::handle(resp, Some(&span)).await;
+        span.set_status(result.is_ok());
+        span.finish();
+        result
     }
 
     pub async fn get_query<T: DeserializeOwned>(
@@ -192,6 +396,8 @@ impl ApiClient {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<T, String> {
+        let span = self.request_span("GET", path);
+        span.set_data_i64("api.query_count", metric_i64(query.len()));
         let url = self.url(path);
         let headers = self.headers();
         let params: Vec<(String, String)> = query
@@ -199,14 +405,29 @@ impl ApiClient {
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
         let resp = self
-            .send_with_retry(|| {
-                self.client
-                    .get(&url)
-                    .headers(headers.clone())
-                    .query(&params)
-            })
-            .await?;
-        Self::handle(resp).await
+            .send_with_retry(
+                || {
+                    self.client
+                        .get(&url)
+                        .headers(headers.clone())
+                        .query(&params)
+                },
+                Some(&span),
+            )
+            .await;
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(error) => {
+                span.set_status(false);
+                span.finish();
+                return Err(error);
+            }
+        };
+        self.finish_response_span(&span, resp.status().as_u16());
+        let result = Self::handle(resp, Some(&span)).await;
+        span.set_status(result.is_ok());
+        span.finish();
+        result
     }
 
     pub async fn post<B: Serialize, T: DeserializeOwned>(
@@ -214,18 +435,35 @@ impl ApiClient {
         path: &str,
         body: &B,
     ) -> Result<T, String> {
+        let span = self.request_span("POST", path);
         let url = self.url(path);
         let headers = self.headers();
         let payload: Value = serde_json::to_value(body).map_err(|e| e.to_string())?;
+        span.set_data_i64("api.request_bytes", metric_i64(payload.to_string().len()));
         let resp = self
-            .send_with_retry(|| {
-                self.client
-                    .post(&url)
-                    .headers(headers.clone())
-                    .json(&payload)
-            })
-            .await?;
-        Self::handle(resp).await
+            .send_with_retry(
+                || {
+                    self.client
+                        .post(&url)
+                        .headers(headers.clone())
+                        .json(&payload)
+                },
+                Some(&span),
+            )
+            .await;
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(error) => {
+                span.set_status(false);
+                span.finish();
+                return Err(error);
+            }
+        };
+        self.finish_response_span(&span, resp.status().as_u16());
+        let result = Self::handle(resp, Some(&span)).await;
+        span.set_status(result.is_ok());
+        span.finish();
+        result
     }
 
     pub async fn put<B: Serialize, T: DeserializeOwned>(
@@ -233,18 +471,35 @@ impl ApiClient {
         path: &str,
         body: &B,
     ) -> Result<T, String> {
+        let span = self.request_span("PUT", path);
         let url = self.url(path);
         let headers = self.headers();
         let payload: Value = serde_json::to_value(body).map_err(|e| e.to_string())?;
+        span.set_data_i64("api.request_bytes", metric_i64(payload.to_string().len()));
         let resp = self
-            .send_with_retry(|| {
-                self.client
-                    .put(&url)
-                    .headers(headers.clone())
-                    .json(&payload)
-            })
-            .await?;
-        Self::handle(resp).await
+            .send_with_retry(
+                || {
+                    self.client
+                        .put(&url)
+                        .headers(headers.clone())
+                        .json(&payload)
+                },
+                Some(&span),
+            )
+            .await;
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(error) => {
+                span.set_status(false);
+                span.finish();
+                return Err(error);
+            }
+        };
+        self.finish_response_span(&span, resp.status().as_u16());
+        let result = Self::handle(resp, Some(&span)).await;
+        span.set_status(result.is_ok());
+        span.finish();
+        result
     }
 
     pub async fn patch_json<B: Serialize, T: DeserializeOwned>(
@@ -252,50 +507,178 @@ impl ApiClient {
         path: &str,
         body: &B,
     ) -> Result<T, String> {
+        let span = self.request_span("PATCH", path);
         let url = self.url(path);
         let headers = self.headers();
         let payload: Value = serde_json::to_value(body).map_err(|e| e.to_string())?;
+        span.set_data_i64("api.request_bytes", metric_i64(payload.to_string().len()));
         let resp = self
-            .send_with_retry(|| {
-                self.client
-                    .patch(&url)
-                    .headers(headers.clone())
-                    .json(&payload)
-            })
-            .await?;
-        Self::handle(resp).await
+            .send_with_retry(
+                || {
+                    self.client
+                        .patch(&url)
+                        .headers(headers.clone())
+                        .json(&payload)
+                },
+                Some(&span),
+            )
+            .await;
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(error) => {
+                span.set_status(false);
+                span.finish();
+                return Err(error);
+            }
+        };
+        self.finish_response_span(&span, resp.status().as_u16());
+        let result = Self::handle(resp, Some(&span)).await;
+        span.set_status(result.is_ok());
+        span.finish();
+        result
     }
 
     pub async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+        let span = self.request_span("DELETE", path);
         let url = self.url(path);
         let headers = self.headers();
-        let resp = self
-            .send_with_retry(|| self.client.delete(&url).headers(headers.clone()))
-            .await?;
-        Self::handle(resp).await
+        let resp = match self
+            .send_with_retry(
+                || self.client.delete(&url).headers(headers.clone()),
+                Some(&span),
+            )
+            .await
+        {
+            Ok(resp) => resp,
+            Err(error) => {
+                span.set_status(false);
+                span.finish();
+                return Err(error);
+            }
+        };
+        self.finish_response_span(&span, resp.status().as_u16());
+        let result = Self::handle(resp, Some(&span)).await;
+        span.set_status(result.is_ok());
+        span.finish();
+        result
     }
 
     pub async fn delete_ok(&self, path: &str) -> Result<bool, String> {
+        let span = self.request_span("DELETE", path);
         let url = self.url(path);
         let headers = self.headers();
-        let resp = self
-            .send_with_retry(|| self.client.delete(&url).headers(headers.clone()))
-            .await?;
+        let resp = match self
+            .send_with_retry(
+                || self.client.delete(&url).headers(headers.clone()),
+                Some(&span),
+            )
+            .await
+        {
+            Ok(resp) => resp,
+            Err(error) => {
+                span.set_status(false);
+                span.finish();
+                return Err(error);
+            }
+        };
         let status = resp.status();
+        self.finish_response_span(&span, status.as_u16());
         if status == StatusCode::NO_CONTENT || status.is_success() {
+            span.set_status(true);
+            span.finish();
             Ok(true)
         } else {
             let text = resp.text().await.unwrap_or_default();
+            span.set_data_i64("api.response_bytes", metric_i64(text.len()));
+            span.set_status(false);
+            span.finish();
             Err(tr_args(
                 "api-error",
-                &[("status", status.as_u16().to_string()), ("message", text)],
+                &[
+                    ("status", status.as_u16().to_string()),
+                    ("message", format!("[{} bytes]", text.len())),
+                ],
             ))
         }
+    }
+
+    pub async fn get_bytes(&self, path_or_url: &str) -> Result<Vec<u8>, String> {
+        let url = self.resource_url(path_or_url);
+        let span = telemetry::TraceSpan::child("http.client", "api.resource");
+        span.set_tag("api.method", "GET");
+        span.set_tag("api.route", "resource");
+        let same_origin = self.is_same_origin(&url);
+        let explicit_external_resources = Self::external_resources_enabled();
+        let public_https_resource = Self::public_https_resource_allowed(&url);
+        if !same_origin && !explicit_external_resources && !public_https_resource {
+            span.set_tag("operation", "external_resource_blocked");
+            span.set_status(false);
+            span.finish();
+            return Err(
+                "external resource is not a public HTTPS URL; set KRAMLI_ALLOW_EXTERNAL_RESOURCES=1 to allow it"
+                    .to_string(),
+            );
+        }
+        let headers = if same_origin {
+            span.set_tag("operation", "same_origin");
+            self.headers()
+        } else if public_https_resource && !explicit_external_resources {
+            span.set_tag("operation", "external_public_https_resource");
+            Self::language_headers()
+        } else {
+            span.set_tag("operation", "external_resource");
+            Self::language_headers()
+        };
+
+        let resp = match self
+            .send_with_retry(
+                || self.client.get(&url).headers(headers.clone()),
+                Some(&span),
+            )
+            .await
+        {
+            Ok(resp) => resp,
+            Err(error) => {
+                span.set_status(false);
+                span.finish();
+                return Err(error);
+            }
+        };
+
+        let status = resp.status();
+        self.finish_response_span(&span, status.as_u16());
+        if status.is_success() {
+            let result = Self::read_limited_bytes(resp, MAX_RESOURCE_BYTES).await;
+            if let Ok(bytes) = &result {
+                span.set_data_i64("api.response_bytes", metric_i64(bytes.len()));
+            }
+            span.set_status(result.is_ok());
+            span.finish();
+            return result;
+        }
+
+        let bytes = Self::read_limited_bytes(resp, MAX_RESOURCE_BYTES)
+            .await
+            .unwrap_or_default();
+        span.set_data_i64("api.response_bytes", metric_i64(bytes.len()));
+        span.set_status(false);
+        span.finish();
+        Err(tr_args(
+            "api-error",
+            &[
+                ("status", status.as_u16().to_string()),
+                ("message", format!("[{} bytes]", bytes.len())),
+            ],
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use reqwest::Client;
+
     use super::ApiClient;
 
     #[test]
@@ -318,5 +701,79 @@ mod tests {
         assert!(ApiClient::ensure_secure_base_url("http://192.0.2.10:8080").is_err());
         // userinfo must not be mistaken for a loopback host
         assert!(ApiClient::ensure_secure_base_url("http://localhost@evil.example.com").is_err());
+        assert!(ApiClient::ensure_secure_base_url("http://127.evil.com").is_err());
+        assert!(ApiClient::ensure_secure_base_url("http://127.0.0.1.evil.example").is_err());
+    }
+
+    fn test_client(base_url: &str) -> ApiClient {
+        ApiClient {
+            client: Client::new(),
+            base_url: base_url.to_string(),
+            api_key: "kramli_test".to_string(),
+            min_request_interval: Duration::from_millis(0),
+        }
+    }
+
+    #[test]
+    fn resource_url_uses_base_for_relative_paths() {
+        let client = test_client("https://kramli.de");
+        assert_eq!(
+            client.resource_url("/uploads/file.jpg"),
+            "https://kramli.de/uploads/file.jpg"
+        );
+        assert_eq!(
+            client.resource_url("uploads/file.jpg"),
+            "https://kramli.de/uploads/file.jpg"
+        );
+    }
+
+    #[test]
+    fn same_origin_detection_rejects_external_hosts() {
+        let client = test_client("https://kramli.de");
+        assert!(client.is_same_origin("https://kramli.de/uploads/file.jpg"));
+        assert!(!client.is_same_origin("https://example.com/file.jpg"));
+    }
+
+    #[test]
+    fn external_resources_are_opt_in() {
+        assert!(!ApiClient::external_resources_enabled_from(None));
+        assert!(!ApiClient::external_resources_enabled_from(Some("invalid")));
+        assert!(!ApiClient::external_resources_enabled_from(Some("0")));
+        assert!(ApiClient::external_resources_enabled_from(Some("true")));
+    }
+
+    #[test]
+    fn public_https_resources_are_allowed_by_default() {
+        assert!(ApiClient::public_https_resource_allowed(
+            "https://cdn.example.com/avatar.png"
+        ));
+        assert!(ApiClient::public_https_resource_allowed(
+            "https://93.184.216.34/avatar.png"
+        ));
+    }
+
+    #[test]
+    fn unsafe_external_resources_are_not_allowed_by_default() {
+        assert!(!ApiClient::public_https_resource_allowed(
+            "http://cdn.example.com/avatar.png"
+        ));
+        assert!(!ApiClient::public_https_resource_allowed(
+            "https://localhost/avatar.png"
+        ));
+        assert!(!ApiClient::public_https_resource_allowed(
+            "https://api.localhost/avatar.png"
+        ));
+        assert!(!ApiClient::public_https_resource_allowed(
+            "https://127.0.0.1/avatar.png"
+        ));
+        assert!(!ApiClient::public_https_resource_allowed(
+            "https://10.0.0.5/avatar.png"
+        ));
+        assert!(!ApiClient::public_https_resource_allowed(
+            "https://[::1]/avatar.png"
+        ));
+        assert!(!ApiClient::public_https_resource_allowed(
+            "https://[fd00::1]/avatar.png"
+        ));
     }
 }

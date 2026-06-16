@@ -5,6 +5,7 @@ use crate::api::ApiClient;
 use crate::config::Config;
 use crate::i18n::{tr, tr_args};
 use crate::models::{ListItem, ShoppingList};
+use crate::telemetry;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
 
@@ -41,6 +42,9 @@ async fn handle_message(message: Value) -> Option<Value> {
         return None;
     }
 
+    let span = telemetry::TraceSpan::child("mcp.request", "mcp.request");
+    span.set_tag("operation", mcp_method_trace_name(method));
+
     let id = id.unwrap_or(Value::Null);
     let result = match method {
         "initialize" => Ok(json!({
@@ -56,9 +60,15 @@ async fn handle_message(message: Value) -> Option<Value> {
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
         "tools/call" => handle_tool_call(message.get("params").unwrap_or(&Value::Null)).await,
-        _ => return Some(error_response(id, -32601, &tr("mcp-method-not-found"))),
+        _ => {
+            span.set_status(false);
+            span.finish();
+            return Some(error_response(id, -32601, &tr("mcp-method-not-found")));
+        }
     };
 
+    span.set_status(result.is_ok());
+    span.finish();
     match result {
         Ok(value) => Some(json!({"jsonrpc": "2.0", "id": id, "result": value})),
         Err(message) => Some(error_response(id, -32603, &message)),
@@ -78,6 +88,10 @@ async fn handle_tool_call(params: &Value) -> Result<Value, String> {
         .cloned()
         .unwrap_or_default();
 
+    let span = telemetry::TraceSpan::child("mcp.tool", "mcp.tool");
+    span.set_tag("action", mcp_tool_trace_name(name));
+    span.set_data_i64("argument.count", args.len() as i64);
+
     let result = match name {
         "list_lists" => list_lists(&api).await,
         "list_items" => list_items(&api, &args).await,
@@ -88,10 +102,34 @@ async fn handle_tool_call(params: &Value) -> Result<Value, String> {
         _ => Err(tr_args("mcp-unknown-tool", &[("name", name.to_string())])),
     };
 
+    span.set_status(result.is_ok());
+    span.finish();
     Ok(match result {
         Ok(value) => tool_result(value, false),
         Err(message) => tool_text_result(message, true),
     })
+}
+
+fn mcp_method_trace_name(method: &str) -> &'static str {
+    match method {
+        "initialize" => "initialize",
+        "ping" => "ping",
+        "tools/list" => "tools_list",
+        "tools/call" => "tools_call",
+        _ => "unknown",
+    }
+}
+
+fn mcp_tool_trace_name(name: &str) -> &'static str {
+    match name {
+        "list_lists" => "list_lists",
+        "list_items" => "list_items",
+        "create_item" => "create_item",
+        "update_item" => "update_item",
+        "toggle_item_done" => "toggle_item_done",
+        "delete_item" => "delete_item",
+        _ => "unknown",
+    }
 }
 
 async fn list_lists(api: &ApiClient) -> Result<Value, String> {
@@ -106,8 +144,13 @@ async fn list_items(api: &ApiClient, args: &Map<String, Value>) -> Result<Value,
     let completed = optional_bool(args, "completed")?.unwrap_or(false);
     let state = optional_string(args, "state")?.map(|value| value.to_ascii_lowercase());
     let contains = optional_string(args, "contains")?.map(|value| value.to_ascii_lowercase());
+    let newest = optional_bool(args, "newest")?.unwrap_or(false);
+    let oldest = optional_bool(args, "oldest")?.unwrap_or(false);
+    let limit = optional_i64(args, "limit")?
+        .map(|value| value.max(0) as usize)
+        .filter(|value| *value > 0);
 
-    let filtered: Vec<ListItem> = items
+    let mut filtered: Vec<ListItem> = items
         .into_iter()
         .filter(|item| {
             let is_done = item.is_done.unwrap_or(false);
@@ -136,6 +179,16 @@ async fn list_items(api: &ApiClient, args: &Map<String, Value>) -> Result<Value,
             true
         })
         .collect();
+
+    if newest {
+        filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    } else if oldest {
+        filtered.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    }
+
+    if let Some(max) = limit {
+        filtered.truncate(max);
+    }
 
     serde_json::to_value(filtered).map_err(|e| e.to_string())
 }
@@ -494,7 +547,10 @@ fn tools() -> Vec<Value> {
                     "open": {"type": "boolean"},
                     "completed": {"type": "boolean"},
                     "state": {"type": "string"},
-                    "contains": {"type": "string"}
+                    "contains": {"type": "string"},
+                    "newest": {"type": "boolean"},
+                    "oldest": {"type": "boolean"},
+                    "limit": {"type": "integer"}
                 },
                 "required": ["list_id"],
                 "additionalProperties": false
@@ -566,7 +622,10 @@ fn tools() -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_length, try_parse_message, write_message, MessageFraming};
+    use super::{
+        content_length, mcp_method_trace_name, mcp_tool_trace_name, try_parse_message,
+        write_message, MessageFraming,
+    };
     use serde_json::json;
 
     #[test]
@@ -595,6 +654,14 @@ mod tests {
     #[test]
     fn reads_content_length_case_insensitively() {
         assert_eq!(content_length("content-length: 12").unwrap(), 12);
+    }
+
+    #[test]
+    fn trace_names_are_low_cardinality() {
+        assert_eq!(mcp_method_trace_name("tools/call"), "tools_call");
+        assert_eq!(mcp_method_trace_name("notifications/changed"), "unknown");
+        assert_eq!(mcp_tool_trace_name("create_item"), "create_item");
+        assert_eq!(mcp_tool_trace_name("custom_user_input"), "unknown");
     }
 
     #[tokio::test]

@@ -1,16 +1,20 @@
 use std::fs;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use colored::control::set_override;
 use colored::Colorize;
+use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::process::Command as TokioCommand;
 
 use crate::api::ApiClient;
 use crate::config::Config;
 use crate::i18n::{apply_profile_locale, current_locale_code, is_explicit_lang_set, tr, tr_args};
 use crate::models::*;
 use crate::output;
+use crate::telemetry;
 
 #[derive(Parser)]
 #[command(
@@ -24,8 +28,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Start a full-screen terminal UI
+    #[arg(short = 'i', long, global = true)]
+    pub interactive: bool,
+
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -85,11 +93,6 @@ pub enum Commands {
     Undo { list_id: i64 },
     /// Redo the last undone action on a list
     Redo { list_id: i64 },
-    /// Send or clear cross-device handoff events
-    Handoff {
-        #[command(subcommand)]
-        action: HandoffCmd,
-    },
     /// Show profile
     Profile,
     /// Account security level and login confirmation
@@ -104,10 +107,18 @@ pub enum Commands {
         #[arg(long, value_delimiter = ',')]
         docs: Option<Vec<String>>,
     },
+    /// Send or clear cross-device activity handoff state
+    Handoff {
+        #[command(subcommand)]
+        action: HandoffCmd,
+    },
     /// Check server connectivity
     Ping,
     /// Show CLI configuration
     Config,
+    /// Check whether a newer kramli CLI release is available
+    #[command(name = "update-check", alias = "update")]
+    UpdateCheck,
     /// Run a local stdio MCP server using the CLI login
     Mcp,
     /// Run multiple CLI commands from a file or stdin
@@ -124,6 +135,23 @@ pub enum Commands {
         /// Shell to generate for
         shell: Shell,
     },
+}
+
+const UPDATE_CHECK_URL: &str =
+    "https://api.github.com/repos/SpotlightForBugs/kramli-cli/releases/latest";
+const UPDATE_CHECK_INTERVAL_SECS: i64 = 60 * 60 * 24;
+
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    html_url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SemverTriplet {
+    major: u64,
+    minor: u64,
+    patch: u64,
 }
 
 // ─── Subcommands ───
@@ -270,6 +298,104 @@ mod tests {
     fn rejects_empty_list_references() {
         assert!(resolve_list_reference("  ").is_err());
     }
+
+    #[test]
+    fn batch_child_args_strips_program_name() {
+        assert_eq!(batch_child_args("kramli ping").unwrap(), vec!["ping"]);
+    }
+
+    #[test]
+    fn batch_child_args_forces_json_once() {
+        assert_eq!(
+            batch_child_args("kramli --json ping").unwrap(),
+            vec!["ping"]
+        );
+    }
+
+    #[test]
+    fn batch_child_args_rejects_nested_batch() {
+        assert!(batch_child_args("batch -").is_err());
+    }
+
+    #[test]
+    fn parses_interactive_mode_without_command() {
+        let cli = Cli::try_parse_from(["kramli", "-i"]).expect("interactive parse should work");
+        assert!(cli.interactive);
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_regular_mode_with_command() {
+        let cli = Cli::try_parse_from(["kramli", "status"]).expect("status parse should work");
+        assert!(!cli.interactive);
+        assert!(matches!(cli.command, Some(Commands::Status)));
+    }
+
+    #[test]
+    fn parses_update_check_command() {
+        let cli = Cli::try_parse_from(["kramli", "update-check"])
+            .expect("update-check parse should work");
+        assert!(matches!(cli.command, Some(Commands::UpdateCheck)));
+    }
+
+    #[test]
+    fn parses_manual_handoff_command_for_compatibility() {
+        let cli = Cli::try_parse_from(["kramli", "handoff", "clear"])
+            .expect("handoff clear parse should work");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Handoff {
+                action: HandoffCmd::Clear
+            })
+        ));
+    }
+
+    #[test]
+    fn handoff_payload_does_not_request_integration_open() {
+        let body = handoff_body(42, Some("Groceries".to_string()), "Kramli CLI".to_string());
+        assert_eq!(body.get("list_id"), Some(&Value::from(42)));
+        assert_eq!(
+            body.get("list_name"),
+            Some(&Value::String("Groceries".to_string()))
+        );
+        assert_eq!(
+            body.get("device_label"),
+            Some(&Value::String("Kramli CLI".to_string()))
+        );
+        assert!(body.get("integration").is_none());
+    }
+
+    #[test]
+    fn compares_semver_triplets() {
+        assert_eq!(
+            parse_semver_triplet("v0.1.8"),
+            Some(SemverTriplet {
+                major: 0,
+                minor: 1,
+                patch: 8,
+            })
+        );
+        assert_eq!(update_is_available("0.1.8", "v0.2.0"), Some(true));
+        assert_eq!(update_is_available("0.1.8", "0.1.8"), Some(false));
+        assert_eq!(update_is_available("0.1.8", "invalid"), None);
+    }
+
+    #[test]
+    fn invite_url_prefers_server_url_and_supports_tokens() {
+        assert_eq!(
+            invite_url_from_response(&json!({"invite_url": "https://kram.li/i/server"})),
+            Some("https://kram.li/i/server".to_string())
+        );
+        assert_eq!(
+            invite_url_from_response(&json!({"invite_token": "abc123"})),
+            Some("https://kram.li/i/abc123".to_string())
+        );
+        assert_eq!(
+            invite_url_from_response(&json!({"token": "legacy"})),
+            Some("https://kram.li/i/legacy".to_string())
+        );
+        assert_eq!(invite_url_from_response(&json!({})), None);
+    }
 }
 
 #[derive(Subcommand)]
@@ -290,6 +416,15 @@ pub enum ItemCmd {
         /// Filter by title text (case-insensitive)
         #[arg(long)]
         contains: Option<String>,
+        /// Sort by creation date (newest first)
+        #[arg(long, conflicts_with = "oldest")]
+        newest: bool,
+        /// Sort by creation date (oldest first)
+        #[arg(long, conflicts_with = "newest")]
+        oldest: bool,
+        /// Limit number of returned items after filtering/sorting
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Show item details (notes, images, comments)
     Show { id: i64 },
@@ -457,59 +592,150 @@ pub enum SecurityCmd {
 
 #[derive(Subcommand)]
 pub enum HandoffCmd {
-    /// Report that this CLI is currently viewing a list
+    /// Mark a list as currently viewed on this device
     Viewing {
         list_id: i64,
         #[arg(long)]
         list_name: Option<String>,
-        /// Optional device label for other clients
         #[arg(long)]
         device: Option<String>,
     },
-    /// Ask other devices to continue with this list
+    /// Ask another device to continue with this list
     Continue {
         list_id: i64,
         #[arg(long)]
         list_name: Option<String>,
-        /// Optional device label for other clients
         #[arg(long)]
         device: Option<String>,
     },
-    /// Clear current handoff presence state
+    /// Clear current handoff state
     Clear,
 }
 
 // ─── Dispatch ───
 
 pub async fn run(cli: Cli) -> Result<(), String> {
+    let command_label = if cli.interactive {
+        "interactive"
+    } else {
+        cli.command
+            .as_ref()
+            .map(command_trace_name)
+            .unwrap_or("missing")
+    };
+    let mode_label = if cli.interactive {
+        "interactive"
+    } else if cli.json {
+        "json"
+    } else {
+        "human"
+    };
+    let transaction = telemetry::TraceTransaction::start("cli.command", "cli.command");
+    transaction.set_tag("command", command_label);
+    transaction.set_tag("mode", mode_label);
+    transaction.set_data_i64(
+        "cli.has_command",
+        if cli.command.is_some() || cli.interactive {
+            1
+        } else {
+            0
+        },
+    );
+
+    let result = run_inner(cli).await;
+    transaction.set_tag("outcome", if result.is_ok() { "ok" } else { "error" });
+    if result.is_err() {
+        transaction.set_tag("error.category", "command_error");
+    }
+    transaction.finish(result.is_ok());
+    result
+}
+
+async fn run_inner(cli: Cli) -> Result<(), String> {
     // Honour NO_COLOR convention (https://no-color.org/)
     if std::env::var("NO_COLOR").is_ok() || cli.json {
         set_override(false);
     }
 
-    maybe_apply_profile_locale(&cli.command).await;
+    if cli.interactive {
+        if cli.json {
+            return Err(tr("cli-interactive-json-conflict"));
+        }
+        if cli.command.is_some() {
+            return Err(tr("cli-interactive-subcommand-conflict"));
+        }
+        return crate::tui::run_tui().await;
+    }
 
-    match cli.command {
+    let should_auto_update_check = cli
+        .command
+        .as_ref()
+        .is_some_and(command_supports_auto_update_check)
+        && !cli.json;
+
+    let Some(command) = cli.command else {
+        return Err(tr("cli-missing-command"));
+    };
+
+    maybe_apply_profile_locale(Some(&command)).await;
+
+    let result = run_command(command, cli.json).await;
+    if result.is_ok() && should_auto_update_check {
+        maybe_auto_update_notice().await;
+    }
+    result
+}
+
+fn command_trace_name(command: &Commands) -> &'static str {
+    match command {
+        Commands::Login { .. } => "login",
+        Commands::Logout => "logout",
+        Commands::Status => "status",
+        Commands::Lists { .. } => "lists",
+        Commands::Items { .. } => "items",
+        Commands::Folders { .. } => "folders",
+        Commands::Members { .. } => "members",
+        Commands::Keys { .. } => "keys",
+        Commands::Search { .. } => "search",
+        Commands::Activity { .. } => "activity",
+        Commands::Undo { .. } => "undo",
+        Commands::Redo { .. } => "redo",
+        Commands::Profile => "profile",
+        Commands::Security { .. } => "security",
+        Commands::AcceptTerms { .. } => "accept_terms",
+        Commands::Handoff { .. } => "handoff",
+        Commands::Ping => "ping",
+        Commands::Config => "config",
+        Commands::UpdateCheck => "update_check",
+        Commands::Mcp => "mcp",
+        Commands::Batch { .. } => "batch",
+        Commands::Completions { .. } => "completions",
+    }
+}
+
+async fn run_command(command: Commands, as_json: bool) -> Result<(), String> {
+    match command {
         Commands::Login { url } => run_login(url).await,
         Commands::Logout => run_logout(),
-        Commands::Status => run_status(cli.json).await,
-        Commands::Lists { action } => run_lists(action, cli.json).await,
-        Commands::Items { action } => run_items(action, cli.json).await,
-        Commands::Folders { action } => run_folders(action, cli.json).await,
-        Commands::Members { action } => run_members(action, cli.json).await,
-        Commands::Keys { action } => run_keys(action, cli.json).await,
-        Commands::Search { query } => run_search(&query, cli.json).await,
-        Commands::Activity { list_id, limit } => run_activity(list_id, limit, cli.json).await,
+        Commands::Status => run_status(as_json).await,
+        Commands::Lists { action } => run_lists(action, as_json).await,
+        Commands::Items { action } => run_items(action, as_json).await,
+        Commands::Folders { action } => run_folders(action, as_json).await,
+        Commands::Members { action } => run_members(action, as_json).await,
+        Commands::Keys { action } => run_keys(action, as_json).await,
+        Commands::Search { query } => run_search(&query, as_json).await,
+        Commands::Activity { list_id, limit } => run_activity(list_id, limit, as_json).await,
         Commands::Undo { list_id } => run_undo(list_id).await,
         Commands::Redo { list_id } => run_redo(list_id).await,
-        Commands::Handoff { action } => run_handoff(action, cli.json).await,
-        Commands::Profile => run_profile(cli.json).await,
-        Commands::Security { action } => run_security(action, cli.json).await,
-        Commands::AcceptTerms { docs } => run_accept_terms(docs, cli.json).await,
-        Commands::Ping => run_ping(cli.json).await,
-        Commands::Config => run_config(cli.json),
+        Commands::Profile => run_profile(as_json).await,
+        Commands::Security { action } => run_security(action, as_json).await,
+        Commands::AcceptTerms { docs } => run_accept_terms(docs, as_json).await,
+        Commands::Handoff { action } => run_handoff(action, as_json).await,
+        Commands::Ping => run_ping(as_json).await,
+        Commands::Config => run_config(as_json),
+        Commands::UpdateCheck => run_update_check(as_json).await,
         Commands::Mcp => crate::mcp::run_stdio().await,
-        Commands::Batch { file, keep_going } => run_batch(&file, keep_going, cli.json).await,
+        Commands::Batch { file, keep_going } => run_batch(&file, keep_going, as_json).await,
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "kramli", &mut std::io::stdout());
@@ -518,14 +744,23 @@ pub async fn run(cli: Cli) -> Result<(), String> {
     }
 }
 
-fn command_supports_profile_locale(command: &Commands) -> bool {
+fn command_supports_profile_locale(command: Option<&Commands>) -> bool {
     !matches!(
         command,
-        Commands::Login { .. } | Commands::Completions { .. }
+        Some(Commands::Login { .. })
+            | Some(Commands::Completions { .. })
+            | Some(Commands::UpdateCheck)
     )
 }
 
-async fn maybe_apply_profile_locale(command: &Commands) {
+fn command_supports_auto_update_check(command: &Commands) -> bool {
+    !matches!(
+        command,
+        Commands::Login { .. } | Commands::Completions { .. } | Commands::UpdateCheck
+    )
+}
+
+async fn maybe_apply_profile_locale(command: Option<&Commands>) {
     if is_explicit_lang_set() || !command_supports_profile_locale(command) {
         return;
     }
@@ -871,8 +1106,192 @@ fn env_flag_enabled(name: &str, default_value: bool) -> bool {
     }
 }
 
+fn auto_update_check_enabled() -> bool {
+    if env_flag_enabled("DO_NOT_TRACK", false) || env_flag_enabled("KRAMLI_NO_TELEMETRY", false) {
+        return false;
+    }
+    env_flag_enabled("KRAMLI_AUTO_UPDATE_CHECK", false)
+}
+
 fn auto_handoff_enabled() -> bool {
     env_flag_enabled("KRAMLI_AUTO_HANDOFF", true)
+}
+
+fn handoff_body(
+    list_id: i64,
+    list_name: Option<String>,
+    device_label: String,
+) -> serde_json::Map<String, Value> {
+    let mut body = serde_json::Map::new();
+    body.insert("list_id".into(), Value::from(list_id));
+    body.insert("device_label".into(), Value::String(device_label));
+    if let Some(name) = normalize_optional_text(list_name) {
+        body.insert("list_name".into(), Value::String(name));
+    }
+    body
+}
+
+fn unix_timestamp_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn parse_semver_triplet(raw: &str) -> Option<SemverTriplet> {
+    fn parse_segment(segment: &str) -> Option<u64> {
+        let digits: String = segment
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect();
+        if digits.is_empty() {
+            None
+        } else {
+            digits.parse::<u64>().ok()
+        }
+    }
+
+    let normalized = raw.trim().trim_start_matches(['v', 'V']);
+    let mut parts = normalized.split('.');
+    let major = parse_segment(parts.next()?)?;
+    let minor = parse_segment(parts.next()?)?;
+    let patch = parse_segment(parts.next()?)?;
+    Some(SemverTriplet {
+        major,
+        minor,
+        patch,
+    })
+}
+
+fn update_is_available(current: &str, latest: &str) -> Option<bool> {
+    let current = parse_semver_triplet(current)?;
+    let latest = parse_semver_triplet(latest)?;
+    Some(latest > current)
+}
+
+async fn fetch_latest_release() -> Result<GitHubRelease, String> {
+    let span = telemetry::TraceSpan::child("http.client", "update_check");
+    span.set_tag("operation", "update_check");
+    span.set_tag("api.method", "GET");
+    span.set_tag("api.route", "external_release");
+    let response = match reqwest::Client::new()
+        .get(UPDATE_CHECK_URL)
+        .header(
+            reqwest::header::USER_AGENT,
+            format!("kramli-cli/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            span.set_status(false);
+            span.finish();
+            return Err(tr_args(
+                "api-network-error",
+                &[("error", error.to_string())],
+            ));
+        }
+    };
+
+    span.set_tag(
+        "api.status_class",
+        telemetry::status_class(response.status().as_u16()),
+    );
+    if !response.status().is_success() {
+        span.set_status(false);
+        span.finish();
+        return Err(tr_args(
+            "cli-update-check-http",
+            &[("status", response.status().as_u16().to_string())],
+        ));
+    }
+
+    let text = match response.text().await {
+        Ok(text) => text,
+        Err(error) => {
+            span.set_status(false);
+            span.finish();
+            return Err(tr_args(
+                "api-network-error",
+                &[("error", error.to_string())],
+            ));
+        }
+    };
+    span.set_data_i64("api.response_bytes", text.len() as i64);
+    let result = serde_json::from_str::<GitHubRelease>(&text)
+        .map_err(|e| tr_args("api-network-error", &[("error", e.to_string())]));
+    span.set_status(result.is_ok());
+    span.finish();
+    result
+}
+
+fn invite_url_from_response(resp: &Value) -> Option<String> {
+    resp.get("invite_url")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            resp.get("invite_token")
+                .and_then(Value::as_str)
+                .map(|token| format!("https://kram.li/i/{token}"))
+        })
+        .or_else(|| {
+            resp.get("token")
+                .and_then(Value::as_str)
+                .map(|token| format!("https://kram.li/i/{token}"))
+        })
+}
+
+async fn maybe_auto_update_notice() {
+    if !auto_update_check_enabled() {
+        return;
+    }
+
+    let mut cfg = Config::load();
+    let now = unix_timestamp_secs();
+    if let Some(last) = cfg.update_check_last() {
+        if now.saturating_sub(last) < UPDATE_CHECK_INTERVAL_SECS {
+            return;
+        }
+    }
+
+    let release = match fetch_latest_release().await {
+        Ok(release) => release,
+        Err(_) => {
+            cfg.set_update_check_state(now, None, None);
+            let _ = cfg.save();
+            return;
+        }
+    };
+
+    cfg.set_update_check_state(
+        now,
+        Some(release.tag_name.clone()),
+        release.html_url.clone(),
+    );
+    let _ = cfg.save();
+
+    if update_is_available(env!("CARGO_PKG_VERSION"), &release.tag_name) != Some(true) {
+        return;
+    }
+
+    let url = release.html_url.unwrap_or_else(|| {
+        "https://github.com/SpotlightForBugs/kramli-cli/releases/latest".to_string()
+    });
+    eprintln!(
+        "{} {}",
+        "↑".cyan(),
+        tr_args(
+            "cli-update-auto-available",
+            &[
+                ("current", env!("CARGO_PKG_VERSION").to_string()),
+                ("latest", release.tag_name),
+                ("url", url),
+            ],
+        )
+    );
 }
 
 async fn maybe_auto_handoff(api: &ApiClient, list_id: i64, list_name: Option<&str>, as_json: bool) {
@@ -880,16 +1299,11 @@ async fn maybe_auto_handoff(api: &ApiClient, list_id: i64, list_name: Option<&st
         return;
     }
 
-    let mut body = serde_json::Map::new();
-    body.insert("list_id".into(), Value::from(list_id));
-    body.insert(
-        "device_label".into(),
-        Value::String(default_handoff_device_label(None)),
+    let body = handoff_body(
+        list_id,
+        list_name.map(str::to_string),
+        default_handoff_device_label(None),
     );
-    body.insert("integration".into(), Value::String("cli".to_string()));
-    if let Some(name) = list_name.map(str::trim).filter(|name| !name.is_empty()) {
-        body.insert("list_name".into(), Value::String(name.to_string()));
-    }
 
     let _: Result<Value, String> = api.post("/activity/viewing", &body).await;
 }
@@ -1051,6 +1465,9 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
             completed,
             state,
             contains,
+            newest,
+            oldest,
+            limit,
         } => {
             let items: Vec<ListItem> = api.get(&format!("/lists/{list_id}/items")).await?;
             let state_filter = state
@@ -1059,7 +1476,7 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
             let contains_filter = contains
                 .map(|value| value.trim().to_ascii_lowercase())
                 .filter(|value| !value.is_empty());
-            let filtered: Vec<ListItem> = items
+            let mut filtered: Vec<ListItem> = items
                 .into_iter()
                 .filter(|item| {
                     let is_done = item.is_done.unwrap_or(false);
@@ -1092,6 +1509,16 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
                     true
                 })
                 .collect();
+
+            if newest {
+                filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            } else if oldest {
+                filtered.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            }
+
+            if let Some(max) = limit {
+                filtered.truncate(max);
+            }
 
             json_or!(as_json, filtered, output::print_items(&filtered));
             maybe_auto_handoff(&api, list_id, None, as_json).await;
@@ -1472,14 +1899,8 @@ async fn run_members(cmd: MemberCmd, as_json: bool) -> Result<(), String> {
                     "{}",
                     serde_json::to_string_pretty(&resp).unwrap_or_default()
                 );
-            } else if let Some(token) = resp.get("token").and_then(|v| v.as_str()) {
-                println!(
-                    "{}",
-                    tr_args(
-                        "cli-invite-link",
-                        &[("url", format!("https://kram.li/i/{token}"))],
-                    )
-                );
+            } else if let Some(url) = invite_url_from_response(&resp) {
+                println!("{}", tr_args("cli-invite-link", &[("url", url)]),);
             } else {
                 println!(
                     "{}",
@@ -1723,16 +2144,7 @@ async fn run_handoff(cmd: HandoffCmd, as_json: bool) -> Result<(), String> {
             list_name,
             device,
         } => {
-            let mut body = serde_json::Map::new();
-            body.insert("list_id".into(), Value::from(list_id));
-            body.insert(
-                "device_label".into(),
-                Value::String(default_handoff_device_label(device)),
-            );
-            body.insert("integration".into(), Value::String("cli".to_string()));
-            if let Some(name) = normalize_optional_text(list_name) {
-                body.insert("list_name".into(), Value::String(name));
-            }
+            let body = handoff_body(list_id, list_name, default_handoff_device_label(device));
             let resp: Value = api.post("/activity/viewing", &body).await?;
             json_or!(
                 as_json,
@@ -1745,16 +2157,7 @@ async fn run_handoff(cmd: HandoffCmd, as_json: bool) -> Result<(), String> {
             list_name,
             device,
         } => {
-            let mut body = serde_json::Map::new();
-            body.insert("list_id".into(), Value::from(list_id));
-            body.insert(
-                "device_label".into(),
-                Value::String(default_handoff_device_label(device)),
-            );
-            body.insert("integration".into(), Value::String("cli".to_string()));
-            if let Some(name) = normalize_optional_text(list_name) {
-                body.insert("list_name".into(), Value::String(name));
-            }
+            let body = handoff_body(list_id, list_name, default_handoff_device_label(device));
             let resp: Value = api.post("/activity/continue-on-device", &body).await?;
             json_or!(
                 as_json,
@@ -1777,7 +2180,7 @@ async fn run_handoff(cmd: HandoffCmd, as_json: bool) -> Result<(), String> {
 
 async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), String> {
     if as_json {
-        return Err(tr("cli-batch-json-not-supported"));
+        return run_batch_json(file, keep_going).await;
     }
 
     let source = if file == "-" {
@@ -1873,7 +2276,7 @@ async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), St
             }
         };
 
-        if matches!(nested_cli.command, Commands::Batch { .. }) {
+        if matches!(nested_cli.command, Some(Commands::Batch { .. })) {
             let err = tr_args(
                 "cli-batch-nested-not-supported",
                 &[("source", source.clone()), ("line", line_no.to_string())],
@@ -1930,6 +2333,168 @@ async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), St
     );
 
     Err(first_error.unwrap_or_else(|| tr("cli-batch-failed")))
+}
+
+async fn run_batch_json(file: &str, keep_going: bool) -> Result<(), String> {
+    let source = if file == "-" {
+        "stdin".to_string()
+    } else {
+        file.to_string()
+    };
+
+    let content = if file == "-" {
+        use tokio::io::AsyncReadExt;
+        let mut buffer = String::new();
+        tokio::io::stdin()
+            .read_to_string(&mut buffer)
+            .await
+            .map_err(|e| tr_args("cli-batch-read-stdin-error", &[("error", e.to_string())]))?;
+        buffer
+    } else {
+        fs::read_to_string(file).map_err(|e| {
+            tr_args(
+                "cli-batch-read-file-error",
+                &[("file", file.to_string()), ("error", e.to_string())],
+            )
+        })?
+    };
+
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut results = Vec::new();
+    let mut executed = 0usize;
+    let mut failed = 0usize;
+    let mut first_error: Option<String> = None;
+
+    for (idx, raw_line) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        executed += 1;
+
+        let args = match batch_child_args(line) {
+            Ok(args) => args,
+            Err(error) => {
+                let err = tr_args(
+                    "cli-batch-parse-error",
+                    &[
+                        ("source", source.clone()),
+                        ("line", line_no.to_string()),
+                        ("error", error),
+                    ],
+                );
+                failed += 1;
+                if first_error.is_none() {
+                    first_error = Some(err.clone());
+                }
+                results.push(json!({
+                    "line": line_no,
+                    "command": line,
+                    "ok": false,
+                    "exit_code": null,
+                    "error": err,
+                }));
+                if !keep_going {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        let output = TokioCommand::new(&exe)
+            .arg("--json")
+            .args(&args)
+            .output()
+            .await;
+
+        match output {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let ok = output.status.success();
+                if !ok {
+                    failed += 1;
+                }
+                let mut result = json!({
+                    "line": line_no,
+                    "command": line,
+                    "ok": ok,
+                    "exit_code": output.status.code(),
+                    "stdout": stdout,
+                    "stderr": stderr,
+                });
+                if let Ok(parsed) = serde_json::from_str::<Value>(stdout.trim()) {
+                    result["json"] = parsed;
+                }
+                if !ok && first_error.is_none() {
+                    first_error = Some(format!("line {line_no}: command failed"));
+                }
+                results.push(result);
+                if !ok && !keep_going {
+                    break;
+                }
+            }
+            Err(error) => {
+                failed += 1;
+                let err = format!("line {line_no}: {error}");
+                if first_error.is_none() {
+                    first_error = Some(err.clone());
+                }
+                results.push(json!({
+                    "line": line_no,
+                    "command": line,
+                    "ok": false,
+                    "exit_code": null,
+                    "error": err,
+                }));
+                if !keep_going {
+                    break;
+                }
+            }
+        }
+    }
+
+    let succeeded = executed.saturating_sub(failed);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": failed == 0,
+            "source": source,
+            "executed": executed,
+            "succeeded": succeeded,
+            "failed": failed,
+            "results": results,
+        }))
+        .unwrap_or_default()
+    );
+
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(first_error.unwrap_or_else(|| tr("cli-batch-failed")))
+    }
+}
+
+fn batch_child_args(line: &str) -> Result<Vec<String>, String> {
+    let mut args = shell_words::split(line).map_err(|e| e.to_string())?;
+    if args.first().is_some_and(|arg| arg == "kramli") {
+        args.remove(0);
+    }
+    args.retain(|arg| arg != "--json");
+    if args.is_empty() {
+        return Err(tr("cli-batch-failed"));
+    }
+
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push("kramli".to_string());
+    argv.extend(args.iter().cloned());
+    let nested_cli = Cli::try_parse_from(&argv).map_err(|e| e.to_string())?;
+    if matches!(nested_cli.command, Some(Commands::Batch { .. })) {
+        return Err(tr("cli-batch-nested-not-supported"));
+    }
+    Ok(args)
 }
 
 async fn run_security(cmd: SecurityCmd, as_json: bool) -> Result<(), String> {
@@ -2117,6 +2682,76 @@ async fn run_accept_terms(docs: Option<Vec<String>>, as_json: bool) -> Result<()
     Ok(())
 }
 
+async fn run_update_check(as_json: bool) -> Result<(), String> {
+    let release = fetch_latest_release().await?;
+    let now = unix_timestamp_secs();
+
+    let mut cfg = Config::load();
+    cfg.set_update_check_state(
+        now,
+        Some(release.tag_name.clone()),
+        release.html_url.clone(),
+    );
+    let _ = cfg.save();
+
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let latest_version = release.tag_name.clone();
+    let update_available = update_is_available(&current_version, &latest_version);
+
+    if as_json {
+        let out = json!({
+            "current_version": current_version,
+            "latest_version": latest_version,
+            "update_available": update_available,
+            "url": release.html_url,
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        return Ok(());
+    }
+
+    match update_available {
+        Some(true) => {
+            println!(
+                "{} {}",
+                "↑".cyan(),
+                tr_args(
+                    "cli-update-available",
+                    &[
+                        ("current", current_version),
+                        ("latest", latest_version.clone()),
+                    ],
+                )
+            );
+            if let Some(url) = release.html_url {
+                println!("  {}", tr_args("cli-update-open-url", &[("url", url)]));
+            }
+            println!("  {}", tr("cli-update-auto-hint"));
+        }
+        Some(false) => {
+            println!(
+                "{} {}",
+                "✓".green(),
+                tr_args(
+                    "cli-update-up-to-date",
+                    &[("current", current_version), ("latest", latest_version)],
+                )
+            );
+        }
+        None => {
+            println!(
+                "{} {}",
+                "!".yellow(),
+                tr_args(
+                    "cli-update-version-unknown",
+                    &[("current", current_version), ("latest", latest_version),],
+                )
+            );
+        }
+    }
+
+    Ok(())
+}
+
 async fn run_ping(as_json: bool) -> Result<(), String> {
     let cfg = Config::load();
     let url = format!("{}/api/ping", cfg.base_url().trim_end_matches('/'));
@@ -2156,12 +2791,21 @@ async fn run_ping(as_json: bool) -> Result<(), String> {
 
 fn run_config(as_json: bool) -> Result<(), String> {
     let cfg = Config::load();
+    let telemetry_enabled = telemetry::is_enabled();
+    let bootstrap_icons_enabled = cfg.bootstrap_icons_enabled();
+    let auto_update_enabled = auto_update_check_enabled();
     if as_json {
         let out = json!({
             "config_path": Config::path().display().to_string(),
             "server": cfg.base_url(),
             "api_key_stored": cfg.has_api_key(),
             "api_key_source": if cfg.api_key_from_env() { "env" } else { "keychain" },
+            "telemetry_enabled": telemetry_enabled,
+            "bootstrap_icons_enabled": bootstrap_icons_enabled,
+            "auto_update_check": auto_update_enabled,
+            "last_update_check": cfg.update_check_last(),
+            "last_update_version": cfg.update_check_latest(),
+            "last_update_url": cfg.update_check_url(),
         });
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
         return Ok(());
@@ -2187,5 +2831,37 @@ fn run_config(as_json: bool) -> Result<(), String> {
         },
         src
     );
+    println!(
+        "{} {}",
+        tr("label-telemetry"),
+        if telemetry_enabled {
+            tr("label-enabled").green().to_string()
+        } else {
+            tr("label-disabled").yellow().to_string()
+        }
+    );
+    println!(
+        "{} {}",
+        tr("label-bootstrap-icons"),
+        if bootstrap_icons_enabled {
+            tr("label-enabled").green().to_string()
+        } else {
+            tr("label-disabled").yellow().to_string()
+        }
+    );
+    println!(
+        "{} {}",
+        tr("label-update-check"),
+        if auto_update_enabled {
+            tr("label-on").green().to_string()
+        } else {
+            tr("label-off").yellow().to_string()
+        }
+    );
+    let last_check = cfg
+        .update_check_last()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| tr("label-never"));
+    println!("{}    {}", tr("label-last-check"), last_check);
     Ok(())
 }

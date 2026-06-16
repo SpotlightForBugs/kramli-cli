@@ -1,6 +1,6 @@
 [package]
 name = "kramli"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 description = "CLI client for the Kramli shopping & todo list app"
 license = "MIT"
@@ -28,6 +28,11 @@ dirs = "6"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 colored = "3"
 dialoguer = "0.11"
+crossterm = "0.29"
+image = "0.25"
+ratatui = "0.30"
+ratatui-image = { version = "11.0.2", default-features = false, features = ["tokio", "crossterm"] }
+resvg = { version = "0.47", default-features = false }
 sentry = { version = "0.46", default-features = false, features = ["backtrace", "contexts", "debug-images", "panic", "release-health", "reqwest", "rustls"] }
 shell-words = "1"
 fluent-templates = "0.13"
