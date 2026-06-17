@@ -1,4 +1,6 @@
 use colored::Colorize;
+use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 
 use crate::i18n::{tr, tr_args};
 use crate::models::{
@@ -37,44 +39,84 @@ fn parse_hex_color(input: &str) -> Option<(u8, u8, u8)> {
     Some((r, g, b))
 }
 
+fn bootstrap_icon_asset_name(raw_icon: &str) -> Option<String> {
+    let raw_icon = raw_icon.trim();
+    if raw_icon.is_empty() || raw_icon.contains("..") {
+        return None;
+    }
+
+    for (index, _) in raw_icon.match_indices("bi-") {
+        let candidate: String = raw_icon[index + 3..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+            .collect();
+        if let Some(icon) = normalize_bootstrap_icon_name(&candidate.replace('_', "-")) {
+            return Some(icon);
+        }
+    }
+
+    let candidate = raw_icon
+        .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`' || ch == '[' || ch == ']')
+        .trim_end_matches(".svg")
+        .rsplit(['/', '#', '?'])
+        .next()
+        .unwrap_or(raw_icon)
+        .trim()
+        .trim_start_matches("bootstrap-icons:")
+        .trim_start_matches("bootstrap-icon:")
+        .trim_start_matches("bi:")
+        .trim_start_matches("bi_");
+    let candidate = candidate
+        .strip_prefix("bi-")
+        .unwrap_or(candidate)
+        .replace('_', "-")
+        .to_ascii_lowercase();
+
+    normalize_bootstrap_icon_name(&candidate)
+}
+
+fn normalize_bootstrap_icon_name(candidate: &str) -> Option<String> {
+    let icon = candidate.trim();
+    (!icon.is_empty()
+        && icon.len() <= 80
+        && icon
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'))
+    .then(|| icon.to_string())
+}
+
 fn map_bootstrap_icon_emoji(icon: &str, fallback: &str) -> String {
     match icon {
-        "bi-cart-fill" => "🛒".to_string(),
-        "bi-egg-fried" => "🍳".to_string(),
-        "bi-people-fill" => "👥".to_string(),
-        "bi-tag" => "🏷️".to_string(),
-        "bi-tools" => "🛠️".to_string(),
-        "bi-paperclip" => "📎".to_string(),
-        "bi-book-fill" => "📚".to_string(),
-        "bi-check-circle-fill" => "✅".to_string(),
-        "bi-fire" => "🔥".to_string(),
-        "bi-cup-hot" => "☕".to_string(),
-        "bi-folder2" => "📁".to_string(),
+        "cart-fill" => "🛒".to_string(),
+        "egg-fried" => "🍳".to_string(),
+        "people-fill" => "👥".to_string(),
+        "tag" => "🏷️".to_string(),
+        "tools" => "🛠️".to_string(),
+        "paperclip" => "📎".to_string(),
+        "book-fill" => "📚".to_string(),
+        "check-circle-fill" => "✅".to_string(),
+        "fire" => "🔥".to_string(),
+        "cup-hot" => "☕".to_string(),
+        "folder2" | "folder2-open" => "📁".to_string(),
         _ => fallback.to_string(),
     }
 }
 
 fn map_bootstrap_icon_label(icon: &str, fallback_name: &str) -> String {
     let label = match icon {
-        "bi-cart-fill" => "cart",
-        "bi-egg-fried" => "food",
-        "bi-people-fill" => "team",
-        "bi-tag" => "tag",
-        "bi-tools" => "tools",
-        "bi-paperclip" => "clip",
-        "bi-book-fill" => "book",
-        "bi-check-circle-fill" => "done",
-        "bi-fire" => "fire",
-        "bi-cup-hot" => "coffee",
-        "bi-folder2" => "folder",
-        _ => {
-            let stripped = icon.strip_prefix("bi-").unwrap_or(icon);
-            if stripped.is_empty() {
-                fallback_name
-            } else {
-                stripped
-            }
-        }
+        "cart-fill" => "cart",
+        "egg-fried" => "food",
+        "people-fill" => "team",
+        "tag" => "tag",
+        "tools" => "tools",
+        "paperclip" => "clip",
+        "book-fill" => "book",
+        "check-circle-fill" => "done",
+        "fire" => "fire",
+        "cup-hot" => "coffee",
+        "folder2" | "folder2-open" => "folder",
+        _ if !icon.is_empty() => icon,
+        _ => fallback_name,
     };
     format!("[{label}]")
 }
@@ -95,13 +137,13 @@ fn display_icon(raw: Option<&str>, fallback_name: &str) -> String {
         return fallback_icon(style, fallback_name);
     };
 
-    if icon.starts_with("bi-") {
+    if let Some(asset) = bootstrap_icon_asset_name(icon) {
         return match style {
             IconStyle::Emoji => {
-                map_bootstrap_icon_emoji(icon, &fallback_icon(style, fallback_name))
+                map_bootstrap_icon_emoji(&asset, &fallback_icon(style, fallback_name))
             }
-            IconStyle::Raw => icon.to_string(),
-            IconStyle::Label => map_bootstrap_icon_label(icon, fallback_name),
+            IconStyle::Raw => format!("bi-{asset}"),
+            IconStyle::Label => map_bootstrap_icon_label(&asset, fallback_name),
         };
     }
 
@@ -117,6 +159,180 @@ fn color_dot(raw: Option<&str>) -> String {
         Some((r, g, b)) => format!(" {}", "●".truecolor(r, g, b)),
         None => String::new(),
     }
+}
+
+fn char_display_width(ch: char) -> usize {
+    match ch {
+        '\t' => 4,
+        _ if ch.is_control() => 0,
+        _ => 1,
+    }
+}
+
+fn visible_width_ansi(input: &str) -> usize {
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    let mut width = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'[' {
+                i += 1;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    i += 1;
+                    if (0x40..=0x7e).contains(&b) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        let Some(ch) = input[i..].chars().next() else {
+            break;
+        };
+        i += ch.len_utf8();
+        width += char_display_width(ch);
+    }
+
+    width
+}
+
+fn wrap_ansi_with_prefix(
+    content: &str,
+    first_prefix: &str,
+    next_prefix: &str,
+    width: usize,
+) -> String {
+    let next_prefix_width = visible_width_ansi(next_prefix);
+    if width <= next_prefix_width + 4 {
+        return format!("{first_prefix}{content}");
+    }
+
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    let mut col = visible_width_ansi(first_prefix);
+    let mut line = first_prefix.to_string();
+    let mut lines = Vec::new();
+
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            let start = i;
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'[' {
+                i += 1;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    i += 1;
+                    if (0x40..=0x7e).contains(&b) {
+                        break;
+                    }
+                }
+            }
+            line.push_str(&content[start..i]);
+            continue;
+        }
+
+        let Some(ch) = content[i..].chars().next() else {
+            break;
+        };
+        i += ch.len_utf8();
+
+        if ch == '\n' {
+            lines.push(line);
+            line = next_prefix.to_string();
+            col = next_prefix_width;
+            continue;
+        }
+
+        let ch_width = char_display_width(ch);
+        if col + ch_width > width && col > next_prefix_width {
+            lines.push(line);
+            line = next_prefix.to_string();
+            col = next_prefix_width;
+            if ch == ' ' {
+                continue;
+            }
+        }
+
+        line.push(ch);
+        col += ch_width;
+    }
+
+    lines.push(line);
+    lines.join("\n")
+}
+
+fn print_wrapped_item_line(first_prefix: &str, next_prefix: &str, content: &str) {
+    if !std::io::stdout().is_terminal() {
+        println!("{first_prefix}{content}");
+        return;
+    }
+
+    let width = crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(120);
+    println!(
+        "{}",
+        wrap_ansi_with_prefix(content, first_prefix, next_prefix, width)
+    );
+}
+
+fn list_display_name_with_folder(list: &ShoppingList) -> String {
+    let name = list.name.trim();
+    let folder = list
+        .folder_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (folder, name.is_empty()) {
+        (Some(folder_name), false) => format!("{folder_name} / {name}"),
+        (Some(folder_name), true) => folder_name.to_string(),
+        (None, false) => list.name.clone(),
+        (None, true) => tr("common-unknown"),
+    }
+}
+
+fn list_folder_parts(list: &ShoppingList) -> Vec<String> {
+    if let Some(folder_name) = list
+        .folder_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return folder_name
+            .split('/')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+
+    list.folder_id
+        .map(|id| vec![format!("#{}", id)])
+        .unwrap_or_default()
+}
+
+fn folder_path_parts(folder: &Folder) -> Vec<String> {
+    let mut parts = folder
+        .parent_folder_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .split('/')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    parts.push(folder.name.clone());
+    parts
 }
 
 fn colorize_text(raw: Option<&str>, text: &str) -> String {
@@ -182,7 +398,37 @@ pub fn print_lists(lists: &[ShoppingList]) {
         println!("{}", tr("output-no-lists").dimmed());
         return;
     }
+    let mut lists: Vec<&ShoppingList> = lists.iter().collect();
+    lists.sort_by(|a, b| {
+        list_folder_parts(a)
+            .join("/")
+            .to_ascii_lowercase()
+            .cmp(&list_folder_parts(b).join("/").to_ascii_lowercase())
+            .then_with(|| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+            })
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let folder_icon = display_icon(Some("bi-folder2"), "folder")
+        .dimmed()
+        .to_string();
+    let mut current_folder: Vec<String> = Vec::new();
     for l in lists {
+        let folder = list_folder_parts(l);
+        let common = current_folder
+            .iter()
+            .zip(folder.iter())
+            .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+            .count();
+        for (depth, part) in folder.iter().enumerate().skip(common) {
+            let indent = "  ".repeat(depth);
+            println!("  {indent}{folder_icon} {}", part.bold());
+        }
+        current_folder = folder;
+
         let icon = colorize_text(l.color.as_deref(), &display_icon(l.icon.as_deref(), "list"));
         let name = colorize_bold_text(l.color.as_deref(), &l.name);
         let done = l.done_count.unwrap_or(0);
@@ -194,8 +440,9 @@ pub fn print_lists(lists: &[ShoppingList]) {
             format!(" ({})", role_label(role).dimmed())
         };
         let color_badge = color_dot(l.color.as_deref());
+        let indent = "  ".repeat(current_folder.len());
         println!(
-            "  {icon} {:<36} {done:>3}/{total:<3}  #{}{role_badge}{color_badge}",
+            "  {indent}{icon} {:<36} {done:>3}/{total:<3}  #{}{role_badge}{color_badge}",
             name, l.id,
         );
     }
@@ -409,13 +656,21 @@ pub fn print_items(items: &[ListItem]) {
         println!("{}", tr("output-no-items").dimmed());
         return;
     }
+    let parent_by_id: HashMap<i64, Option<i64>> = items
+        .iter()
+        .map(|item| (item.id, item.parent_item_id))
+        .collect();
     for i in items {
         let check = if i.is_done.unwrap_or(false) {
             "✓".green().to_string()
         } else {
             "○".dimmed().to_string()
         };
-        let indent = "  ".repeat(i.depth.unwrap_or(0) as usize);
+        let depth = i
+            .depth
+            .filter(|depth| *depth > 0)
+            .unwrap_or_else(|| computed_item_depth(i, &parent_by_id));
+        let indent = "  ".repeat(depth as usize);
         let pri = match i.priority.as_deref() {
             Some("high") => " !!!".red().to_string(),
             Some("medium") => " !!".yellow().to_string(),
@@ -450,9 +705,97 @@ pub fn print_items(items: &[ListItem]) {
         } else {
             colorize_text(i.color.as_deref(), &i.text)
         };
-        println!(
-            "  {indent}{check} {text}{pri}{qty}{sub}{progress}{due}{tags_str}  (#{id})",
+        let first_prefix = format!("  {indent}");
+        let next_prefix = format!("  {indent}  ");
+        let content = format!(
+            "{check} {text}{pri}{qty}{sub}{progress}{due}{tags_str}  (#{id})",
             id = i.id,
+        );
+        print_wrapped_item_line(&first_prefix, &next_prefix, &content);
+    }
+}
+
+fn computed_item_depth(item: &ListItem, parent_by_id: &HashMap<i64, Option<i64>>) -> i64 {
+    let mut depth = 0;
+    let mut parent = item.parent_item_id;
+    let mut seen = HashSet::new();
+    while let Some(parent_id) = parent {
+        if !seen.insert(parent_id) {
+            break;
+        }
+        let Some(next_parent) = parent_by_id.get(&parent_id) else {
+            break;
+        };
+        depth += 1;
+        parent = *next_parent;
+    }
+    depth
+}
+
+pub fn print_items_for_list(list: Option<&ShoppingList>, items: &[ListItem]) {
+    if let Some(list) = list {
+        println!(
+            "{}: {}",
+            tr("label-items"),
+            list_display_name_with_folder(list)
+        );
+    }
+    print_items(items);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{list_display_name_with_folder, map_bootstrap_icon_label, wrap_ansi_with_prefix};
+    use crate::models::ShoppingList;
+
+    #[test]
+    fn keeps_hanging_indent_after_wrap() {
+        let out = wrap_ansi_with_prefix("o abcdefghijklmnop", "  ", "    ", 10);
+        assert_eq!(out, "  o abcdef\n    ghijkl\n    mnop");
+    }
+
+    #[test]
+    fn keeps_hanging_indent_after_embedded_newline() {
+        let out = wrap_ansi_with_prefix("o first\nsecond", "  ", "    ", 80);
+        assert_eq!(out, "  o first\n    second");
+    }
+
+    #[test]
+    fn does_not_count_ansi_escape_sequences() {
+        let red = "\u{1b}[31mRED\u{1b}[0m";
+        let out = wrap_ansi_with_prefix(&format!("o {red} tail"), "  ", "    ", 9);
+        assert!(out.contains("\u{1b}[31mRED\u{1b}[0m"));
+        assert_eq!(out, format!("  o {red} t\n    ail"));
+    }
+
+    #[test]
+    fn unknown_bootstrap_icons_use_fallback_label() {
+        assert_eq!(map_bootstrap_icon_label("badge-3d", "list"), "[badge-3d]");
+    }
+
+    #[test]
+    fn list_display_name_joins_folder_and_name() {
+        let list = ShoppingList {
+            id: 42,
+            name: "Roadmap".to_string(),
+            icon: None,
+            color: None,
+            folder_id: Some(9),
+            folder_name: Some("Work/Backend".to_string()),
+            archived: Some(false),
+            archive_mode: None,
+            view_mode: None,
+            role: None,
+            item_count: None,
+            done_count: None,
+            state_config: None,
+            states: None,
+            created_at: None,
+        };
+
+        assert_eq!(
+            list_display_name_with_folder(&list),
+            "Work/Backend / Roadmap"
         );
     }
 }
@@ -464,6 +807,15 @@ pub fn print_folders(folders: &[Folder]) {
         println!("{}", tr("output-no-folders").dimmed());
         return;
     }
+    let mut folders: Vec<&Folder> = folders.iter().collect();
+    folders.sort_by(|a, b| {
+        folder_path_parts(a)
+            .join("/")
+            .to_ascii_lowercase()
+            .cmp(&folder_path_parts(b).join("/").to_ascii_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
     for f in folders {
         let icon = colorize_text(
             f.color.as_deref(),
@@ -471,7 +823,8 @@ pub fn print_folders(folders: &[Folder]) {
         );
         let name = colorize_bold_text(f.color.as_deref(), &f.name);
         let color_badge = color_dot(f.color.as_deref());
-        println!("  {icon} {:<36} #{}{color_badge}", name, f.id);
+        let indent = "  ".repeat(folder_path_parts(f).len().saturating_sub(1));
+        println!("  {indent}{icon} {:<36} #{}{color_badge}", name, f.id);
     }
 }
 

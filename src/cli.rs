@@ -29,7 +29,7 @@ pub struct Cli {
     pub json: bool,
 
     /// Start a full-screen terminal UI
-    #[arg(short = 'i', long, global = true)]
+    #[arg(short = 'i', long)]
     pub interactive: bool,
 
     #[command(subcommand)]
@@ -84,15 +84,22 @@ pub enum Commands {
     /// Show activity feed for a list
     Activity {
         /// List ID
+        #[arg(value_parser = resolve_list_reference)]
         list_id: i64,
         /// Number of entries
         #[arg(short, long, default_value = "20")]
         limit: u32,
     },
     /// Undo the last action on a list
-    Undo { list_id: i64 },
+    Undo {
+        #[arg(value_parser = resolve_list_reference)]
+        list_id: i64,
+    },
     /// Redo the last undone action on a list
-    Redo { list_id: i64 },
+    Redo {
+        #[arg(value_parser = resolve_list_reference)]
+        list_id: i64,
+    },
     /// Show profile
     Profile,
     /// Account security level and login confirmation
@@ -119,6 +126,11 @@ pub enum Commands {
     /// Check whether a newer kramli CLI release is available
     #[command(name = "update-check", alias = "update")]
     UpdateCheck,
+    /// Manage local privacy preferences
+    Privacy {
+        #[command(subcommand)]
+        action: PrivacyCmd,
+    },
     /// Run a local stdio MCP server using the CLI login
     Mcp,
     /// Run multiple CLI commands from a file or stdin
@@ -164,7 +176,10 @@ pub enum ListCmd {
     /// Resolve a list reference (ID, /lists/l/<slug>, or full URL)
     Resolve { reference: String },
     /// Show list details
-    Show { id: i64 },
+    Show {
+        #[arg(value_parser = resolve_list_reference)]
+        id: i64,
+    },
     /// Create a list
     Create {
         name: String,
@@ -181,6 +196,7 @@ pub enum ListCmd {
     },
     /// Update a list
     Update {
+        #[arg(value_parser = resolve_list_reference)]
         id: i64,
         #[arg(short, long)]
         name: Option<String>,
@@ -195,9 +211,13 @@ pub enum ListCmd {
     },
     /// Delete a list
     #[command(alias = "rm")]
-    Delete { id: i64 },
+    Delete {
+        #[arg(value_parser = resolve_list_reference)]
+        id: i64,
+    },
     /// Move a list to a folder
     Move {
+        #[arg(value_parser = resolve_list_reference)]
         id: i64,
         /// Folder ID (omit to remove the list from a folder)
         folder_id: Option<i64>,
@@ -295,6 +315,44 @@ mod tests {
     }
 
     #[test]
+    fn parses_items_list_with_private_url_reference() {
+        let slug = encode_list_slug(46);
+        let cli = Cli::try_parse_from([
+            "kramli",
+            "items",
+            "list",
+            &format!("https://kramli.de/lists/l/{slug}#item-5968"),
+        ])
+        .expect("items list with URL reference should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Items {
+                action: ItemCmd::List { list_id: 46, .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_lists_show_with_private_url_reference() {
+        let slug = encode_list_slug(46);
+        let cli = Cli::try_parse_from([
+            "kramli",
+            "lists",
+            "show",
+            &format!("https://kramli.de/lists/l/{slug}#item-5968"),
+        ])
+        .expect("lists show with URL reference should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Lists {
+                action: ListCmd::Show { id: 46 }
+            })
+        ));
+    }
+
+    #[test]
     fn rejects_empty_list_references() {
         assert!(resolve_list_reference("  ").is_err());
     }
@@ -332,6 +390,11 @@ mod tests {
     }
 
     #[test]
+    fn rejects_interactive_flag_after_subcommand() {
+        assert!(Cli::try_parse_from(["kramli", "status", "--interactive"]).is_err());
+    }
+
+    #[test]
     fn parses_update_check_command() {
         let cli = Cli::try_parse_from(["kramli", "update-check"])
             .expect("update-check parse should work");
@@ -346,6 +409,18 @@ mod tests {
             cli.command,
             Some(Commands::Handoff {
                 action: HandoffCmd::Clear
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_privacy_reset_command() {
+        let cli = Cli::try_parse_from(["kramli", "privacy", "reset"])
+            .expect("privacy reset parse should work");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Privacy {
+                action: PrivacyCmd::Reset
             })
         ));
     }
@@ -403,6 +478,7 @@ pub enum ItemCmd {
     /// List all items in a list
     #[command(alias = "ls")]
     List {
+        #[arg(value_parser = resolve_list_reference)]
         list_id: i64,
         /// Show only open (not done) items
         #[arg(long, conflicts_with = "completed")]
@@ -430,6 +506,7 @@ pub enum ItemCmd {
     Show { id: i64 },
     /// Add a new item
     Add {
+        #[arg(value_parser = resolve_list_reference)]
         list_id: i64,
         text: String,
         #[arg(short, long)]
@@ -490,15 +567,24 @@ pub enum ItemCmd {
     Delete { id: i64 },
     /// Show only completed items
     #[command(name = "done-list")]
-    DoneList { list_id: i64 },
+    DoneList {
+        #[arg(value_parser = resolve_list_reference)]
+        list_id: i64,
+    },
     /// Add a comment to an item
     Comment { id: i64, text: String },
     /// Mark all items as done
     #[command(name = "check-all")]
-    CheckAll { list_id: i64 },
+    CheckAll {
+        #[arg(value_parser = resolve_list_reference)]
+        list_id: i64,
+    },
     /// Delete all completed items
     #[command(name = "clear-done")]
-    ClearDone { list_id: i64 },
+    ClearDone {
+        #[arg(value_parser = resolve_list_reference)]
+        list_id: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -511,6 +597,9 @@ pub enum FolderCmd {
         icon: Option<String>,
         #[arg(short, long)]
         color: Option<String>,
+        /// Parent folder ID for nested folders
+        #[arg(short, long)]
+        parent: Option<i64>,
     },
     Update {
         id: i64,
@@ -520,6 +609,9 @@ pub enum FolderCmd {
         icon: Option<String>,
         #[arg(short, long)]
         color: Option<String>,
+        /// Parent folder ID (omit to leave unchanged)
+        #[arg(short, long)]
+        parent: Option<i64>,
     },
     #[command(alias = "rm")]
     Delete { id: i64 },
@@ -529,19 +621,23 @@ pub enum FolderCmd {
 pub enum MemberCmd {
     #[command(alias = "ls")]
     List {
+        #[arg(value_parser = resolve_list_reference)]
         list_id: i64,
     },
     Invite {
+        #[arg(value_parser = resolve_list_reference)]
         list_id: i64,
         email: String,
         #[arg(short, long, default_value = "editor")]
         role: String,
     },
     Remove {
+        #[arg(value_parser = resolve_list_reference)]
         list_id: i64,
         user_id: i64,
     },
     Role {
+        #[arg(value_parser = resolve_list_reference)]
         list_id: i64,
         user_id: i64,
         role: String,
@@ -549,13 +645,16 @@ pub enum MemberCmd {
     /// Create a reusable invite link
     #[command(name = "invite-link")]
     InviteLink {
+        #[arg(value_parser = resolve_list_reference)]
         list_id: i64,
     },
     /// Revoke public share link
     Unshare {
+        #[arg(value_parser = resolve_list_reference)]
         list_id: i64,
     },
     Leave {
+        #[arg(value_parser = resolve_list_reference)]
         list_id: i64,
     },
 }
@@ -591,9 +690,16 @@ pub enum SecurityCmd {
 }
 
 #[derive(Subcommand)]
+pub enum PrivacyCmd {
+    /// Reset telemetry and Bootstrap icon preferences so Kramli asks again
+    Reset,
+}
+
+#[derive(Subcommand)]
 pub enum HandoffCmd {
     /// Mark a list as currently viewed on this device
     Viewing {
+        #[arg(value_parser = resolve_list_reference)]
         list_id: i64,
         #[arg(long)]
         list_name: Option<String>,
@@ -602,6 +708,7 @@ pub enum HandoffCmd {
     },
     /// Ask another device to continue with this list
     Continue {
+        #[arg(value_parser = resolve_list_reference)]
         list_id: i64,
         #[arg(long)]
         list_name: Option<String>,
@@ -647,7 +754,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
     if result.is_err() {
         transaction.set_tag("error.category", "command_error");
     }
-    transaction.finish(result.is_ok());
+    transaction.finish(result.is_ok() || !telemetry::should_capture_command_error(""));
     result
 }
 
@@ -674,7 +781,10 @@ async fn run_inner(cli: Cli) -> Result<(), String> {
         && !cli.json;
 
     let Some(command) = cli.command else {
-        return Err(tr("cli-missing-command"));
+        let mut cmd = Cli::command();
+        cmd.print_help().map_err(|error| error.to_string())?;
+        println!();
+        return Ok(());
     };
 
     maybe_apply_profile_locale(Some(&command)).await;
@@ -707,6 +817,7 @@ fn command_trace_name(command: &Commands) -> &'static str {
         Commands::Ping => "ping",
         Commands::Config => "config",
         Commands::UpdateCheck => "update_check",
+        Commands::Privacy { .. } => "privacy",
         Commands::Mcp => "mcp",
         Commands::Batch { .. } => "batch",
         Commands::Completions { .. } => "completions",
@@ -734,6 +845,7 @@ async fn run_command(command: Commands, as_json: bool) -> Result<(), String> {
         Commands::Ping => run_ping(as_json).await,
         Commands::Config => run_config(as_json),
         Commands::UpdateCheck => run_update_check(as_json).await,
+        Commands::Privacy { action } => run_privacy(action, as_json),
         Commands::Mcp => crate::mcp::run_stdio().await,
         Commands::Batch { file, keep_going } => run_batch(&file, keep_going, as_json).await,
         Commands::Completions { shell } => {
@@ -750,13 +862,17 @@ fn command_supports_profile_locale(command: Option<&Commands>) -> bool {
         Some(Commands::Login { .. })
             | Some(Commands::Completions { .. })
             | Some(Commands::UpdateCheck)
+            | Some(Commands::Privacy { .. })
     )
 }
 
 fn command_supports_auto_update_check(command: &Commands) -> bool {
     !matches!(
         command,
-        Commands::Login { .. } | Commands::Completions { .. } | Commands::UpdateCheck
+        Commands::Login { .. }
+            | Commands::Completions { .. }
+            | Commands::UpdateCheck
+            | Commands::Privacy { .. }
     )
 }
 
@@ -1469,6 +1585,13 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
             oldest,
             limit,
         } => {
+            let list = if as_json {
+                None
+            } else {
+                api.get::<ShoppingList>(&format!("/lists/{list_id}"))
+                    .await
+                    .ok()
+            };
             let items: Vec<ListItem> = api.get(&format!("/lists/{list_id}/items")).await?;
             let state_filter = state
                 .map(|value| value.trim().to_ascii_lowercase())
@@ -1520,8 +1643,18 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
                 filtered.truncate(max);
             }
 
-            json_or!(as_json, filtered, output::print_items(&filtered));
-            maybe_auto_handoff(&api, list_id, None, as_json).await;
+            json_or!(
+                as_json,
+                filtered,
+                output::print_items_for_list(list.as_ref(), &filtered)
+            );
+            maybe_auto_handoff(
+                &api,
+                list_id,
+                list.as_ref().map(|l| l.name.as_str()),
+                as_json,
+            )
+            .await;
         }
         ItemCmd::Show { id } => {
             // Fetch item from its list (the items endpoint returns full data)
@@ -1725,6 +1858,13 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
             }
         }
         ItemCmd::DoneList { list_id } => {
+            let list = if as_json {
+                None
+            } else {
+                api.get::<ShoppingList>(&format!("/lists/{list_id}"))
+                    .await
+                    .ok()
+            };
             let items: Vec<ListItem> = api.get(&format!("/lists/{list_id}/items")).await?;
             let done: Vec<ListItem> = items
                 .into_iter()
@@ -1738,9 +1878,15 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
             } else if done.is_empty() {
                 println!("{}", tr("cli-no-completed-items").dimmed());
             } else {
-                output::print_items(&done);
+                output::print_items_for_list(list.as_ref(), &done);
             }
-            maybe_auto_handoff(&api, list_id, None, as_json).await;
+            maybe_auto_handoff(
+                &api,
+                list_id,
+                list.as_ref().map(|l| l.name.as_str()),
+                as_json,
+            )
+            .await;
         }
         ItemCmd::Comment { id, text } => {
             let resp: Value = api
@@ -1799,8 +1945,18 @@ async fn run_folders(cmd: FolderCmd, as_json: bool) -> Result<(), String> {
             let f: Vec<Folder> = api.get("/folders").await?;
             json_or!(as_json, f, output::print_folders(&f));
         }
-        FolderCmd::Create { name, icon, color } => {
-            let body = CreateFolder { name, icon, color };
+        FolderCmd::Create {
+            name,
+            icon,
+            color,
+            parent,
+        } => {
+            let body = CreateFolder {
+                name,
+                icon,
+                color,
+                parent_folder_id: parent,
+            };
             let f: Folder = api.post("/folders", &body).await?;
             if as_json {
                 println!("{}", serde_json::to_string_pretty(&f).unwrap_or_default());
@@ -1817,6 +1973,7 @@ async fn run_folders(cmd: FolderCmd, as_json: bool) -> Result<(), String> {
             name,
             icon,
             color,
+            parent,
         } => {
             let mut body = serde_json::Map::new();
             if let Some(n) = name {
@@ -1827,6 +1984,9 @@ async fn run_folders(cmd: FolderCmd, as_json: bool) -> Result<(), String> {
             }
             if let Some(c) = color {
                 body.insert("color".into(), Value::String(c));
+            }
+            if let Some(parent_id) = parent {
+                body.insert("parent_folder_id".into(), Value::from(parent_id));
             }
             if body.is_empty() {
                 return Err(tr("cli-no-changes"));
@@ -2864,4 +3024,26 @@ fn run_config(as_json: bool) -> Result<(), String> {
         .unwrap_or_else(|| tr("label-never"));
     println!("{}    {}", tr("label-last-check"), last_check);
     Ok(())
+}
+
+fn run_privacy(cmd: PrivacyCmd, as_json: bool) -> Result<(), String> {
+    match cmd {
+        PrivacyCmd::Reset => {
+            let mut cfg = Config::load();
+            cfg.reset_privacy_preferences();
+            cfg.save()?;
+            let out = json!({
+                "ok": true,
+                "config_path": Config::path().display().to_string(),
+                "reset": ["telemetry_enabled", "bootstrap_icons_enabled"],
+            });
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            } else {
+                println!("{} Privacy preferences reset.", "✓".green());
+                println!("  {}", Config::path().display());
+            }
+            Ok(())
+        }
+    }
 }

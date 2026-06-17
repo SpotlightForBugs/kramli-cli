@@ -121,6 +121,11 @@ impl Config {
         self.file.bootstrap_icons_enabled = Some(enabled);
     }
 
+    pub fn reset_privacy_preferences(&mut self) {
+        self.file.telemetry_enabled = None;
+        self.file.bootstrap_icons_enabled = None;
+    }
+
     pub fn update_check_last(&self) -> Option<i64> {
         self.file.update_check_last
     }

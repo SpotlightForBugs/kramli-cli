@@ -39,7 +39,7 @@ fn main() -> ExitCode {
     };
 
     if let Err(e) = runtime.block_on(cli::run(cli)) {
-        if guard.is_some() {
+        if guard.is_some() && telemetry::should_capture_command_error(&e) {
             sentry::capture_message(&telemetry::scrub_message(&e), sentry::Level::Error);
         }
         eprintln!("\x1b[31m{}\x1b[0m {e}", tr("main-error-prefix"));
@@ -122,7 +122,10 @@ fn should_prompt_first_run_preferences(cli: &Cli) -> bool {
         Some(command)
             if !matches!(
                 command,
-                Commands::Batch { .. } | Commands::Completions { .. } | Commands::Mcp
+                Commands::Batch { .. }
+                    | Commands::Completions { .. }
+                    | Commands::Mcp
+                    | Commands::Privacy { .. }
             )
     )
 }

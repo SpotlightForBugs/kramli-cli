@@ -119,6 +119,10 @@ pub struct Folder {
     pub name: String,
     pub icon: Option<String>,
     pub color: Option<String>,
+    #[serde(default, alias = "parent_id", alias = "parentFolderId")]
+    pub parent_folder_id: Option<i64>,
+    #[serde(default, alias = "parent_name", alias = "parentFolderName")]
+    pub parent_folder_name: Option<String>,
     pub position: Option<i64>,
     pub created_at: Option<String>,
 }
@@ -130,6 +134,8 @@ pub struct CreateFolder {
     pub icon: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_folder_id: Option<i64>,
 }
 
 // ── Member ──

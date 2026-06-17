@@ -43,6 +43,25 @@ pub fn traces_sample_rate() -> f32 {
         .unwrap_or(1.0)
 }
 
+/// Ordinary CLI failures are usually expected user/API outcomes (not logged in,
+/// not found, validation, network errors). Keep Sentry issues focused on
+/// crashes by requiring an explicit opt-in before capturing command `Err`s as
+/// error events. Panic/default integrations still report real crashes.
+pub fn should_capture_command_error(_message: &str) -> bool {
+    std::env::var("KRAMLI_CAPTURE_COMMAND_ERRORS")
+        .ok()
+        .and_then(|raw| parse_bool(&raw))
+        .unwrap_or(false)
+}
+
+fn parse_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 /// Remove credentials and response payloads from a free-text error/message
 /// before it is sent to telemetry.
 ///

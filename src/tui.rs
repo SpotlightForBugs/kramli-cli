@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::io;
+use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,7 +13,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use image::{load_from_memory, DynamicImage};
+use image::{load_from_memory, DynamicImage, ImageDecoder, ImageReader};
 use ratatui::backend::CrosstermBackend;
 use ratatui::prelude::*;
 use ratatui::widgets::{
@@ -46,7 +46,6 @@ const DRAG_TARGET_COLOR: Color = Color::Yellow;
 const BOOTSTRAP_ICON_BASE_URL: &str = "https://icons.getbootstrap.com/assets/icons";
 const DEFAULT_LIST_ICON: &str = "tag";
 const ARCHIVED_LIST_ICON: &str = "archive";
-const FOLDER_LIST_ICON: &str = "folder2-open";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ViewMode {
@@ -573,6 +572,13 @@ struct CalendarLayout {
     agenda_lines: Vec<Line<'static>>,
     date_hits: Vec<CalendarDateHit>,
     item_hits: Vec<CalendarItemHit>,
+}
+
+#[derive(Debug)]
+struct ListPanelRow {
+    list_index: Option<usize>,
+    depth: usize,
+    label: String,
 }
 
 const ITEM_EDITOR_FIELDS: [EditorField; 7] = [
@@ -1122,6 +1128,12 @@ impl App {
             .unwrap_or_else(|| tr("common-unknown"))
     }
 
+    fn selected_list_display_name(&self) -> String {
+        self.selected_list()
+            .map(list_display_name_for_tui)
+            .unwrap_or_else(|| tr("common-unknown"))
+    }
+
     fn selected_item(&self) -> Option<&ListItem> {
         self.items.get(self.selected_item)
     }
@@ -1326,7 +1338,7 @@ impl App {
             self.apply_item_selection(previous_item_id);
             self.status = Some(format!(
                 "{} | {} {}",
-                self.selected_list_name(),
+                self.selected_list_display_name(),
                 self.items.len(),
                 tr("label-items")
             ));
@@ -1345,7 +1357,7 @@ impl App {
         }
         self.status = Some(tr_args(
             "tui-items-loading",
-            &[("list", self.selected_list_name())],
+            &[("list", self.selected_list_display_name())],
         ));
         let api = self.api.clone();
         self.spawn_load(async move {
@@ -1370,7 +1382,8 @@ impl App {
 
     fn apply_items_result(&mut self, list_id: i64, result: Result<Vec<ListItem>, String>) {
         if self.selected_list_id() != Some(list_id) {
-            if let Ok(items) = result {
+            if let Ok(mut items) = result {
+                apply_item_depths(&mut items);
                 self.items_cache.insert(list_id, items);
             }
             return;
@@ -1378,14 +1391,15 @@ impl App {
 
         self.loading_items_for = None;
         match result {
-            Ok(items) => {
+            Ok(mut items) => {
                 let previous_item_id = self.selected_item().map(|item| item.id);
+                apply_item_depths(&mut items);
                 self.items = items;
                 self.items_cache.insert(list_id, self.items.clone());
                 self.apply_item_selection(previous_item_id);
                 self.status = Some(format!(
                     "{} | {} {}",
-                    self.selected_list_name(),
+                    self.selected_list_display_name(),
                     self.items.len(),
                     tr("label-items")
                 ));
@@ -1459,10 +1473,12 @@ impl App {
     fn clamp_scrolls(&mut self) {
         self.selected_list = self.selected_list.min(self.lists.len().saturating_sub(1));
         self.selected_item = self.selected_item.min(self.items.len().saturating_sub(1));
+        let rows = list_panel_rows(&self.lists);
+        let selected_row = selected_list_panel_row(&rows, self.selected_list);
         self.list_scroll = self
             .list_scroll
-            .min(self.selected_list.saturating_sub(0))
-            .min(self.lists.len().saturating_sub(1));
+            .min(selected_row)
+            .min(rows.len().saturating_sub(1));
         self.item_scroll = self
             .item_scroll
             .min(self.selected_item.saturating_sub(0))
@@ -1480,7 +1496,9 @@ impl App {
                     return;
                 }
                 self.selected_list = shifted_index(self.selected_list, delta, self.lists.len());
-                self.list_scroll = scroll_to_visible(self.list_scroll, self.selected_list, 8);
+                let rows = list_panel_rows(&self.lists);
+                let selected_row = selected_list_panel_row(&rows, self.selected_list);
+                self.list_scroll = scroll_to_visible(self.list_scroll, selected_row, 8);
                 self.load_items_for_selected_list(false);
             }
             FocusPane::Items => {
@@ -1518,7 +1536,7 @@ impl App {
             self.detail_image_note = Some("—".to_string());
             return;
         };
-        let Ok(image) = load_from_memory(&bytes) else {
+        let Ok(image) = load_oriented_image(&bytes) else {
             self.detail_image = None;
             self.detail_image_note = Some("—".to_string());
             return;
@@ -1538,7 +1556,7 @@ impl App {
             self.profile_image = None;
             return;
         };
-        let Ok(image) = load_from_memory(&bytes) else {
+        let Ok(image) = load_oriented_image(&bytes) else {
             self.profile_image = None;
             return;
         };
@@ -1895,29 +1913,50 @@ impl App {
             return Ok(());
         }
 
+        let due_date = editor.due_date.trim().to_string();
+        if !valid_due_date_input(&due_date) {
+            self.status = Some(format!(
+                "{}: YYYY-MM-DD",
+                tr("label-due").trim_end_matches(':')
+            ));
+            return Ok(());
+        }
+
+        let current_progress = editor
+            .item_id
+            .and_then(|item_id| self.items.iter().find(|item| item.id == item_id))
+            .and_then(|item| item.progress.as_deref())
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        let progress_raw = editor.progress.trim();
+        let Some(progress) = self.normalize_progress_input(progress_raw).or_else(|| {
+            (editor.mode == EditorMode::Edit
+                && !progress_raw.is_empty()
+                && current_progress.eq_ignore_ascii_case(progress_raw))
+            .then(|| current_progress.clone())
+        }) else {
+            self.status = Some(format!(
+                "{}: {}",
+                tr("label-state").trim_end_matches(':'),
+                self.progress_choices().join(" | ")
+            ));
+            return Ok(());
+        };
+
         let mut body = Map::new();
         body.insert("text".to_string(), Value::String(text));
         body.insert(
             "quantity".to_string(),
             Value::String(editor.quantity.trim().to_string()),
         );
-        body.insert(
-            "due_date".to_string(),
-            Value::String(editor.due_date.trim().to_string()),
-        );
+        body.insert("due_date".to_string(), Value::String(due_date));
         body.insert(
             "priority".to_string(),
             Value::String(editor.priority.trim().to_string()),
         );
         body.insert("tags".to_string(), tags_value(&editor.tags));
-        let progress = editor.progress.trim().to_string();
-        if editor.mode == EditorMode::Create
-            || editor
-                .item_id
-                .and_then(|item_id| self.items.iter().find(|item| item.id == item_id))
-                .map(|item| item.progress.as_deref().map(str::trim).unwrap_or_default() != progress)
-                .unwrap_or(true)
-        {
+        if editor.mode == EditorMode::Create || current_progress != progress {
             body.insert("progress".to_string(), Value::String(progress));
         }
         body.insert(
@@ -2421,14 +2460,63 @@ impl App {
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
-                if let Some(editor) = self.editor.as_mut() {
-                    active_editor_value_mut(editor).push(ch);
-                }
+                self.push_editor_char(ch);
             }
             _ => {}
         }
 
         Ok(())
+    }
+
+    fn push_editor_char(&mut self, ch: char) {
+        let Some((field, candidate)) = self.editor.as_ref().map(|editor| {
+            let mut candidate = match editor.active_field {
+                EditorField::Text => editor.text.clone(),
+                EditorField::Quantity => editor.quantity.clone(),
+                EditorField::DueDate => editor.due_date.clone(),
+                EditorField::Priority => editor.priority.clone(),
+                EditorField::Tags => editor.tags.clone(),
+                EditorField::Progress => editor.progress.clone(),
+                EditorField::Notes => editor.notes.clone(),
+            };
+            candidate.push(ch);
+            (editor.active_field, candidate)
+        }) else {
+            return;
+        };
+
+        let allowed = match field {
+            EditorField::DueDate => due_date_input_prefix_allowed(&candidate),
+            EditorField::Progress => {
+                let candidate = candidate.trim();
+                candidate.is_empty()
+                    || self.progress_choices().iter().any(|choice| {
+                        choice
+                            .trim()
+                            .to_ascii_lowercase()
+                            .starts_with(&candidate.to_ascii_lowercase())
+                    })
+            }
+            _ => true,
+        };
+
+        if allowed {
+            if let Some(editor) = self.editor.as_mut() {
+                active_editor_value_mut(editor).push(ch);
+            }
+        } else {
+            self.status = Some(match field {
+                EditorField::DueDate => {
+                    format!("{}: YYYY-MM-DD", tr("label-due").trim_end_matches(':'))
+                }
+                EditorField::Progress => format!(
+                    "{}: {}",
+                    tr("label-state").trim_end_matches(':'),
+                    self.progress_choices().join(" | ")
+                ),
+                _ => "Invalid input".to_string(),
+            });
+        }
     }
 
     async fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> Result<(), String> {
@@ -2510,9 +2598,10 @@ impl App {
         let list_rows_area = item_rows_area(list_panel_rows_area(layout.lists));
         if left_down && rect_contains(list_rows_area, mouse.column, mouse.row) {
             self.focus = FocusPane::Lists;
+            let panel_rows = list_panel_rows(&self.lists);
             let row = self.list_scroll + mouse.row.saturating_sub(list_rows_area.y) as usize;
-            if row < self.lists.len() {
-                self.selected_list = row;
+            if let Some(list_index) = panel_rows.get(row).and_then(|row| row.list_index) {
+                self.selected_list = list_index;
                 self.calendar_selected_date = None;
                 self.calendar_visible_month = None;
                 self.reload_items();
@@ -2556,9 +2645,15 @@ impl App {
                 let list_items_area = item_rows_area(list_rect);
                 if left_down && rect_contains(list_items_area, mouse.column, mouse.row) {
                     let visible = self.visible_item_indices();
-                    let row =
-                        self.item_scroll + mouse.row.saturating_sub(list_items_area.y) as usize;
-                    if let Some(clicked) = visible.get(row).copied() {
+                    let row = mouse.row.saturating_sub(list_items_area.y) as usize;
+                    let row_width = list_rect.width.saturating_sub(2) as usize;
+                    if let Some(clicked) = visible_item_at_wrapped_row(
+                        &self.items,
+                        &visible,
+                        self.item_scroll,
+                        row,
+                        row_width,
+                    ) {
                         self.selected_item = clicked;
                         if self.register_item_click(clicked) {
                             self.open_editor()?;
@@ -2926,23 +3021,16 @@ impl App {
     }
 
     fn progress_suggestions(&self) -> Vec<String> {
+        self.progress_choices()
+    }
+
+    fn progress_choices(&self) -> Vec<String> {
         let mut out = Vec::new();
 
         for column in self.kanban_columns() {
             let name = column.name.trim();
             if !name.is_empty() {
                 push_unique_case_insensitive(&mut out, name);
-            }
-        }
-
-        for item in &self.items {
-            if let Some(progress) = item
-                .progress
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                push_unique_case_insensitive(&mut out, progress);
             }
         }
 
@@ -2953,6 +3041,17 @@ impl App {
         }
 
         out
+    }
+
+    fn normalize_progress_input(&self, raw: &str) -> Option<String> {
+        let value = raw.trim();
+        if value.is_empty() {
+            return Some(String::new());
+        }
+
+        self.progress_choices()
+            .into_iter()
+            .find(|choice| choice.trim().eq_ignore_ascii_case(value))
     }
 
     fn tag_suggestions(&self) -> Vec<String> {
@@ -3212,7 +3311,11 @@ impl App {
         let mut agenda_lines = Vec::new();
         let mut date_hits = Vec::new();
         let mut item_hits = Vec::new();
-        let title = format!("{}: {}", tr("view-calendar"), self.selected_list_name());
+        let title = format!(
+            "{}: {}",
+            tr("view-calendar"),
+            self.selected_list_display_name()
+        );
 
         if inner.height == 0 || inner.width == 0 {
             return CalendarLayout {
@@ -3489,6 +3592,35 @@ fn parse_iso_date(raw: &str) -> Option<SimpleDate> {
     Some(SimpleDate { year, month, day })
 }
 
+fn valid_due_date_input(raw: &str) -> bool {
+    let value = raw.trim();
+    if value.is_empty() {
+        return true;
+    }
+    if parse_iso_date(value).is_none() {
+        return false;
+    }
+    if value.len() == 10 {
+        return true;
+    }
+    if parse_due_time(value).is_none() {
+        return false;
+    }
+    value
+        .get(16..)
+        .unwrap_or_default()
+        .chars()
+        .all(|ch| ch.is_ascii_digit() || matches!(ch, ':' | 'Z' | 'z' | '+' | '-'))
+}
+
+fn due_date_input_prefix_allowed(raw: &str) -> bool {
+    let value = raw.trim();
+    value.len() <= 25
+        && value.chars().all(|ch| {
+            ch.is_ascii_digit() || matches!(ch, '-' | 'T' | 't' | ':' | 'Z' | 'z' | '+' | ' ')
+        })
+}
+
 fn due_date_time_suffix(raw: &str) -> Option<&str> {
     if raw.len() <= 10 {
         return None;
@@ -3674,6 +3806,59 @@ fn fit_cell(value: &str, width: usize) -> String {
         text.push_str(&" ".repeat(width - len));
     }
     text
+}
+
+fn wrap_plain_row(first_prefix: &str, next_prefix: &str, value: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![format!("{first_prefix}{value}")];
+    }
+
+    let next_width = next_prefix.chars().count();
+    if width <= next_width.saturating_add(4) {
+        return vec![format!("{first_prefix}{value}")];
+    }
+
+    let mut lines = Vec::new();
+    let mut line = first_prefix.to_string();
+    let mut col = first_prefix.chars().count();
+    for ch in value.chars() {
+        let ch_width = 1;
+        if col + ch_width > width && col > next_width {
+            lines.push(line);
+            line = next_prefix.to_string();
+            col = next_width;
+            if ch == ' ' {
+                continue;
+            }
+        }
+        line.push(ch);
+        col += ch_width;
+    }
+    lines.push(line);
+    lines
+}
+
+fn wrapped_item_row_height(item: &ListItem, width: usize) -> usize {
+    wrap_plain_row("  ", "  ", &item_row_text(item), width).len()
+}
+
+fn visible_item_at_wrapped_row(
+    items: &[ListItem],
+    visible: &[usize],
+    start: usize,
+    target_row: usize,
+    width: usize,
+) -> Option<usize> {
+    let mut row = 0;
+    for item_index in visible.iter().copied().skip(start) {
+        let item = items.get(item_index)?;
+        let height = wrapped_item_row_height(item, width);
+        if target_row < row + height {
+            return Some(item_index);
+        }
+        row += height;
+    }
+    None
 }
 
 fn calendar_hit_item(indexes: &[usize], selected_item: usize) -> Option<usize> {
@@ -4268,7 +4453,7 @@ fn draw_lists_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| tr("common-unknown"));
         let list_count = app.lists.len();
-        let selected = app.selected_list_name();
+        let selected = app.selected_list_display_name();
         let info = vec![
             Line::from(profile_text),
             Line::from(format!("{} {}", tr("label-lists"), list_count)),
@@ -4312,23 +4497,59 @@ fn draw_lists_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         );
     }
 
+    let panel_rows = list_panel_rows(&app.lists);
+    let selected_row = selected_list_panel_row(&panel_rows, app.selected_list);
     let visible_rows = list_area.height.saturating_sub(2) as usize;
-    app.list_scroll = scroll_to_visible(app.list_scroll, app.selected_list, visible_rows);
-    let start = app.list_scroll.min(app.lists.len());
-    let end = start.saturating_add(visible_rows).min(app.lists.len());
+    app.list_scroll = scroll_to_visible(app.list_scroll, selected_row, visible_rows);
+    let start = app.list_scroll.min(panel_rows.len());
+    let end = start.saturating_add(visible_rows).min(panel_rows.len());
 
     let mut icon_targets: Vec<(String, Rect)> = Vec::new();
     let mut list_items: Vec<TuiListItem> = Vec::new();
-    for idx in start..end {
+    for (row_idx, panel_row) in panel_rows.iter().enumerate().take(end).skip(start) {
+        if panel_row.list_index.is_none() {
+            let indent = "  ".repeat(panel_row.depth);
+            let folder_asset = "folder2";
+            let use_image_icon = list_icon_image_enabled(
+                app.bootstrap_icons_enabled,
+                app.inline_images_enabled,
+                app.picker.protocol_type(),
+                Some(folder_asset),
+            );
+            let folder_icon = if use_image_icon {
+                app.ensure_list_icon_background(folder_asset);
+                icon_targets.push((
+                    folder_asset.to_string(),
+                    Rect::new(
+                        list_area
+                            .x
+                            .saturating_add(3)
+                            .saturating_add((panel_row.depth * 2) as u16),
+                        list_area.y.saturating_add(1 + (row_idx - start) as u16),
+                        2,
+                        1,
+                    ),
+                ));
+                "  ".to_string()
+            } else {
+                bootstrap_icon_for_tui("bi-folder2", tui_icon_style())
+            };
+            list_items.push(TuiListItem::new(format!(
+                "  {indent}{folder_icon} {}",
+                panel_row.label
+            )));
+            continue;
+        }
+
+        let idx = panel_row.list_index.unwrap_or(0);
         let list = &app.lists[idx];
         let list_id = list.id;
         let raw_icon = list.icon.clone();
-        let name = list.name.clone();
+        let name = panel_row.label.clone();
         let total = list.item_count.unwrap_or(0);
         let done = list.done_count.unwrap_or(0);
         let is_archived = list.archived.unwrap_or(false);
-        let is_foldered = list_has_folder(list);
-        let row = list_area.y.saturating_add(1 + (idx - start) as u16);
+        let row = list_area.y.saturating_add(1 + (row_idx - start) as u16);
 
         let icon_asset = list_icon_asset_name(raw_icon.as_deref());
         let use_image_icon = list_icon_image_enabled(
@@ -4342,7 +4563,15 @@ fn draw_lists_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 app.ensure_list_icon_background(asset);
                 icon_targets.push((
                     asset.to_string(),
-                    Rect::new(list_area.x.saturating_add(3), row, 2, 1),
+                    Rect::new(
+                        list_area
+                            .x
+                            .saturating_add(3)
+                            .saturating_add((panel_row.depth * 2) as u16),
+                        row,
+                        2,
+                        1,
+                    ),
                 ));
             }
         }
@@ -4352,23 +4581,13 @@ fn draw_lists_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else {
             list_icon_for_tui(raw_icon.as_deref())
         };
+        let indent = "  ".repeat(panel_row.depth);
         let trailing_base_x = list_area
             .x
             .saturating_add(7)
+            .saturating_add(indent.chars().count() as u16)
             .saturating_add(name.chars().count() as u16);
         let mut trailing_cells = 0;
-        let folder_marker = if is_foldered {
-            trailing_list_icon_marker(
-                app,
-                &mut icon_targets,
-                FOLDER_LIST_ICON,
-                row,
-                trailing_base_x,
-                &mut trailing_cells,
-            )
-        } else {
-            String::new()
-        };
         let archive_marker = if is_archived {
             trailing_list_icon_marker(
                 app,
@@ -4384,14 +4603,14 @@ fn draw_lists_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let open = (total - done).max(0);
         let marker = if idx == app.selected_list { ">" } else { " " };
         list_items.push(TuiListItem::new(format!(
-            "{marker} {icon} {name}{folder_marker}{archive_marker} #{} ({open}/{total})",
+            "{marker} {indent}{icon} {name}{archive_marker} #{} ({open}/{total})",
             list_id
         )));
     }
 
     let mut state = ListState::default();
     if !list_items.is_empty() {
-        state.select(Some(app.selected_list.saturating_sub(start)));
+        state.select(Some(selected_row.saturating_sub(start)));
     }
 
     let border_style = if app.focus == FocusPane::Lists {
@@ -4468,6 +4687,7 @@ fn draw_list_mode(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .saturating_add(visible_rows)
         .min(visible_indices.len());
 
+    let row_width = list_rect.width.saturating_sub(2) as usize;
     let mut rows: Vec<TuiListItem> = visible_indices
         .iter()
         .skip(start)
@@ -4475,11 +4695,15 @@ fn draw_list_mode(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .map(|item_idx| {
             let item = &app.items[*item_idx];
             let marker = if *item_idx == app.selected_item {
-                ">"
+                "> "
             } else {
-                " "
+                "  "
             };
-            TuiListItem::new(format!("{marker} {}", item_row_text(item)))
+            let lines = wrap_plain_row(marker, "  ", &item_row_text(item), row_width)
+                .into_iter()
+                .map(Line::from)
+                .collect::<Vec<_>>();
+            TuiListItem::new(Text::from(lines))
         })
         .collect();
 
@@ -4505,7 +4729,7 @@ fn draw_list_mode(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .title(format!(
                     "{}: {}",
                     tr("label-items"),
-                    app.selected_list_name()
+                    app.selected_list_display_name()
                 ))
                 .border_style(border_style),
         )
@@ -4843,7 +5067,10 @@ fn draw_calendar_mode(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn item_placeholder(app: &App) -> String {
     if app.loading_items_for == app.selected_list_id() {
-        tr_args("tui-items-loading", &[("list", app.selected_list_name())])
+        tr_args(
+            "tui-items-loading",
+            &[("list", app.selected_list_display_name())],
+        )
     } else {
         tr("output-no-items")
     }
@@ -5892,6 +6119,10 @@ fn kanban_column_at(chunks: &[Rect], x: u16, y: u16) -> Option<usize> {
 
 fn item_row_text(item: &ListItem) -> String {
     let mut out = String::new();
+    let depth = item.depth.unwrap_or(0).max(0) as usize;
+    if depth > 0 {
+        out.push_str(&"  ".repeat(depth));
+    }
     out.push_str(if item.is_done.unwrap_or(false) {
         "[x] "
     } else {
@@ -5934,6 +6165,35 @@ fn item_row_text(item: &ListItem) -> String {
     }
 
     out
+}
+
+fn apply_item_depths(items: &mut [ListItem]) {
+    let parent_by_id: HashMap<i64, Option<i64>> = items
+        .iter()
+        .map(|item| (item.id, item.parent_item_id))
+        .collect();
+
+    for item in items {
+        if item.depth.unwrap_or(0) > 0 {
+            continue;
+        }
+        let mut depth = 0;
+        let mut parent = item.parent_item_id;
+        let mut seen = HashSet::new();
+        while let Some(parent_id) = parent {
+            if !seen.insert(parent_id) {
+                break;
+            }
+            let Some(next_parent) = parent_by_id.get(&parent_id) else {
+                break;
+            };
+            depth += 1;
+            parent = *next_parent;
+        }
+        if depth > 0 {
+            item.depth = Some(depth);
+        }
+    }
 }
 
 fn kanban_card_text(item: &ListItem) -> String {
@@ -6197,6 +6457,7 @@ fn list_folder_sort_key(list: &ShoppingList) -> (u8, String) {
     (1, String::new())
 }
 
+#[cfg(test)]
 fn list_has_folder(list: &ShoppingList) -> bool {
     list.folder_id.is_some()
         || list
@@ -6204,6 +6465,77 @@ fn list_has_folder(list: &ShoppingList) -> bool {
             .as_deref()
             .map(str::trim)
             .is_some_and(|value| !value.is_empty())
+}
+
+fn list_folder_parts_for_tui(list: &ShoppingList) -> Vec<String> {
+    if let Some(folder_name) = list
+        .folder_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return folder_name
+            .split('/')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+
+    list.folder_id
+        .map(|id| vec![format!("#{}", id)])
+        .unwrap_or_default()
+}
+
+fn list_panel_rows(lists: &[ShoppingList]) -> Vec<ListPanelRow> {
+    let mut rows = Vec::new();
+    let mut current_folder: Vec<String> = Vec::new();
+
+    for (list_index, list) in lists.iter().enumerate() {
+        let folder = list_folder_parts_for_tui(list);
+        let common = current_folder
+            .iter()
+            .zip(folder.iter())
+            .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+            .count();
+        for (depth, part) in folder.iter().enumerate().skip(common) {
+            rows.push(ListPanelRow {
+                list_index: None,
+                depth,
+                label: part.clone(),
+            });
+        }
+        current_folder = folder;
+        rows.push(ListPanelRow {
+            list_index: Some(list_index),
+            depth: current_folder.len(),
+            label: list.name.clone(),
+        });
+    }
+
+    rows
+}
+
+fn selected_list_panel_row(rows: &[ListPanelRow], selected_list: usize) -> usize {
+    rows.iter()
+        .position(|row| row.list_index == Some(selected_list))
+        .unwrap_or(0)
+}
+
+fn list_display_name_for_tui(list: &ShoppingList) -> String {
+    let name = list.name.trim();
+    let folder = list
+        .folder_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (folder, name.is_empty()) {
+        (Some(folder_name), false) => format!("{folder_name} / {name}"),
+        (Some(folder_name), true) => folder_name.to_string(),
+        (None, false) => list.name.clone(),
+        (None, true) => tr("common-unknown"),
+    }
 }
 
 fn trailing_list_icon_marker(
@@ -6384,6 +6716,12 @@ async fn fetch_bootstrap_icon_image(icon: &str) -> Result<DynamicImage, String> 
     let Some(icon) = bootstrap_icon_asset_name(Some(icon)) else {
         return Err("invalid bootstrap icon".to_string());
     };
+    if let Some(bytes) = read_cached_bootstrap_icon(&icon).await {
+        if let Ok(image) = render_bootstrap_svg_icon(&bytes) {
+            return Ok(image);
+        }
+    }
+
     let url = format!("{BOOTSTRAP_ICON_BASE_URL}/{icon}.svg");
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(6))
@@ -6400,11 +6738,49 @@ async fn fetch_bootstrap_icon_image(icon: &str) -> Result<DynamicImage, String> 
         ));
     }
     let bytes = response.bytes().await.map_err(|error| error.to_string())?;
+    write_cached_bootstrap_icon(&icon, &bytes).await;
     render_bootstrap_svg_icon(&bytes)
+}
+
+fn bootstrap_icon_cache_path(icon: &str) -> Option<PathBuf> {
+    let icon = normalize_bootstrap_icon_name(icon)?;
+    dirs::cache_dir().map(|dir| {
+        dir.join("kramli")
+            .join("bootstrap-icons")
+            .join(format!("{icon}.svg"))
+    })
+}
+
+async fn read_cached_bootstrap_icon(icon: &str) -> Option<Vec<u8>> {
+    let path = bootstrap_icon_cache_path(icon)?;
+    tokio::fs::read(path).await.ok()
+}
+
+async fn write_cached_bootstrap_icon(icon: &str, bytes: &[u8]) {
+    let Some(path) = bootstrap_icon_cache_path(icon) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if tokio::fs::create_dir_all(parent).await.is_err() {
+            return;
+        }
+    }
+    let _ = tokio::fs::write(path, bytes).await;
 }
 
 fn render_bootstrap_svg_icon(svg: &[u8]) -> Result<DynamicImage, String> {
     render_bootstrap_svg_icon_with_color(svg, &icon_svg_color())
+}
+
+fn load_oriented_image(bytes: &[u8]) -> image::ImageResult<DynamicImage> {
+    let reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+    let mut decoder = reader.into_decoder()?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut image = DynamicImage::from_decoder(decoder)?;
+    image.apply_orientation(orientation);
+    Ok(image)
 }
 
 fn render_bootstrap_svg_icon_with_color(svg: &[u8], color: &str) -> Result<DynamicImage, String> {
@@ -6848,15 +7224,16 @@ mod tests {
     }
 
     #[test]
-    fn foldered_lists_keep_list_icon_slot_and_use_trailing_folder_icon() {
+    fn foldered_lists_keep_list_icon_slot_and_render_folder_rows() {
         let folder_id_only = test_shopping_list(1, "Groceries", None, Some(83), None, false);
         assert!(list_has_folder(&folder_id_only));
         assert_eq!(list_icon_asset_name(None), Some("tag".to_string()));
         assert_eq!(list_icon_for_tui(None), "[tag]");
-        assert_eq!(
-            bootstrap_icon_for_tui(&format!("bi-{FOLDER_LIST_ICON}"), TuiIconStyle::Label),
-            "[folder2-open]"
-        );
+        let rows = list_panel_rows(&[folder_id_only]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].list_index, None);
+        assert_eq!(rows[0].label, "#83");
+        assert_eq!(rows[1].list_index, Some(0));
 
         let named_folder = test_shopping_list(
             2,
@@ -6870,6 +7247,83 @@ mod tests {
         assert_eq!(
             list_icon_asset_name(named_folder.icon.as_deref()),
             Some("cart-fill".to_string())
+        );
+    }
+
+    #[test]
+    fn list_panel_rows_expand_nested_folder_paths() {
+        let lists = vec![
+            test_shopping_list(1, "Roadmap", None, Some(10), Some("Work/Backend"), false),
+            test_shopping_list(2, "Groceries", None, None, None, false),
+        ];
+        let rows = list_panel_rows(&lists);
+
+        assert_eq!(rows[0].label, "Work");
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(rows[1].label, "Backend");
+        assert_eq!(rows[1].depth, 1);
+        assert_eq!(rows[2].list_index, Some(0));
+        assert_eq!(rows[2].depth, 2);
+        assert_eq!(rows[3].list_index, Some(1));
+        assert_eq!(selected_list_panel_row(&rows, 1), 3);
+    }
+
+    #[test]
+    fn list_display_name_for_tui_includes_folder_path() {
+        let nested = test_shopping_list(7, "Roadmap", None, Some(11), Some("Work/Backend"), false);
+        assert_eq!(list_display_name_for_tui(&nested), "Work/Backend / Roadmap");
+
+        let plain = test_shopping_list(8, "Groceries", None, None, None, false);
+        assert_eq!(list_display_name_for_tui(&plain), "Groceries");
+    }
+
+    #[test]
+    fn item_row_text_keeps_subitem_indent() {
+        let mut item = sample_item(42, "Child task");
+        item.depth = Some(2);
+
+        assert_eq!(item_row_text(&item), "    [ ] Child task");
+    }
+
+    #[test]
+    fn item_depths_are_derived_from_parent_ids() {
+        let mut items = vec![sample_item(1, "Parent"), sample_item(2, "Child")];
+        items[1].parent_item_id = Some(1);
+
+        apply_item_depths(&mut items);
+
+        assert_eq!(items[0].depth, None);
+        assert_eq!(items[1].depth, Some(1));
+    }
+
+    #[test]
+    fn wrap_plain_row_keeps_hanging_indent() {
+        assert_eq!(
+            wrap_plain_row("> ", "  ", "[ ] abcdefgh", 8),
+            vec!["> [ ] ab".to_string(), "  cdefgh".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrapped_item_hit_test_accounts_for_visual_height() {
+        let items = vec![sample_item(1, "abcdefghijkl"), sample_item(2, "short")];
+        let visible = vec![0, 1];
+
+        assert_eq!(
+            visible_item_at_wrapped_row(&items, &visible, 0, 0, 8),
+            Some(0)
+        );
+        assert_eq!(
+            visible_item_at_wrapped_row(&items, &visible, 0, 1, 8),
+            Some(0)
+        );
+        assert_eq!(
+            visible_item_at_wrapped_row(&items, &visible, 0, 2, 8),
+            Some(0)
+        );
+        assert_eq!(
+            visible_item_at_wrapped_row(&items, &visible, 0, 3, 8),
+            Some(1)
         );
     }
 
@@ -7106,6 +7560,19 @@ mod tests {
             })
         );
         assert_eq!(parse_iso_date("2026-13-01"), None);
+    }
+
+    #[test]
+    fn validates_due_date_editor_input() {
+        assert!(valid_due_date_input(""));
+        assert!(valid_due_date_input("2026-06-17"));
+        assert!(valid_due_date_input("2026-06-17T09:30"));
+        assert!(valid_due_date_input("2026-06-17T09:30:00Z"));
+        assert!(!valid_due_date_input("morgen"));
+        assert!(!valid_due_date_input("2026-02-29"));
+        assert!(!valid_due_date_input("2026-06-17 later"));
+        assert!(due_date_input_prefix_allowed("2026-06-"));
+        assert!(!due_date_input_prefix_allowed("morgen"));
     }
 
     #[test]
