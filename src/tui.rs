@@ -366,13 +366,6 @@ enum EditorField {
     Text,
     Quantity,
     DueDate,
-    DueTime,
-    PlannedDate,
-    PlannedTime,
-    Reminder,
-    ReminderTime,
-    ReminderOffsets,
-    TravelTimeMinutes,
     Priority,
     Tags,
     Progress,
@@ -385,13 +378,6 @@ impl EditorField {
             Self::Text => tr("label-text"),
             Self::Quantity => tr("label-quantity"),
             Self::DueDate => tr("label-due"),
-            Self::DueTime => tr("label-due-time"),
-            Self::PlannedDate => tr("label-planned"),
-            Self::PlannedTime => tr("label-planned-time"),
-            Self::Reminder => tr("label-reminder"),
-            Self::ReminderTime => tr("label-reminder-time"),
-            Self::ReminderOffsets => tr("label-reminder-offsets"),
-            Self::TravelTimeMinutes => tr("label-travel-time"),
             Self::Priority => "!".to_string(),
             Self::Tags => tr("label-tags"),
             Self::Progress => tr("label-state"),
@@ -421,13 +407,6 @@ struct EditorState {
     text: String,
     quantity: String,
     due_date: String,
-    due_time: String,
-    planned_date: String,
-    planned_time: String,
-    reminder: String,
-    reminder_time: String,
-    reminder_offsets: String,
-    travel_time_minutes: String,
     priority: String,
     tags: String,
     progress: String,
@@ -602,17 +581,10 @@ struct ListPanelRow {
     label: String,
 }
 
-const ITEM_EDITOR_FIELDS: [EditorField; 14] = [
+const ITEM_EDITOR_FIELDS: [EditorField; 7] = [
     EditorField::Text,
     EditorField::Quantity,
     EditorField::DueDate,
-    EditorField::DueTime,
-    EditorField::PlannedDate,
-    EditorField::PlannedTime,
-    EditorField::Reminder,
-    EditorField::ReminderTime,
-    EditorField::ReminderOffsets,
-    EditorField::TravelTimeMinutes,
     EditorField::Priority,
     EditorField::Tags,
     EditorField::Progress,
@@ -1813,23 +1785,6 @@ impl App {
             text: item.text.clone(),
             quantity: item.quantity.clone().unwrap_or_default(),
             due_date: item.due_date.clone().unwrap_or_default(),
-            due_time: item.due_time.clone().unwrap_or_default(),
-            planned_date: item.planned_date.clone().unwrap_or_default(),
-            planned_time: item.planned_time.clone().unwrap_or_default(),
-            reminder: editor_bool_label(item.reminder),
-            reminder_time: item.reminder_time.clone().unwrap_or_default(),
-            reminder_offsets: item
-                .reminder_offsets
-                .clone()
-                .unwrap_or_default()
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", "),
-            travel_time_minutes: item
-                .travel_time_minutes
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
             priority: item.priority.clone().unwrap_or_default(),
             tags: item.tags.clone().unwrap_or_default().join(", "),
             progress: item.progress.clone().unwrap_or_default(),
@@ -1861,13 +1816,6 @@ impl App {
             text: String::new(),
             quantity: String::new(),
             due_date,
-            due_time: String::new(),
-            planned_date: String::new(),
-            planned_time: String::new(),
-            reminder: String::new(),
-            reminder_time: String::new(),
-            reminder_offsets: String::new(),
-            travel_time_minutes: String::new(),
             priority: String::new(),
             tags: String::new(),
             progress: self.default_progress_value(),
@@ -1888,13 +1836,6 @@ impl App {
             text: String::new(),
             quantity: String::new(),
             due_date: String::new(),
-            due_time: String::new(),
-            planned_date: String::new(),
-            planned_time: String::new(),
-            reminder: String::new(),
-            reminder_time: String::new(),
-            reminder_offsets: String::new(),
-            travel_time_minutes: String::new(),
             priority: String::new(),
             tags: String::new(),
             progress: String::new(),
@@ -1911,13 +1852,6 @@ impl App {
             text: self.item_filter.clone(),
             quantity: String::new(),
             due_date: String::new(),
-            due_time: String::new(),
-            planned_date: String::new(),
-            planned_time: String::new(),
-            reminder: String::new(),
-            reminder_time: String::new(),
-            reminder_offsets: String::new(),
-            travel_time_minutes: String::new(),
             priority: String::new(),
             tags: String::new(),
             progress: String::new(),
@@ -2017,43 +1951,6 @@ impl App {
             Value::String(editor.quantity.trim().to_string()),
         );
         body.insert("due_date".to_string(), Value::String(due_date));
-        body.insert(
-            "due_time".to_string(),
-            Value::String(editor.due_time.trim().to_string()),
-        );
-        body.insert(
-            "planned_date".to_string(),
-            Value::String(editor.planned_date.trim().to_string()),
-        );
-        body.insert(
-            "planned_time".to_string(),
-            Value::String(editor.planned_time.trim().to_string()),
-        );
-        let reminder = parse_editor_bool_input(&editor.reminder);
-        let reminder_time = editor.reminder_time.trim();
-        let reminder_offsets = parse_i64_csv(&editor.reminder_offsets);
-        let travel_time = editor.travel_time_minutes.trim();
-        let travel_time_minutes = travel_time.parse::<i64>().ok();
-        if let Some(reminder) = reminder.or_else(|| {
-            editor_reminder_details_provided(reminder_time, &reminder_offsets).then_some(true)
-        }) {
-            body.insert("reminder".to_string(), Value::Bool(reminder));
-        }
-        if !reminder_time.is_empty() {
-            body.insert(
-                "reminder_time".to_string(),
-                Value::String(reminder_time.to_string()),
-            );
-        }
-        if !reminder_offsets.is_empty() {
-            body.insert(
-                "reminder_offsets".to_string(),
-                Value::Array(reminder_offsets.into_iter().map(Value::from).collect()),
-            );
-        }
-        if let Some(minutes) = travel_time_minutes {
-            body.insert("travel_time_minutes".to_string(), Value::from(minutes));
-        }
         body.insert(
             "priority".to_string(),
             Value::String(editor.priority.trim().to_string()),
@@ -3184,22 +3081,6 @@ impl App {
         };
 
         match active_field {
-            EditorField::Reminder => {
-                let suggestions = vec![tr("label-off"), tr("label-on")];
-                let current = self
-                    .editor
-                    .as_ref()
-                    .map(|editor| editor.reminder.clone())
-                    .unwrap_or_default();
-                let Some(next) = cycle_suggestion_value(&current, &suggestions, delta) else {
-                    return false;
-                };
-                if let Some(editor) = self.editor.as_mut() {
-                    editor.reminder = next;
-                    return true;
-                }
-                false
-            }
             EditorField::Progress => {
                 let suggestions = self.progress_suggestions();
                 let current = self
@@ -4144,48 +4025,11 @@ fn active_editor_value_mut(editor: &mut EditorState) -> &mut String {
         EditorField::Text => &mut editor.text,
         EditorField::Quantity => &mut editor.quantity,
         EditorField::DueDate => &mut editor.due_date,
-        EditorField::DueTime => &mut editor.due_time,
-        EditorField::PlannedDate => &mut editor.planned_date,
-        EditorField::PlannedTime => &mut editor.planned_time,
-        EditorField::Reminder => &mut editor.reminder,
-        EditorField::ReminderTime => &mut editor.reminder_time,
-        EditorField::ReminderOffsets => &mut editor.reminder_offsets,
-        EditorField::TravelTimeMinutes => &mut editor.travel_time_minutes,
         EditorField::Priority => &mut editor.priority,
         EditorField::Tags => &mut editor.tags,
         EditorField::Progress => &mut editor.progress,
         EditorField::Notes => &mut editor.notes,
     }
-}
-
-fn editor_bool_label(value: Option<bool>) -> String {
-    match value {
-        Some(true) => tr("label-on"),
-        Some(false) => tr("label-off"),
-        None => String::new(),
-    }
-}
-
-fn parse_editor_bool_input(raw: &str) -> Option<bool> {
-    let value = raw.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let normalized = value.to_ascii_lowercase();
-    match normalized.as_str() {
-        "1" | "true" | "yes" | "y" | "on" => return Some(true),
-        "0" | "false" | "no" | "n" | "off" => return Some(false),
-        _ => {}
-    }
-
-    let localized = value.to_lowercase();
-    if localized == tr("label-on").to_lowercase() {
-        return Some(true);
-    }
-    if localized == tr("label-off").to_lowercase() {
-        return Some(false);
-    }
-    None
 }
 
 fn tags_value(raw: &str) -> Value {
@@ -4196,16 +4040,6 @@ fn tags_value(raw: &str) -> Value {
             .map(|tag| Value::String(tag.to_string()))
             .collect(),
     )
-}
-
-fn parse_i64_csv(raw: &str) -> Vec<i64> {
-    raw.split(',')
-        .filter_map(|part| part.trim().parse::<i64>().ok())
-        .collect()
-}
-
-fn editor_reminder_details_provided(reminder_time: &str, reminder_offsets: &[i64]) -> bool {
-    !reminder_time.trim().is_empty() || !reminder_offsets.is_empty()
 }
 
 fn invite_url_from_response(resp: &Value) -> Option<String> {
@@ -4977,65 +4811,12 @@ fn draw_item_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         lines.push(Line::from(format!(
             "{}: {}",
             tr("label-due").trim_end_matches(':'),
-            date_with_time_display(item.due_date.as_deref(), item.due_time.as_deref())
+            item.due_date
+                .as_deref()
+                .and_then(|v| v.get(0..10))
+                .filter(|v| !v.is_empty())
+                .unwrap_or("-")
         )));
-        lines.push(Line::from(format!(
-            "{}: {}",
-            tr("label-planned").trim_end_matches(':'),
-            date_with_time_display(item.planned_date.as_deref(), item.planned_time.as_deref())
-        )));
-        if let Some(repeat) = item
-            .repeat_label
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            lines.push(Line::from(format!(
-                "{}: {repeat}",
-                tr("label-repeat").trim_end_matches(':')
-            )));
-        }
-        if let Some(reminder) = item.reminder {
-            let state = if reminder {
-                tr("label-on")
-            } else {
-                tr("label-off")
-            };
-            lines.push(Line::from(format!(
-                "{}: {state}",
-                tr("label-reminder").trim_end_matches(':')
-            )));
-            if reminder {
-                if let Some(time) = item
-                    .reminder_time
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    lines.push(Line::from(format!(
-                        "{}: {time}",
-                        tr("label-reminder-time").trim_end_matches(':')
-                    )));
-                }
-                if let Some(offsets) = item
-                    .reminder_offsets
-                    .as_ref()
-                    .filter(|offsets| !offsets.is_empty())
-                {
-                    lines.push(Line::from(format!(
-                        "{}: {}",
-                        tr("label-reminder-offsets").trim_end_matches(':'),
-                        reminder_offsets_display(offsets)
-                    )));
-                }
-            }
-        }
-        if let Some(minutes) = item.travel_time_minutes.filter(|minutes| *minutes > 0) {
-            lines.push(Line::from(format!(
-                "{}: {minutes} min",
-                tr("label-travel-time").trim_end_matches(':')
-            )));
-        }
         lines.push(Line::from(format!(
             "{}: {}",
             tr("label-quantity").trim_end_matches(':'),
@@ -5629,13 +5410,6 @@ fn render_editor_field(
         EditorField::Text => &editor.text,
         EditorField::Quantity => &editor.quantity,
         EditorField::DueDate => &editor.due_date,
-        EditorField::DueTime => &editor.due_time,
-        EditorField::PlannedDate => &editor.planned_date,
-        EditorField::PlannedTime => &editor.planned_time,
-        EditorField::Reminder => &editor.reminder,
-        EditorField::ReminderTime => &editor.reminder_time,
-        EditorField::ReminderOffsets => &editor.reminder_offsets,
-        EditorField::TravelTimeMinutes => &editor.travel_time_minutes,
         EditorField::Priority => &editor.priority,
         EditorField::Tags => &editor.tags,
         EditorField::Progress => &editor.progress,
@@ -6388,15 +6162,6 @@ fn item_row_text(item: &ListItem) -> String {
     {
         out.push_str(" | ");
         out.push_str(due);
-        if let Some(time) = item
-            .due_time
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            out.push(' ');
-            out.push_str(time);
-        }
     }
 
     out
@@ -6458,15 +6223,6 @@ fn kanban_card_text(item: &ListItem) -> String {
     {
         out.push_str(" · ");
         out.push_str(due);
-        if let Some(time) = item
-            .due_time
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            out.push(' ');
-            out.push_str(time);
-        }
     }
 
     if let Some(count) = item.comment_count.filter(|count| *count > 0) {
@@ -6478,36 +6234,6 @@ fn kanban_card_text(item: &ListItem) -> String {
     }
 
     out
-}
-
-fn date_with_time_display(date: Option<&str>, time: Option<&str>) -> String {
-    let Some(date) = date
-        .and_then(|value| value.get(0..10))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return "-".to_string();
-    };
-    match time.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(time) => format!("{date} {time}"),
-        None => date.to_string(),
-    }
-}
-
-fn reminder_offsets_display(offsets: &[i64]) -> String {
-    offsets
-        .iter()
-        .map(|offset| {
-            if *offset >= 1440 && offset % 1440 == 0 {
-                format!("{}d", offset / 1440)
-            } else if *offset >= 60 && offset % 60 == 0 {
-                format!("{}h", offset / 60)
-            } else {
-                format!("{offset}m")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn item_matches_filter(item: &ListItem, query: &str) -> bool {
@@ -7370,14 +7096,7 @@ mod tests {
             notes: None,
             tldr: None,
             due_date: None,
-            due_time: None,
-            reminder: None,
-            reminder_time: None,
-            reminder_days_before: None,
-            reminder_offsets: None,
-            travel_time_minutes: None,
             planned_date: None,
-            planned_time: None,
             priority: None,
             progress: None,
             tags: None,
@@ -7782,14 +7501,7 @@ mod tests {
             notes: Some("AA size".to_string()),
             tldr: None,
             due_date: None,
-            due_time: None,
-            reminder: None,
-            reminder_time: None,
-            reminder_days_before: None,
-            reminder_offsets: None,
-            travel_time_minutes: None,
             planned_date: None,
-            planned_time: None,
             priority: Some("high".to_string()),
             progress: None,
             tags: Some(vec!["hardware".to_string()]),
@@ -7826,13 +7538,6 @@ mod tests {
                 Value::String("bar".to_string())
             ])
         );
-    }
-
-    #[test]
-    fn editor_reminder_details_enable_reminders_by_default() {
-        assert!(editor_reminder_details_provided("09:00", &[]));
-        assert!(editor_reminder_details_provided("", &[0, 60]));
-        assert!(!editor_reminder_details_provided("  ", &[]));
     }
 
     #[test]
