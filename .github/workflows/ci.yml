@@ -19,3 +19,43 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
       - run: cargo clippy -- -D warnings
+
+  deepsource-coverage:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DEEPSOURCE_DSN: ${{ secrets.DEEPSOURCE_DSN }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Linux build deps
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: Build LCOV report
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path target/coverage/lcov.info
+      - name: Install DeepSource CLI
+        run: curl https://deepsource.io/cli | sh
+      - name: Upload coverage to DeepSource
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${DEEPSOURCE_DSN:-}" ]]; then
+            ./bin/deepsource report \
+              --analyzer test-coverage \
+              --key rust \
+              --value-file target/coverage/lcov.info
+          else
+            ./bin/deepsource report \
+              --analyzer test-coverage \
+              --key rust \
+              --value-file target/coverage/lcov.info \
+              --use-oidc
+          fi
