@@ -53,7 +53,15 @@ pub struct ListItem {
     pub notes: Option<String>,
     pub tldr: Option<String>,
     pub due_date: Option<String>,
+    pub due_time: Option<String>,
     pub planned_date: Option<String>,
+    pub planned_time: Option<String>,
+    pub repeat_label: Option<String>,
+    pub reminder: Option<bool>,
+    pub reminder_time: Option<String>,
+    pub reminder_days_before: Option<i64>,
+    pub reminder_offsets: Option<Vec<i64>>,
+    pub travel_time_minutes: Option<i64>,
     pub priority: Option<String>,
     pub progress: Option<String>,
     pub tags: Option<Vec<String>>,
@@ -68,7 +76,6 @@ pub struct ListItem {
     pub done_child_count: Option<i64>,
     pub comment_count: Option<i64>,
     pub color: Option<String>,
-    pub repeat_label: Option<String>,
     pub image_url: Option<String>,
     pub image_filename: Option<String>,
     pub attachments: Option<Vec<Attachment>>,
@@ -103,6 +110,22 @@ pub struct CreateItem {
     pub notes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub due_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reminder: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reminder_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reminder_days_before: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reminder_offsets: Option<Vec<i64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub travel_time_minutes: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

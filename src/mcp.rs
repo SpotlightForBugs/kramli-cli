@@ -201,6 +201,10 @@ async fn create_item(api: &ApiClient, args: &Map<String, Value>) -> Result<Value
     insert_optional_string(args, &mut body, "quantity", "quantity")?;
     insert_optional_string(args, &mut body, "notes", "notes")?;
     insert_optional_string(args, &mut body, "due_date", "due_date")?;
+    insert_optional_string(args, &mut body, "due_time", "due_time")?;
+    insert_optional_string(args, &mut body, "planned_date", "planned_date")?;
+    insert_optional_string(args, &mut body, "planned_time", "planned_time")?;
+    insert_reminder_fields(args, &mut body)?;
     insert_optional_string(args, &mut body, "priority", "priority")?;
     insert_optional_string(args, &mut body, "progress", "progress")?;
     if let Some(tags) = optional_string_array(args, "tags")? {
@@ -221,6 +225,10 @@ async fn update_item(api: &ApiClient, args: &Map<String, Value>) -> Result<Value
     insert_optional_string(args, &mut body, "quantity", "quantity")?;
     insert_optional_string(args, &mut body, "notes", "notes")?;
     insert_optional_string(args, &mut body, "due_date", "due_date")?;
+    insert_optional_string(args, &mut body, "due_time", "due_time")?;
+    insert_optional_string(args, &mut body, "planned_date", "planned_date")?;
+    insert_optional_string(args, &mut body, "planned_time", "planned_time")?;
+    insert_reminder_fields(args, &mut body)?;
     insert_optional_string(args, &mut body, "priority", "priority")?;
     insert_optional_string(args, &mut body, "color", "color")?;
     insert_optional_string(args, &mut body, "progress", "progress")?;
@@ -246,6 +254,39 @@ async fn toggle_item_done(api: &ApiClient, args: &Map<String, Value>) -> Result<
 async fn delete_item(api: &ApiClient, args: &Map<String, Value>) -> Result<Value, String> {
     let id = required_i64(args, "id")?;
     api.delete(&format!("/items/{id}")).await
+}
+
+fn insert_reminder_fields(
+    args: &Map<String, Value>,
+    body: &mut Map<String, Value>,
+) -> Result<(), String> {
+    let reminder = optional_bool(args, "reminder")?;
+    let reminder_time = optional_string(args, "reminder_time")?;
+    let reminder_days_before = optional_i64(args, "reminder_days_before")?;
+    let reminder_offsets = optional_i64_array(args, "reminder_offsets")?;
+    let travel_time_minutes = optional_i64(args, "travel_time_minutes")?;
+    let has_reminder_details = reminder_time.is_some()
+        || reminder_days_before.is_some()
+        || reminder_offsets
+            .as_ref()
+            .is_some_and(|offsets| !offsets.is_empty());
+
+    if let Some(reminder) = reminder.or_else(|| has_reminder_details.then_some(true)) {
+        body.insert("reminder".to_string(), Value::Bool(reminder));
+    }
+    if let Some(reminder_time) = reminder_time {
+        body.insert("reminder_time".to_string(), Value::String(reminder_time));
+    }
+    if let Some(days) = reminder_days_before {
+        body.insert("reminder_days_before".to_string(), Value::from(days));
+    }
+    if let Some(offsets) = reminder_offsets {
+        body.insert("reminder_offsets".to_string(), Value::Array(offsets));
+    }
+    if let Some(minutes) = travel_time_minutes {
+        body.insert("travel_time_minutes".to_string(), Value::from(minutes));
+    }
+    Ok(())
 }
 
 fn required_i64(args: &Map<String, Value>, name: &str) -> Result<i64, String> {
@@ -566,7 +607,15 @@ fn tools() -> Vec<Value> {
                     "text": {"type": "string"},
                     "quantity": {"type": "string"},
                     "notes": {"type": "string"},
-                    "due_date": {"type": "string"},
+                    "due_date": {"type": "string", "description": "Due date (YYYY-MM-DD)."},
+                    "due_time": {"type": "string", "description": "Due time (HH:MM)."},
+                    "planned_date": {"type": "string", "description": "Planned date (YYYY-MM-DD)."},
+                    "planned_time": {"type": "string", "description": "Planned time (HH:MM)."},
+                    "reminder": {"type": "boolean", "description": "Enable additional reminders."},
+                    "reminder_time": {"type": "string", "description": "Reminder time (HH:MM)."},
+                    "reminder_days_before": {"type": "integer", "description": "Days before due date for reminder."},
+                    "reminder_offsets": {"type": "array", "items": {"type": "integer"}, "description": "Additional reminder offsets in minutes."},
+                    "travel_time_minutes": {"type": "integer", "description": "Travel time in minutes (independent from reminders)."},
                     "priority": {"type": "string"},
                     "progress": {"type": "string"},
                     "tags": {"type": "array", "items": {"type": "string"}},
@@ -586,7 +635,15 @@ fn tools() -> Vec<Value> {
                     "text": {"type": "string"},
                     "quantity": {"type": "string"},
                     "notes": {"type": "string"},
-                    "due_date": {"type": "string"},
+                    "due_date": {"type": "string", "description": "Due date (YYYY-MM-DD)."},
+                    "due_time": {"type": "string", "description": "Due time (HH:MM)."},
+                    "planned_date": {"type": "string", "description": "Planned date (YYYY-MM-DD)."},
+                    "planned_time": {"type": "string", "description": "Planned time (HH:MM)."},
+                    "reminder": {"type": "boolean", "description": "Enable additional reminders."},
+                    "reminder_time": {"type": "string", "description": "Reminder time (HH:MM)."},
+                    "reminder_days_before": {"type": "integer", "description": "Days before due date for reminder."},
+                    "reminder_offsets": {"type": "array", "items": {"type": "integer"}, "description": "Additional reminder offsets in minutes."},
+                    "travel_time_minutes": {"type": "integer", "description": "Travel time in minutes (independent from reminders)."},
                     "priority": {"type": "string"},
                     "color": {"type": "string"},
                     "progress": {"type": "string"},
@@ -623,10 +680,24 @@ fn tools() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        content_length, mcp_method_trace_name, mcp_tool_trace_name, try_parse_message,
-        write_message, MessageFraming,
+        content_length, insert_reminder_fields, mcp_method_trace_name, mcp_tool_trace_name, tools,
+        try_parse_message, write_message, MessageFraming,
     };
-    use serde_json::json;
+    use serde_json::{json, Map, Value};
+
+    fn schedule_properties_for_tool(tool_name: &str) -> Map<String, Value> {
+        let tool = tools()
+            .into_iter()
+            .find(|entry| entry.get("name").and_then(Value::as_str) == Some(tool_name))
+            .expect("tool must exist");
+
+        tool.get("inputSchema")
+            .and_then(Value::as_object)
+            .and_then(|schema| schema.get("properties"))
+            .and_then(Value::as_object)
+            .cloned()
+            .expect("tool inputSchema.properties must exist")
+    }
 
     #[test]
     fn parses_content_length_message() {
@@ -662,6 +733,222 @@ mod tests {
         assert_eq!(mcp_method_trace_name("notifications/changed"), "unknown");
         assert_eq!(mcp_tool_trace_name("create_item"), "create_item");
         assert_eq!(mcp_tool_trace_name("custom_user_input"), "unknown");
+    }
+
+    #[test]
+    fn reminder_details_enable_reminders_by_default() {
+        let args = json!({"reminder_time": "09:00"})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let mut body = Map::new();
+
+        insert_reminder_fields(&args, &mut body).expect("valid reminder fields");
+
+        assert_eq!(body.get("reminder"), Some(&Value::Bool(true)));
+        assert_eq!(
+            body.get("reminder_time"),
+            Some(&Value::String("09:00".to_string()))
+        );
+    }
+
+    #[test]
+    fn explicit_false_reminder_stays_false_with_details() {
+        let args = json!({"reminder": false, "travel_time_minutes": 15})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let mut body = Map::new();
+
+        insert_reminder_fields(&args, &mut body).expect("valid reminder fields");
+
+        assert_eq!(body.get("reminder"), Some(&Value::Bool(false)));
+        assert_eq!(body.get("travel_time_minutes"), Some(&Value::from(15)));
+    }
+
+    #[test]
+    fn travel_time_does_not_enable_reminder_by_default() {
+        let args = json!({"travel_time_minutes": 15})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let mut body = Map::new();
+
+        insert_reminder_fields(&args, &mut body).expect("valid reminder fields");
+
+        assert_eq!(body.get("reminder"), None);
+        assert_eq!(body.get("travel_time_minutes"), Some(&Value::from(15)));
+    }
+
+    #[test]
+    fn create_item_schema_has_schedule_descriptions() {
+        let properties = schedule_properties_for_tool("create_item");
+
+        let due_date = properties
+            .get("due_date")
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("description"))
+            .and_then(Value::as_str);
+        let due_time = properties
+            .get("due_time")
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("description"))
+            .and_then(Value::as_str);
+        let planned_date = properties
+            .get("planned_date")
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("description"))
+            .and_then(Value::as_str);
+        let planned_time = properties
+            .get("planned_time")
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("description"))
+            .and_then(Value::as_str);
+        let reminder = properties
+            .get("reminder")
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("description"))
+            .and_then(Value::as_str);
+        let reminder_time = properties
+            .get("reminder_time")
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("description"))
+            .and_then(Value::as_str);
+        let reminder_days_before = properties
+            .get("reminder_days_before")
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("description"))
+            .and_then(Value::as_str);
+        let reminder_offsets = properties
+            .get("reminder_offsets")
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("description"))
+            .and_then(Value::as_str);
+        let travel_time_minutes = properties
+            .get("travel_time_minutes")
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("description"))
+            .and_then(Value::as_str);
+
+        assert_eq!(due_date, Some("Due date (YYYY-MM-DD)."));
+        assert_eq!(due_time, Some("Due time (HH:MM)."));
+        assert_eq!(planned_date, Some("Planned date (YYYY-MM-DD)."));
+        assert_eq!(planned_time, Some("Planned time (HH:MM)."));
+        assert_eq!(reminder, Some("Enable additional reminders."));
+        assert_eq!(reminder_time, Some("Reminder time (HH:MM)."));
+        assert_eq!(
+            reminder_days_before,
+            Some("Days before due date for reminder.")
+        );
+        assert_eq!(
+            reminder_offsets,
+            Some("Additional reminder offsets in minutes.")
+        );
+        assert_eq!(
+            travel_time_minutes,
+            Some("Travel time in minutes (independent from reminders).")
+        );
+    }
+
+    #[test]
+    fn update_item_schema_has_schedule_descriptions() {
+        let properties = schedule_properties_for_tool("update_item");
+
+        let travel_time_minutes = properties
+            .get("travel_time_minutes")
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("description"))
+            .and_then(Value::as_str);
+        let reminder = properties
+            .get("reminder")
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("description"))
+            .and_then(Value::as_str);
+        let planned_date = properties
+            .get("planned_date")
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("description"))
+            .and_then(Value::as_str);
+
+        assert_eq!(reminder, Some("Enable additional reminders."));
+        assert_eq!(planned_date, Some("Planned date (YYYY-MM-DD)."));
+        assert_eq!(
+            travel_time_minutes,
+            Some("Travel time in minutes (independent from reminders).")
+        );
+    }
+
+    #[test]
+    fn reminder_offsets_also_enable_reminders_by_default() {
+        let args = json!({"reminder_offsets": [15, 60]})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let mut body = Map::new();
+
+        insert_reminder_fields(&args, &mut body).expect("valid reminder fields");
+
+        assert_eq!(body.get("reminder"), Some(&Value::Bool(true)));
+        assert_eq!(
+            body.get("reminder_offsets"),
+            Some(&Value::Array(vec![Value::from(15), Value::from(60)]))
+        );
+    }
+
+    #[test]
+    fn reminder_days_before_enable_reminders_by_default() {
+        let args = json!({"reminder_days_before": 2})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let mut body = Map::new();
+
+        insert_reminder_fields(&args, &mut body).expect("valid reminder fields");
+
+        assert_eq!(body.get("reminder"), Some(&Value::Bool(true)));
+        assert_eq!(body.get("reminder_days_before"), Some(&Value::from(2)));
+    }
+
+    #[test]
+    fn create_item_schema_required_fields_are_stable() {
+        let tool = tools()
+            .into_iter()
+            .find(|entry| entry.get("name").and_then(Value::as_str) == Some("create_item"))
+            .expect("create_item tool must exist");
+
+        let required = tool
+            .get("inputSchema")
+            .and_then(Value::as_object)
+            .and_then(|schema| schema.get("required"))
+            .and_then(Value::as_array)
+            .cloned()
+            .expect("required array must exist");
+
+        assert_eq!(
+            required,
+            vec![
+                Value::String("list_id".into()),
+                Value::String("text".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn update_item_schema_required_fields_are_stable() {
+        let tool = tools()
+            .into_iter()
+            .find(|entry| entry.get("name").and_then(Value::as_str) == Some("update_item"))
+            .expect("update_item tool must exist");
+
+        let required = tool
+            .get("inputSchema")
+            .and_then(Value::as_object)
+            .and_then(|schema| schema.get("required"))
+            .and_then(Value::as_array)
+            .cloned()
+            .expect("required array must exist");
+
+        assert_eq!(required, vec![Value::String("id".into())]);
     }
 
     #[tokio::test]

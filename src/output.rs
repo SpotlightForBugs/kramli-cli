@@ -535,6 +535,102 @@ fn human_size(bytes: i64) -> String {
     format!("{val:.1} TB")
 }
 
+fn date_with_time(date: &str, time: Option<&String>) -> String {
+    match time
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        Some(time) => format!("{date} {time}"),
+        None => date.to_string(),
+    }
+}
+
+fn reminder_offsets_label(offsets: &[i64]) -> String {
+    offsets
+        .iter()
+        .map(|offset| {
+            if *offset >= 1440 && offset % 1440 == 0 {
+                format!("{}d", offset / 1440)
+            } else if *offset >= 60 && offset % 60 == 0 {
+                format!("{}h", offset / 60)
+            } else {
+                format!("{offset}m")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+struct ScheduleLine {
+    label_key: &'static str,
+    value: String,
+}
+
+fn schedule_lines(item: &ListItem) -> Vec<ScheduleLine> {
+    let mut lines = Vec::new();
+
+    if let Some(ref date) = item.due_date {
+        lines.push(ScheduleLine {
+            label_key: "label-due",
+            value: date_with_time(date, item.due_time.as_ref())
+                .yellow()
+                .to_string(),
+        });
+    }
+    if let Some(ref date) = item.planned_date {
+        lines.push(ScheduleLine {
+            label_key: "label-planned",
+            value: date_with_time(date, item.planned_time.as_ref()),
+        });
+    }
+    if let Some(ref repeat) = item.repeat_label {
+        lines.push(ScheduleLine {
+            label_key: "label-repeat",
+            value: repeat.clone(),
+        });
+    }
+    if let Some(reminder) = item.reminder {
+        lines.push(ScheduleLine {
+            label_key: "label-reminder",
+            value: if reminder {
+                tr("label-on")
+            } else {
+                tr("label-off")
+            },
+        });
+
+        if reminder {
+            if let Some(ref time) = item.reminder_time {
+                if !time.trim().is_empty() {
+                    lines.push(ScheduleLine {
+                        label_key: "label-reminder-time",
+                        value: time.clone(),
+                    });
+                }
+            }
+            if let Some(ref offsets) = item.reminder_offsets {
+                if !offsets.is_empty() {
+                    lines.push(ScheduleLine {
+                        label_key: "label-reminder-offsets",
+                        value: reminder_offsets_label(offsets),
+                    });
+                }
+            }
+        }
+    }
+    if let Some(minutes) = item.travel_time_minutes {
+        if minutes > 0 {
+            lines.push(ScheduleLine {
+                label_key: "label-travel-time",
+                value: format!("{minutes} min"),
+            });
+        }
+    }
+
+    lines
+}
+
 pub fn print_item_detail(item: &ListItem, comments: &[ItemComment]) {
     let check = if item.is_done.unwrap_or(false) {
         "✓".green().to_string()
@@ -558,14 +654,8 @@ pub fn print_item_detail(item: &ListItem, comments: &[ItemComment]) {
             println!("  {}  {q}", tr("label-quantity").dimmed());
         }
     }
-    if let Some(ref d) = item.due_date {
-        println!("  {}  {}", tr("label-due").dimmed(), d.yellow());
-    }
-    if let Some(ref d) = item.planned_date {
-        println!("  {}  {d}", tr("label-planned").dimmed());
-    }
-    if let Some(ref r) = item.repeat_label {
-        println!("  {}  {r}", tr("label-repeat").dimmed());
+    for line in schedule_lines(item) {
+        println!("  {}  {}", tr(line.label_key).dimmed(), line.value);
     }
     if let Some(ref p) = item.progress {
         println!("  {}  {p}", tr("label-state").dimmed());
@@ -682,7 +772,11 @@ pub fn print_items(items: &[ListItem]) {
             _ => String::new(),
         };
         let due = match &i.due_date {
-            Some(d) => format!("  {}: {}", tr("label-due-lower"), d.yellow()),
+            Some(d) => format!(
+                "  {}: {}",
+                tr("label-due-lower"),
+                date_with_time(d, i.due_time.as_ref()).yellow()
+            ),
             None => String::new(),
         };
         let tags_str = match &i.tags {
@@ -744,7 +838,7 @@ pub fn print_items_for_list(list: Option<&ShoppingList>, items: &[ListItem]) {
 }
 
 #[cfg(test)]
-mod tests {
+mod wrap_and_icon_tests {
     use super::{list_display_name_with_folder, map_bootstrap_icon_label, wrap_ansi_with_prefix};
     use crate::models::ShoppingList;
 
@@ -967,5 +1061,158 @@ pub fn print_activity(entries: &[ActivityEntry]) {
             detail.dimmed(),
             when.dimmed()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        activity_detail_text, date_with_time, human_size, parse_hex_color, reminder_offsets_label,
+        schedule_lines, strip_html,
+    };
+    use crate::models::ListItem;
+    use serde_json::json;
+
+    fn minimal_item() -> ListItem {
+        ListItem {
+            id: 1,
+            list_id: Some(1),
+            text: "Test".to_string(),
+            is_done: Some(false),
+            quantity: None,
+            notes: None,
+            tldr: None,
+            due_date: None,
+            due_time: None,
+            planned_date: None,
+            planned_time: None,
+            repeat_label: None,
+            reminder: None,
+            reminder_time: None,
+            reminder_days_before: None,
+            reminder_offsets: None,
+            travel_time_minutes: None,
+            priority: None,
+            progress: None,
+            tags: None,
+            parent_item_id: None,
+            depth: None,
+            position: None,
+            completed_at: None,
+            created_at: None,
+            updated_at: None,
+            assigned_to: None,
+            child_count: None,
+            done_child_count: None,
+            comment_count: None,
+            color: None,
+            image_url: None,
+            image_filename: None,
+            attachments: None,
+        }
+    }
+
+    #[test]
+    fn schedule_lines_keep_due_planned_repeat_reminder_travel_order() {
+        let mut item = minimal_item();
+        item.due_date = Some("2026-07-20".to_string());
+        item.due_time = Some("09:30".to_string());
+        item.planned_date = Some("2026-07-19".to_string());
+        item.planned_time = Some("08:00".to_string());
+        item.repeat_label = Some("Wöchentlich".to_string());
+        item.reminder = Some(true);
+        item.reminder_time = Some("09:00".to_string());
+        item.reminder_offsets = Some(vec![60, 1440]);
+        item.travel_time_minutes = Some(20);
+
+        let keys: Vec<&str> = schedule_lines(&item)
+            .into_iter()
+            .map(|line| line.label_key)
+            .collect();
+
+        assert_eq!(
+            keys,
+            vec![
+                "label-due",
+                "label-planned",
+                "label-repeat",
+                "label-reminder",
+                "label-reminder-time",
+                "label-reminder-offsets",
+                "label-travel-time",
+            ]
+        );
+    }
+
+    #[test]
+    fn schedule_lines_show_travel_without_reminder() {
+        let mut item = minimal_item();
+        item.reminder = Some(false);
+        item.travel_time_minutes = Some(15);
+
+        let lines = schedule_lines(&item);
+        let keys: Vec<&str> = lines.iter().map(|line| line.label_key).collect();
+
+        assert_eq!(keys, vec!["label-reminder", "label-travel-time"]);
+        assert_eq!(lines[1].value, "15 min");
+    }
+
+    #[test]
+    fn reminder_offsets_label_formats_units() {
+        assert_eq!(
+            reminder_offsets_label(&[5, 60, 180, 1440]),
+            "5m, 1h, 3h, 1d"
+        );
+    }
+
+    #[test]
+    fn strip_html_keeps_line_breaks_and_unescapes() {
+        let raw = "Hi<br><b>there</b> &amp; &lt;ok&gt;";
+        assert_eq!(strip_html(raw), "Hi\nthere & <ok>");
+    }
+
+    #[test]
+    fn parse_hex_color_accepts_valid_rgb_and_rejects_invalid() {
+        assert_eq!(parse_hex_color("#12AbEf"), Some((0x12, 0xAB, 0xEF)));
+        assert_eq!(parse_hex_color("12abef"), Some((0x12, 0xAB, 0xEF)));
+        assert_eq!(parse_hex_color("#xyzxyz"), None);
+        assert_eq!(parse_hex_color("#12345"), None);
+    }
+
+    #[test]
+    fn date_with_time_appends_non_empty_time() {
+        assert_eq!(
+            date_with_time("2026-08-01", Some(&"09:30".to_string())),
+            "2026-08-01 09:30"
+        );
+        assert_eq!(
+            date_with_time("2026-08-01", Some(&"  ".to_string())),
+            "2026-08-01"
+        );
+        assert_eq!(date_with_time("2026-08-01", None), "2026-08-01");
+    }
+
+    #[test]
+    fn human_size_formats_units_progressively() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(2048), "2.0 KB");
+        assert_eq!(human_size(1024 * 1024), "1.0 MB");
+    }
+
+    #[test]
+    fn activity_detail_text_prefers_text_then_changes_then_pairs() {
+        let with_text = json!({"text": "Milch"});
+        let with_changes = json!({"changes": ["prio", "datum"]});
+        let with_pairs = json!({"alpha": 1, "beta": "x"});
+
+        assert!(activity_detail_text(Some(&with_text)).contains("Milch"));
+
+        let changes_rendered = activity_detail_text(Some(&with_changes));
+        assert!(changes_rendered.contains("prio"));
+        assert!(changes_rendered.contains("datum"));
+
+        let pairs_rendered = activity_detail_text(Some(&with_pairs));
+        assert!(pairs_rendered.contains("alpha=1"));
+        assert!(pairs_rendered.contains("beta=x"));
     }
 }
