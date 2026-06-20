@@ -58,7 +58,7 @@ pub enum Commands {
     #[command(alias = "i")]
     Items {
         #[command(subcommand)]
-        action: ItemCmd,
+        action: Box<ItemCmd>,
     },
     /// Manage folders
     Folders {
@@ -395,6 +395,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_boxed_items_subcommand() {
+        let cli = Cli::try_parse_from([
+            "kramli",
+            "items",
+            "update",
+            "123",
+            "--reminder-time",
+            "09:00",
+        ])
+        .expect("items update parse should work");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Items { action })
+                if matches!(
+                    *action,
+                    ItemCmd::Update {
+                        id: 123,
+                        reminder_time: Some(ref time),
+                        ..
+                    } if time == "09:00"
+                )
+        ));
+    }
+
+    #[test]
     fn parses_update_check_command() {
         let cli = Cli::try_parse_from(["kramli", "update-check"])
             .expect("update-check parse should work");
@@ -471,6 +497,28 @@ mod tests {
         );
         assert_eq!(invite_url_from_response(&json!({})), None);
     }
+
+    #[test]
+    fn reminder_details_enable_reminders_by_default() {
+        assert_eq!(effective_reminder_value(None, true), Some(true));
+        assert_eq!(effective_reminder_value(Some(true), true), Some(true));
+        assert_eq!(effective_reminder_value(Some(false), true), Some(false));
+        assert_eq!(effective_reminder_value(None, false), None);
+    }
+
+    #[test]
+    fn reminder_details_exclude_travel_time_semantics() {
+        assert!(!reminder_details_provided(&None, None, &None));
+        assert_eq!(
+            effective_reminder_value(None, reminder_details_provided(&None, None, &None)),
+            None
+        );
+        assert!(reminder_details_provided(
+            &Some("09:00".to_string()),
+            None,
+            &None
+        ));
+    }
 }
 
 #[derive(Subcommand)]
@@ -513,6 +561,23 @@ pub enum ItemCmd {
         quantity: Option<String>,
         #[arg(short, long)]
         due: Option<String>,
+        #[arg(long)]
+        due_time: Option<String>,
+        #[arg(long, alias = "planned-date")]
+        planned: Option<String>,
+        #[arg(long)]
+        planned_time: Option<String>,
+        #[arg(long)]
+        reminder: Option<bool>,
+        #[arg(long)]
+        reminder_time: Option<String>,
+        #[arg(long)]
+        reminder_days_before: Option<i64>,
+        #[arg(long, value_delimiter = ',')]
+        reminder_offsets: Option<Vec<i64>>,
+        /// Travel time in minutes (independent from reminders)
+        #[arg(long, alias = "travel-time", alias = "wegzeit")]
+        travel_time_minutes: Option<i64>,
         #[arg(short, long)]
         priority: Option<String>,
         #[arg(short, long)]
@@ -540,6 +605,23 @@ pub enum ItemCmd {
         quantity: Option<String>,
         #[arg(short, long)]
         due: Option<String>,
+        #[arg(long)]
+        due_time: Option<String>,
+        #[arg(long, alias = "planned-date")]
+        planned: Option<String>,
+        #[arg(long)]
+        planned_time: Option<String>,
+        #[arg(long)]
+        reminder: Option<bool>,
+        #[arg(long)]
+        reminder_time: Option<String>,
+        #[arg(long)]
+        reminder_days_before: Option<i64>,
+        #[arg(long, value_delimiter = ',')]
+        reminder_offsets: Option<Vec<i64>>,
+        /// Travel time in minutes (independent from reminders)
+        #[arg(long, alias = "travel-time", alias = "wegzeit")]
+        travel_time_minutes: Option<i64>,
         #[arg(short, long)]
         priority: Option<String>,
         #[arg(long)]
@@ -830,7 +912,7 @@ async fn run_command(command: Commands, as_json: bool) -> Result<(), String> {
         Commands::Logout => run_logout(),
         Commands::Status => run_status(as_json).await,
         Commands::Lists { action } => run_lists(action, as_json).await,
-        Commands::Items { action } => run_items(action, as_json).await,
+        Commands::Items { action } => run_items(*action, as_json).await,
         Commands::Folders { action } => run_folders(action, as_json).await,
         Commands::Members { action } => run_members(action, as_json).await,
         Commands::Keys { action } => run_keys(action, as_json).await,
@@ -1132,6 +1214,24 @@ fn normalize_progress_value(progress: Option<String>) -> Option<Value> {
             Value::String(trimmed.to_string())
         }
     })
+}
+
+fn reminder_details_provided(
+    reminder_time: &Option<String>,
+    reminder_days_before: Option<i64>,
+    reminder_offsets: &Option<Vec<i64>>,
+) -> bool {
+    reminder_time
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || reminder_days_before.is_some()
+        || reminder_offsets
+            .as_ref()
+            .is_some_and(|offsets| !offsets.is_empty())
+}
+
+fn effective_reminder_value(reminder: Option<bool>, has_reminder_details: bool) -> Option<bool> {
+    reminder.or_else(|| has_reminder_details.then_some(true))
 }
 
 async fn fetch_item_from_list(
@@ -1679,6 +1779,14 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
             text,
             quantity,
             due,
+            due_time,
+            planned,
+            planned_time,
+            reminder,
+            reminder_time,
+            reminder_days_before,
+            reminder_offsets,
+            travel_time_minutes,
             priority,
             tags,
             notes,
@@ -1688,11 +1796,23 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
             progress,
         } => {
             let tag_vec = tags.map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
+            let reminder = effective_reminder_value(
+                reminder,
+                reminder_details_provided(&reminder_time, reminder_days_before, &reminder_offsets),
+            );
             let body = CreateItem {
                 text,
                 quantity,
                 notes,
                 due_date: due,
+                due_time,
+                planned_date: planned,
+                planned_time,
+                reminder,
+                reminder_time,
+                reminder_days_before,
+                reminder_offsets,
+                travel_time_minutes,
                 priority,
                 tags: tag_vec,
                 parent_item_id: parent,
@@ -1732,6 +1852,14 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
             text,
             quantity,
             due,
+            due_time,
+            planned,
+            planned_time,
+            reminder,
+            reminder_time,
+            reminder_days_before,
+            reminder_offsets,
+            travel_time_minutes,
             priority,
             tags,
             notes,
@@ -1741,6 +1869,10 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
         } => {
             let tags_provided = tags.is_some();
             let mut body = serde_json::Map::new();
+            let reminder = effective_reminder_value(
+                reminder,
+                reminder_details_provided(&reminder_time, reminder_days_before, &reminder_offsets),
+            );
             if let Some(t) = text {
                 body.insert("text".into(), Value::String(t));
             }
@@ -1749,6 +1881,33 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
             }
             if let Some(d) = due {
                 body.insert("due_date".into(), Value::String(d));
+            }
+            if let Some(due_time) = due_time {
+                body.insert("due_time".into(), Value::String(due_time));
+            }
+            if let Some(planned) = planned {
+                body.insert("planned_date".into(), Value::String(planned));
+            }
+            if let Some(planned_time) = planned_time {
+                body.insert("planned_time".into(), Value::String(planned_time));
+            }
+            if let Some(r) = reminder {
+                body.insert("reminder".into(), Value::Bool(r));
+            }
+            if let Some(rt) = reminder_time {
+                body.insert("reminder_time".into(), Value::String(rt));
+            }
+            if let Some(days) = reminder_days_before {
+                body.insert("reminder_days_before".into(), Value::from(days));
+            }
+            if let Some(offsets) = reminder_offsets {
+                body.insert(
+                    "reminder_offsets".into(),
+                    Value::Array(offsets.into_iter().map(Value::from).collect()),
+                );
+            }
+            if let Some(minutes) = travel_time_minutes {
+                body.insert("travel_time_minutes".into(), Value::from(minutes));
             }
             if let Some(p) = priority {
                 body.insert("priority".into(), Value::String(p));

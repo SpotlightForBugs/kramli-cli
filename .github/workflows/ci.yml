@@ -40,7 +40,9 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
       - name: Build LCOV report
-        run: cargo llvm-cov --workspace --all-features --lcov --output-path target/coverage/lcov.info
+        run: |
+          mkdir -p target/coverage
+          cargo llvm-cov --workspace --all-features --lcov --output-path target/coverage/lcov.info
       - name: Install DeepSource CLI
         run: curl https://deepsource.io/cli | sh
       - name: Upload coverage to DeepSource
