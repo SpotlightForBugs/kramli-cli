@@ -1,0 +1,18 @@
+version = 1
+
+exclude_patterns = [
+  "target/**",
+]
+
+test_patterns = [
+  "tests/**",
+  "benches/**",
+]
+
+[[analyzers]]
+name = "rust"
+enabled = true
+
+[[transformers]]
+name = "rustfmt"
+enabled = true
