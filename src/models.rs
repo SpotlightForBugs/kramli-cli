@@ -393,6 +393,42 @@ mod tests {
     }
 
     #[test]
+    fn parse_search_response_covers_object_null_and_error_shapes() {
+        let null = SearchResponse::from_value(serde_json::Value::Null)
+            .expect("null should parse as empty flat response")
+            .into_grouped();
+        assert!(null.lists.is_none());
+        assert!(null.items.is_none());
+
+        let empty_object = SearchResponse::from_value(serde_json::json!({}))
+            .expect("empty object should parse as empty grouped response")
+            .into_grouped();
+        assert!(empty_object.lists.is_none());
+        assert!(empty_object.items.is_none());
+
+        let nested = SearchResponse::from_value(serde_json::json!({
+            "data": {"lists": [{"id": 8, "name": "Nested"}]}
+        }))
+        .expect("nested grouped response should parse")
+        .into_grouped();
+        assert_eq!(nested.lists.expect("nested list")[0].name, "Nested");
+
+        let flat_object = SearchResponse::from_value(serde_json::json!({
+            "type": "list",
+            "id": 9,
+            "name": "Flat object"
+        }))
+        .expect("single flat object should parse")
+        .into_grouped();
+        assert_eq!(flat_object.lists.expect("flat list")[0].name, "Flat object");
+
+        assert!(SearchResponse::from_value(serde_json::json!({"unexpected": true})).is_err());
+        assert!(SearchResponse::from_value(serde_json::json!(true)).is_err());
+        assert!(SearchResponse::from_value(serde_json::json!(7)).is_err());
+        assert!(SearchResponse::from_value(serde_json::json!("search")).is_err());
+    }
+
+    #[test]
     fn parse_search_response_accepts_flat_hits() {
         let value = serde_json::json!([
             {
@@ -448,6 +484,27 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, 42);
         assert_eq!(items[0].text, "Milk");
+    }
+
+    #[test]
+    fn parse_search_response_covers_fallback_names_and_unknown_hits() {
+        let value = serde_json::json!([
+            {"type": "list", "id": 10},
+            {"type": "item", "id": 11},
+            {"type": "ignored", "id": 12}
+        ]);
+
+        let grouped = SearchResponse::from_value(value)
+            .expect("flat hits should parse")
+            .into_grouped();
+        let lists = grouped.lists.expect("list fallback expected");
+        let items = grouped.items.expect("item fallback expected");
+        assert_eq!(lists.len(), 1);
+        assert!(lists[0].name.contains("10"));
+        assert_eq!(items.len(), 1);
+        assert!(items[0].text.contains("11"));
+
+        assert!(SearchResponse::from_value(serde_json::json!([{"id": true}])).is_err());
     }
 
     #[test]

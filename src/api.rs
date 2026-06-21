@@ -21,6 +21,23 @@ pub(crate) struct ApiClient {
     min_request_interval: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceRequestKind {
+    SameOrigin,
+    ExternalPublicHttps,
+    External,
+}
+
+impl ResourceRequestKind {
+    fn operation_tag(self) -> &'static str {
+        match self {
+            Self::SameOrigin => "same_origin",
+            Self::ExternalPublicHttps => "external_public_https_resource",
+            Self::External => "external_resource",
+        }
+    }
+}
+
 const DEFAULT_RATE_LIMIT_MS: u64 = 120;
 const MAX_429_RETRIES: u32 = 3;
 const MAX_RESOURCE_BYTES: usize = 8 * 1024 * 1024;
@@ -308,6 +325,37 @@ impl ApiClient {
         }
     }
 
+    fn resource_request_kind(
+        same_origin: bool,
+        public_https_resource: bool,
+        explicit_external_resources: bool,
+    ) -> ResourceRequestKind {
+        if same_origin {
+            ResourceRequestKind::SameOrigin
+        } else if public_https_resource && !explicit_external_resources {
+            ResourceRequestKind::ExternalPublicHttps
+        } else {
+            ResourceRequestKind::External
+        }
+    }
+
+    fn append_limited_bytes(out: &mut Vec<u8>, chunk: &[u8], limit: usize) -> Result<(), String> {
+        if out.len().saturating_add(chunk.len()) > limit {
+            return Err(format!("resource exceeds {limit} bytes"));
+        }
+        out.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn resource_headers(&self, kind: ResourceRequestKind) -> HeaderMap {
+        match kind {
+            ResourceRequestKind::SameOrigin => self.headers(),
+            ResourceRequestKind::ExternalPublicHttps | ResourceRequestKind::External => {
+                Self::language_headers()
+            }
+        }
+    }
+
     async fn read_limited_bytes(mut resp: Response, limit: usize) -> Result<Vec<u8>, String> {
         if resp
             .content_length()
@@ -322,10 +370,7 @@ impl ApiClient {
             .await
             .map_err(|e| tr_args("api-network-error", &[("error", e.to_string())]))?
         {
-            if out.len().saturating_add(chunk.len()) > limit {
-                return Err(format!("resource exceeds {limit} bytes"));
-            }
-            out.extend_from_slice(&chunk);
+            Self::append_limited_bytes(&mut out, &chunk, limit)?;
         }
         Ok(out)
     }
@@ -710,16 +755,13 @@ impl ApiClient {
                     .to_string(),
             );
         }
-        let headers = if same_origin {
-            span.set_tag("operation", "same_origin");
-            self.headers()
-        } else if public_https_resource && !explicit_external_resources {
-            span.set_tag("operation", "external_public_https_resource");
-            Self::language_headers()
-        } else {
-            span.set_tag("operation", "external_resource");
-            Self::language_headers()
-        };
+        let request_kind = Self::resource_request_kind(
+            same_origin,
+            public_https_resource,
+            explicit_external_resources,
+        );
+        span.set_tag("operation", request_kind.operation_tag());
+        let headers = self.resource_headers(request_kind);
 
         let resp = match self
             .send_with_retry(
@@ -773,7 +815,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    use super::ApiClient;
+    use super::{ApiClient, ResourceRequestKind, MAX_RESOURCE_BYTES};
 
     struct TestResponse {
         status: u16,
@@ -837,14 +879,8 @@ mod tests {
                     header.push_str("\r\n");
                 }
                 header.push_str("\r\n");
-                stream
-                    .write_all(header.as_bytes())
-                    .await
-                    .expect("write response header");
-                stream
-                    .write_all(&response.body)
-                    .await
-                    .expect("write response body");
+                let _ = stream.write_all(header.as_bytes()).await;
+                let _ = stream.write_all(&response.body).await;
             }
             requests
         });
@@ -1017,7 +1053,10 @@ mod tests {
         assert!(!test_client("not a base").is_same_origin("https://kramli.de/a.png"));
         assert!(client.headers().contains_key("X-API-Key"));
         assert!(ApiClient::language_headers().contains_key(reqwest::header::ACCEPT_LANGUAGE));
+    }
 
+    #[test]
+    fn public_resource_host_filter_covers_private_ranges() {
         assert!(!ApiClient::public_resource_host_allowed(""));
         assert!(!ApiClient::public_resource_host_allowed("0.1.2.3"));
         assert!(!ApiClient::public_resource_host_allowed("100.64.0.1"));
@@ -1028,6 +1067,54 @@ mod tests {
         assert!(!ApiClient::public_resource_host_allowed("fe80::1"));
         assert!(!ApiClient::public_resource_host_allowed("2001:db8::1"));
         assert!(ApiClient::public_resource_host_allowed("example.com"));
+        assert!(!ApiClient::public_https_resource_allowed("not a url"));
+    }
+
+    #[test]
+    fn resource_request_kind_helpers_cover_headers_and_tags() {
+        let client = test_client("https://kramli.de:8443");
+
+        assert_eq!(
+            ApiClient::resource_request_kind(true, false, false),
+            ResourceRequestKind::SameOrigin
+        );
+        assert_eq!(
+            ResourceRequestKind::SameOrigin.operation_tag(),
+            "same_origin"
+        );
+        assert!(client
+            .resource_headers(ResourceRequestKind::SameOrigin)
+            .contains_key("X-API-Key"));
+        assert_eq!(
+            ApiClient::resource_request_kind(false, true, false),
+            ResourceRequestKind::ExternalPublicHttps
+        );
+        assert_eq!(
+            ResourceRequestKind::ExternalPublicHttps.operation_tag(),
+            "external_public_https_resource"
+        );
+        assert!(client
+            .resource_headers(ResourceRequestKind::ExternalPublicHttps)
+            .contains_key(reqwest::header::ACCEPT_LANGUAGE));
+        assert_eq!(
+            ApiClient::resource_request_kind(false, true, true),
+            ResourceRequestKind::External
+        );
+        assert_eq!(
+            ResourceRequestKind::External.operation_tag(),
+            "external_resource"
+        );
+        assert!(client
+            .resource_headers(ResourceRequestKind::External)
+            .contains_key(reqwest::header::ACCEPT_LANGUAGE));
+    }
+
+    #[test]
+    fn append_limited_bytes_covers_success_and_overflow() {
+        let mut out = vec![1, 2];
+        ApiClient::append_limited_bytes(&mut out, &[3, 4], 4).unwrap();
+        assert_eq!(out, vec![1, 2, 3, 4]);
+        assert!(ApiClient::append_limited_bytes(&mut out, &[5], 4).is_err());
     }
 
     #[test]
@@ -1071,17 +1158,17 @@ mod tests {
         .await;
 
         let got: Value = api.get("/ok").await.unwrap();
-        assert_eq!(got["ok"], true);
+        assert!(got["ok"].as_bool().unwrap_or(false));
         let queried: Value = api.get_query("/search", &[("q", "milk")]).await.unwrap();
-        assert_eq!(queried["query"], true);
+        assert!(queried["query"].as_bool().unwrap_or(false));
         let posted: Value = api.post("/items", &json!({"text": "Milk"})).await.unwrap();
-        assert_eq!(posted["posted"], true);
+        assert!(posted["posted"].as_bool().unwrap_or(false));
         let put: Value = api.put("/items/1", &json!({"text": "Eggs"})).await.unwrap();
-        assert_eq!(put["put"], true);
+        assert!(put["put"].as_bool().unwrap_or(false));
         let patched: Value = api.patch_json("/items/1/done", &json!({})).await.unwrap();
-        assert_eq!(patched["patched"], true);
+        assert!(patched["patched"].as_bool().unwrap_or(false));
         let deleted: Value = api.delete("/items/1").await.unwrap();
-        assert_eq!(deleted["deleted"], true);
+        assert!(deleted["deleted"].as_bool().unwrap_or(false));
         assert!(api.delete_ok("/items/1").await.unwrap());
         assert!(api.delete_ok("/items/2").await.is_err());
         assert!(api.get::<Value>("/fail").await.is_err());
@@ -1103,6 +1190,7 @@ mod tests {
         let (api, server) = api_with_responses(vec![
             TestResponse::bytes(b"same".to_vec()),
             TestResponse::bytes(b"public".to_vec()),
+            TestResponse::status(200, vec![b'x'; MAX_RESOURCE_BYTES + 1]),
             TestResponse::status(404, b"missing".to_vec()),
         ])
         .await;
@@ -1115,6 +1203,7 @@ mod tests {
                 .unwrap(),
             b"public".to_vec()
         );
+        assert!(api.get_bytes("/too-large.png").await.is_err());
         assert!(api
             .get_bytes("http://example.com/insecure.png")
             .await
@@ -1124,6 +1213,7 @@ mod tests {
         let requests = server.await.expect("server finished");
         assert_eq!(requests[0], "GET /asset.png HTTP/1.1");
         assert_eq!(requests[1], "GET /external.png HTTP/1.1");
-        assert_eq!(requests[2], "GET /missing.png HTTP/1.1");
+        assert_eq!(requests[2], "GET /too-large.png HTTP/1.1");
+        assert_eq!(requests[3], "GET /missing.png HTTP/1.1");
     }
 }
