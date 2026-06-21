@@ -39,8 +39,7 @@ pub fn traces_sample_rate() -> f32 {
         .ok()
         .and_then(|raw| raw.trim().parse::<f32>().ok())
         .filter(|value| value.is_finite())
-        .map(|value| value.clamp(0.0, 1.0))
-        .unwrap_or(1.0)
+        .map_or(1.0, |value| value.clamp(0.0, 1.0))
 }
 
 /// Ordinary CLI failures are usually expected user/API outcomes (not logged in,
@@ -171,7 +170,7 @@ pub fn scrub_event(mut event: Event<'static>) -> Option<Event<'static>> {
     event.threads.values.clear();
     event.tags.retain(|key, value| is_safe_tag(key, value));
     event.extra.clear();
-    event.debug_meta = Default::default();
+    event.debug_meta = std::borrow::Cow::default();
     event.sdk = None;
 
     if let Some(message) = event.message.take() {
@@ -519,9 +518,7 @@ mod tests {
             let v = value.trim().to_ascii_lowercase();
             !v.is_empty() && v != "0" && v != "false" && v != "off" && v != "no"
         };
-        if dnt.map(env_value_is_truthy).unwrap_or(false)
-            || no_telemetry.map(env_value_is_truthy).unwrap_or(false)
-        {
+        if dnt.is_some_and(env_value_is_truthy) || no_telemetry.is_some_and(env_value_is_truthy) {
             return false;
         }
         telemetry.and_then(parse_env_bool).unwrap_or(false)

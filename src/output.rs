@@ -16,7 +16,6 @@ enum IconStyle {
 
 fn icon_style() -> IconStyle {
     match std::env::var("KRAMLI_ICON_STYLE")
-        .ok()
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
@@ -152,12 +151,12 @@ fn display_icon(raw: Option<&str>, fallback_name: &str) -> String {
 
 fn color_dot(raw: Option<&str>) -> String {
     let Some(color) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
-        return String::new();
+        return String::default();
     };
 
     match parse_hex_color(color) {
         Some((r, g, b)) => format!(" {}", "●".truecolor(r, g, b)),
-        None => String::new(),
+        None => String::default(),
     }
 }
 
@@ -641,7 +640,7 @@ pub fn print_item_detail(item: &ListItem, comments: &[ItemComment]) {
         Some("high") => " !!!".red().to_string(),
         Some("medium") => " !!".yellow().to_string(),
         Some("low") => " !".dimmed().to_string(),
-        _ => String::new(),
+        _ => String::default(),
     };
     println!(
         "{check} {}{pri}  {}",
@@ -733,8 +732,7 @@ pub fn print_item_detail(item: &ListItem, comments: &[ItemComment]) {
             let when = c
                 .created_at
                 .as_deref()
-                .map(|s| &s[..s.len().min(16)])
-                .unwrap_or("");
+                .map_or("", |s| &s[..s.len().min(16)]);
             println!("    {}  {}  {text}", when.dimmed(), who.bold());
         }
     }
@@ -765,11 +763,11 @@ pub fn print_items(items: &[ListItem]) {
             Some("high") => " !!!".red().to_string(),
             Some("medium") => " !!".yellow().to_string(),
             Some("low") => " !".dimmed().to_string(),
-            _ => String::new(),
+            _ => String::default(),
         };
         let qty = match &i.quantity {
             Some(q) if !q.is_empty() => format!(" ({})", q.dimmed()),
-            _ => String::new(),
+            _ => String::default(),
         };
         let due = match &i.due_date {
             Some(d) => format!(
@@ -777,22 +775,22 @@ pub fn print_items(items: &[ListItem]) {
                 tr("label-due-lower"),
                 date_with_time(d, i.due_time.as_ref()).yellow()
             ),
-            None => String::new(),
+            None => String::default(),
         };
         let tags_str = match &i.tags {
             Some(t) if !t.is_empty() => {
                 let joined: Vec<String> = t.iter().map(|tg| format!("#{tg}")).collect();
                 format!("  {}", joined.join(" ").dimmed())
             }
-            _ => String::new(),
+            _ => String::default(),
         };
         let progress = match i.progress.as_deref().map(str::trim) {
             Some(p) if !p.is_empty() => format!("  [{}]", p.cyan()),
-            _ => String::new(),
+            _ => String::default(),
         };
         let sub = match (i.child_count, i.done_child_count) {
             (Some(c), Some(d)) if c > 0 => format!(" [{d}/{c}]").dimmed().to_string(),
-            _ => String::new(),
+            _ => String::default(),
         };
         let text = if i.is_done.unwrap_or(false) {
             i.text.dimmed().strikethrough().to_string()
@@ -940,7 +938,7 @@ pub fn print_members(members: &[Member]) {
         let badge = if kind == "invite" {
             format!(" ({})", tr("member-invited")).yellow().to_string()
         } else {
-            String::new()
+            String::default()
         };
         println!(
             "  {name:<24} {email:<30} [{} | {}]{badge}",
@@ -996,10 +994,10 @@ pub fn print_search(results: &SearchResults) {
 
 fn activity_detail_text(detail: Option<&serde_json::Value>) -> String {
     let Some(detail) = detail else {
-        return String::new();
+        return String::default();
     };
     match detail {
-        serde_json::Value::Null => String::new(),
+        serde_json::Value::Null => String::default(),
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Object(map) => {
             if let Some(text) = map.get("text").and_then(serde_json::Value::as_str) {
@@ -1021,13 +1019,12 @@ fn activity_detail_text(detail: Option<&serde_json::Value>) -> String {
                 .map(|(key, value)| {
                     let rendered = value
                         .as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| value.to_string());
+                        .map_or_else(|| value.to_string(), str::to_string);
                     format!("{key}={rendered}")
                 })
                 .collect();
             if pairs.is_empty() {
-                String::new()
+                String::default()
             } else {
                 pairs.join(", ")
             }
@@ -1050,8 +1047,7 @@ pub fn print_activity(entries: &[ActivityEntry]) {
         let action = a
             .action
             .as_deref()
-            .map(activity_action_label)
-            .unwrap_or_else(|| "?".to_string());
+            .map_or_else(|| "?".to_string(), activity_action_label);
         let detail = activity_detail_text(a.detail.as_ref());
         let when = a.created_at.as_deref().unwrap_or("");
         println!(

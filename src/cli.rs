@@ -806,10 +806,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
     let command_label = if cli.interactive {
         "interactive"
     } else {
-        cli.command
-            .as_ref()
-            .map(command_trace_name)
-            .unwrap_or("missing")
+        cli.command.as_ref().map_or("missing", command_trace_name)
     };
     let mode_label = if cli.interactive {
         "interactive"
@@ -1081,7 +1078,7 @@ async fn run_login(url: Option<String>) -> Result<(), String> {
             let name = p
                 .display_name
                 .clone()
-                .or(p.email.clone())
+                .or_else(|| p.email.clone())
                 .unwrap_or_else(|| tr("common-unknown"));
             println!("{} {} {}", "✓".green(), tr("cli-logged-in-as"), name.bold());
             println!("  {}", tr("cli-api-key-stored"));
@@ -1184,14 +1181,15 @@ fn parse_states_arg(raw: &str) -> Result<Value, String> {
         if part.is_empty() {
             continue;
         }
-        let mut pieces = part.splitn(2, ':');
-        let name = pieces.next().unwrap_or("").trim();
+        let (name, color) = part.split_once(':').unwrap_or((part, ""));
+        let name = name.trim();
         if name.is_empty() {
             continue;
         }
         let mut state = serde_json::Map::new();
         state.insert("name".into(), Value::String(name.to_string()));
-        if let Some(color) = pieces.next().map(str::trim).filter(|c| !c.is_empty()) {
+        let color = color.trim();
+        if !color.is_empty() {
             state.insert("color".into(), Value::String(color.to_string()));
         }
         states.push(Value::Object(state));
@@ -2283,8 +2281,7 @@ async fn run_keys(cmd: KeyCmd, as_json: bool) -> Result<(), String> {
                     let scopes = k
                         .scopes
                         .as_ref()
-                        .map(display_api_key_scopes)
-                        .unwrap_or_else(|| tr("label-all"));
+                        .map_or_else(|| tr("label-all"), display_api_key_scopes);
                     let label = k.name.clone().unwrap_or_else(|| tr("label-no-name"));
                     let last = k.last_used_at.clone().unwrap_or_else(|| tr("label-never"));
                     println!(
@@ -2509,7 +2506,7 @@ async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), St
 
     let content = if file == "-" {
         use tokio::io::AsyncReadExt;
-        let mut buffer = String::new();
+        let mut buffer = String::default();
         tokio::io::stdin()
             .read_to_string(&mut buffer)
             .await
@@ -2662,7 +2659,7 @@ async fn run_batch_json(file: &str, keep_going: bool) -> Result<(), String> {
 
     let content = if file == "-" {
         use tokio::io::AsyncReadExt;
-        let mut buffer = String::new();
+        let mut buffer = String::default();
         tokio::io::stdin()
             .read_to_string(&mut buffer)
             .await
@@ -2970,10 +2967,8 @@ async fn run_accept_terms(docs: Option<Vec<String>>, as_json: bool) -> Result<()
 
     let resp: Value = api.post("/accept-terms", &body).await?;
     if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&resp).unwrap_or_default()
-        );
+        let pretty = serde_json::to_string_pretty(&resp).unwrap_or_default();
+        println!("{pretty}");
         return Ok(());
     }
 
@@ -2981,8 +2976,7 @@ async fn run_accept_terms(docs: Option<Vec<String>>, as_json: bool) -> Result<()
         .get("legal")
         .and_then(|legal| legal.get("pending"))
         .and_then(Value::as_array)
-        .map(|pending| pending.len())
-        .unwrap_or(0);
+        .map_or(0, |pending| pending.len());
 
     if pending_count == 0 {
         println!("{} {}", "✓".green(), tr("cli-accepted-terms-all"));
@@ -3178,8 +3172,7 @@ fn run_config(as_json: bool) -> Result<(), String> {
     );
     let last_check = cfg
         .update_check_last()
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| tr("label-never"));
+        .map_or_else(|| tr("label-never"), |value| value.to_string());
     println!("{}    {}", tr("label-last-check"), last_check);
     Ok(())
 }

@@ -214,7 +214,7 @@ impl Config {
                 return Some(key);
             }
         }
-        Self::keychain_api_key().ok().flatten()
+        Self::keychain_api_key().unwrap_or_default()
     }
 
     pub fn set_api_key(&self, key: &str) -> Result<(), String> {

@@ -62,7 +62,7 @@ fn init_telemetry() -> Option<sentry::ClientInitGuard> {
                 auto_session_tracking: false,
                 traces_sample_rate: telemetry::traces_sample_rate(),
                 before_send: Some(std::sync::Arc::new(telemetry::scrub_event)),
-                ..Default::default()
+                ..sentry::ClientOptions::default()
             },
         ))
     })

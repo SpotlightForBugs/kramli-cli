@@ -341,7 +341,7 @@ fn parse_key_binding(raw: &str) -> Option<KeyBinding> {
 }
 
 fn key_binding_modifier_label(modifiers: KeyModifiers) -> String {
-    let mut label = String::new();
+    let mut label = String::default();
     if modifiers.contains(KeyModifiers::CONTROL) {
         label.push_str("C+");
     }
@@ -838,7 +838,7 @@ impl App {
             selected_item: 0,
             list_scroll: 0,
             item_scroll: 0,
-            item_filter: String::new(),
+            item_filter: String::default(),
             mode: ViewMode::List,
             focus: FocusPane::Lists,
             status: Some(tr("cli-interactive-beta-notice")),
@@ -1090,7 +1090,7 @@ impl App {
     fn apply_profile_result(&mut self, result: Result<Profile, String>) {
         if let Ok(profile) = result {
             let pending_docs = profile_pending_legal_docs(&profile);
-            self.legal_pending_docs = pending_docs.clone();
+            self.legal_pending_docs.clone_from(&pending_docs);
             self.legal_consent_pending = !pending_docs.is_empty();
             self.legal_accepting = false;
             self.profile_name = profile.display_name.or(profile.email);
@@ -1124,7 +1124,7 @@ impl App {
         match result {
             Ok(value) => {
                 let pending_docs = pending_legal_docs_from_value(&value);
-                self.legal_pending_docs = pending_docs.clone();
+                self.legal_pending_docs.clone_from(&pending_docs);
                 self.legal_consent_pending = !pending_docs.is_empty();
                 if self.legal_consent_pending {
                     self.status = Some(tr_args(
@@ -1152,14 +1152,12 @@ impl App {
 
     fn selected_list_name(&self) -> String {
         self.selected_list()
-            .map(|list| list.name.clone())
-            .unwrap_or_else(|| tr("common-unknown"))
+            .map_or_else(|| tr("common-unknown"), |list| list.name.clone())
     }
 
     fn selected_list_display_name(&self) -> String {
         self.selected_list()
-            .map(list_display_name_for_tui)
-            .unwrap_or_else(|| tr("common-unknown"))
+            .map_or_else(|| tr("common-unknown"), list_display_name_for_tui)
     }
 
     fn selected_item(&self) -> Option<&ListItem> {
@@ -1361,7 +1359,7 @@ impl App {
         };
 
         if let Some(cached) = self.items_cache.get(&list_id) {
-            self.items = cached.clone();
+            self.items.clone_from(cached);
             self.loading_items_for = None;
             self.apply_item_selection(previous_item_id);
             self.status = Some(format!(
@@ -1853,25 +1851,25 @@ impl App {
                 .map(format_iso_date)
                 .unwrap_or_default()
         } else {
-            String::new()
+            String::default()
         };
         self.editor = Some(EditorState {
             mode: EditorMode::Create,
             item_id: None,
-            text: String::new(),
-            quantity: String::new(),
+            text: String::default(),
+            quantity: String::default(),
             due_date,
-            due_time: String::new(),
-            planned_date: String::new(),
-            planned_time: String::new(),
-            reminder: String::new(),
-            reminder_time: String::new(),
-            reminder_offsets: String::new(),
-            travel_time_minutes: String::new(),
-            priority: String::new(),
-            tags: String::new(),
+            due_time: String::default(),
+            planned_date: String::default(),
+            planned_time: String::default(),
+            reminder: String::default(),
+            reminder_time: String::default(),
+            reminder_offsets: String::default(),
+            travel_time_minutes: String::default(),
+            priority: String::default(),
+            tags: String::default(),
             progress: self.default_progress_value(),
-            notes: String::new(),
+            notes: String::default(),
             active_field: EditorField::Text,
         });
         Ok(())
@@ -1885,20 +1883,20 @@ impl App {
         self.editor = Some(EditorState {
             mode: EditorMode::Comment,
             item_id: Some(item_id),
-            text: String::new(),
-            quantity: String::new(),
-            due_date: String::new(),
-            due_time: String::new(),
-            planned_date: String::new(),
-            planned_time: String::new(),
-            reminder: String::new(),
-            reminder_time: String::new(),
-            reminder_offsets: String::new(),
-            travel_time_minutes: String::new(),
-            priority: String::new(),
-            tags: String::new(),
-            progress: String::new(),
-            notes: String::new(),
+            text: String::default(),
+            quantity: String::default(),
+            due_date: String::default(),
+            due_time: String::default(),
+            planned_date: String::default(),
+            planned_time: String::default(),
+            reminder: String::default(),
+            reminder_time: String::default(),
+            reminder_offsets: String::default(),
+            travel_time_minutes: String::default(),
+            priority: String::default(),
+            tags: String::default(),
+            progress: String::default(),
+            notes: String::default(),
             active_field: EditorField::Text,
         });
         Ok(())
@@ -1909,19 +1907,19 @@ impl App {
             mode: EditorMode::Filter,
             item_id: None,
             text: self.item_filter.clone(),
-            quantity: String::new(),
-            due_date: String::new(),
-            due_time: String::new(),
-            planned_date: String::new(),
-            planned_time: String::new(),
-            reminder: String::new(),
-            reminder_time: String::new(),
-            reminder_offsets: String::new(),
-            travel_time_minutes: String::new(),
-            priority: String::new(),
-            tags: String::new(),
-            progress: String::new(),
-            notes: String::new(),
+            quantity: String::default(),
+            due_date: String::default(),
+            due_time: String::default(),
+            planned_date: String::default(),
+            planned_time: String::default(),
+            reminder: String::default(),
+            reminder_time: String::default(),
+            reminder_offsets: String::default(),
+            travel_time_minutes: String::default(),
+            priority: String::default(),
+            tags: String::default(),
+            progress: String::default(),
+            notes: String::default(),
             active_field: EditorField::Text,
         });
         Ok(())
@@ -3042,7 +3040,7 @@ impl App {
         let done_column = columns
             .iter()
             .position(|column| column.is_done)
-            .unwrap_or(columns.len().saturating_sub(1));
+            .unwrap_or_else(|| columns.len().saturating_sub(1));
 
         let visible_indices = self.visible_item_indices();
         for idx in visible_indices {
@@ -3141,7 +3139,7 @@ impl App {
     fn normalize_progress_input(&self, raw: &str) -> Option<String> {
         let value = raw.trim();
         if value.is_empty() {
-            return Some(String::new());
+            return Some(String::default());
         }
 
         self.progress_choices()
@@ -3475,7 +3473,7 @@ impl App {
                     let date = shifted_date(grid_start, (week * 7 + weekday) as i64);
                     let in_month = same_calendar_month(date, month);
                     let indexes: &[usize] = if in_month {
-                        dated.get(&date).map(Vec::as_slice).unwrap_or(&[])
+                        dated.get(&date).map_or(&[][..], Vec::as_slice)
                     } else {
                         &[]
                     };
@@ -3542,11 +3540,10 @@ impl App {
         }
 
         let month_title = format!("{:04}-{:02}", month.year, month.month);
-        let agenda_title = selected_date_in_month
-            .map(|date| format!("{} {}", tr("label-items"), format_iso_date(date)))
-            .unwrap_or_else(|| {
-                format!("{} {:04}-{:02}", tr("label-items"), month.year, month.month)
-            });
+        let agenda_title = selected_date_in_month.map_or_else(
+            || format!("{} {:04}-{:02}", tr("label-items"), month.year, month.month),
+            |date| format!("{} {}", tr("label-items"), format_iso_date(date)),
+        );
 
         CalendarLayout {
             title,
@@ -3909,7 +3906,7 @@ where
 
 fn fit_cell(value: &str, width: usize) -> String {
     if width == 0 {
-        return String::new();
+        return String::default();
     }
     let mut text: String = value.chars().take(width).collect();
     let len = text.chars().count();
@@ -4078,7 +4075,7 @@ fn push_calendar_agenda_items(
     if available == 0 {
         return;
     }
-    let visible_items = available.saturating_sub(1).max(1).min(indexes.len());
+    let visible_items = available.saturating_sub(1).clamp(1, indexes.len());
     for item_index in indexes.iter().copied().take(visible_items) {
         let marker = if item_index == selected_item {
             ">"
@@ -4173,7 +4170,7 @@ fn editor_bool_label(value: Option<bool>) -> String {
     match value {
         Some(true) => tr("label-on"),
         Some(false) => tr("label-off"),
-        None => String::new(),
+        None => String::default(),
     }
 }
 
@@ -4775,7 +4772,7 @@ fn draw_lists_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 &mut trailing_cells,
             )
         } else {
-            String::new()
+            String::default()
         };
         let open = (total - done).max(0);
         let marker = if idx == app.selected_list { ">" } else { " " };
@@ -5095,9 +5092,8 @@ fn draw_item_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             lines.push(Line::from(notes));
         }
         let comments = app.comments_cache.get(&item.id);
-        let comment_count = comments
-            .map(Vec::len)
-            .unwrap_or_else(|| item.comment_count.unwrap_or(0) as usize);
+        let comment_count =
+            comments.map_or_else(|| item.comment_count.unwrap_or(0) as usize, Vec::len);
         lines.push(Line::from(format!(
             "{} {}",
             tr("label-comments").trim_end_matches(':'),
@@ -5526,7 +5522,7 @@ fn draw_editor(frame: &mut Frame<'_>, editor: &EditorState) {
         layout.outer,
     );
 
-    let mut progress = String::new();
+    let mut progress = String::default();
     for (index, _) in fields.iter().enumerate() {
         if index > 0 {
             progress.push(' ');
@@ -5967,8 +5963,7 @@ fn profile_pending_legal_docs(profile: &Profile) -> Vec<String> {
     let pending = profile
         .legal
         .as_ref()
-        .map(|legal| legal.pending.as_slice())
-        .unwrap_or(&[]);
+        .map_or(&[][..], |legal| legal.pending.as_slice());
     for doc in pending {
         if let Some(key) = doc
             .key
@@ -5988,8 +5983,7 @@ fn pending_legal_docs_from_value(value: &Value) -> Vec<String> {
         .get("legal")
         .and_then(|legal| legal.get("pending"))
         .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
+        .map_or(&[][..], Vec::as_slice);
     for doc in pending {
         if let Some(key) = doc
             .get("key")
@@ -6164,7 +6158,7 @@ fn autocomplete_last_tag(raw: &str, suggestions: &[String], delta: isize) -> Opt
     let (prefix, tail) = if let Some((head, last)) = raw.rsplit_once(',') {
         (format!("{head},"), last)
     } else {
-        (String::new(), raw)
+        (String::default(), raw)
     };
 
     let leading_ws = tail.chars().take_while(|ch| ch.is_whitespace()).count();
@@ -6355,7 +6349,7 @@ fn kanban_column_at(chunks: &[Rect], x: u16, y: u16) -> Option<usize> {
 }
 
 fn item_row_text(item: &ListItem) -> String {
-    let mut out = String::new();
+    let mut out = String::default();
     let depth = item.depth.unwrap_or(0).max(0) as usize;
     if depth > 0 {
         out.push_str(&"  ".repeat(depth));
@@ -6443,7 +6437,7 @@ fn apply_item_depths(items: &mut [ListItem]) {
 }
 
 fn kanban_card_text(item: &ListItem) -> String {
-    let mut out = String::new();
+    let mut out = String::default();
     out.push_str(if item.is_done.unwrap_or(false) {
         "[x] "
     } else {
@@ -6581,8 +6575,7 @@ fn remove_html_block(raw: &str, tag_name: &str) -> String {
         out.push_str(&raw[index..start]);
         let after_open = lower[start..]
             .find('>')
-            .map(|offset| start + offset + 1)
-            .unwrap_or(raw.len());
+            .map_or(raw.len(), |offset| start + offset + 1);
         if let Some(relative_close) = lower[after_open..].find(&close) {
             index = after_open + relative_close + close.len();
         } else {
@@ -6739,7 +6732,7 @@ fn list_folder_sort_key(list: &ShoppingList) -> (u8, String) {
         return (0, format!("#{id:020}"));
     }
 
-    (1, String::new())
+    (1, String::default())
 }
 
 #[cfg(test)]
@@ -6864,15 +6857,16 @@ fn list_icon_for_tui(raw_icon: Option<&str>) -> String {
 
     if style == TuiIconStyle::Raw {
         let Some(raw_icon) = raw_icon.map(str::trim).filter(|value| !value.is_empty()) else {
-            return icon
-                .map(|icon| bootstrap_icon_for_tui(&format!("bi-{icon}"), style))
-                .unwrap_or_else(empty_icon_slot);
+            return icon.map_or_else(empty_icon_slot, |icon| {
+                bootstrap_icon_for_tui(&format!("bi-{icon}"), style)
+            });
         };
         return raw_icon.to_string();
     }
 
-    icon.map(|icon| bootstrap_icon_for_tui(&format!("bi-{icon}"), style))
-        .unwrap_or_else(empty_icon_slot)
+    icon.map_or_else(empty_icon_slot, |icon| {
+        bootstrap_icon_for_tui(&format!("bi-{icon}"), style)
+    })
 }
 
 fn list_icon_asset_name(raw_icon: Option<&str>) -> Option<String> {
@@ -6887,7 +6881,6 @@ enum TuiIconStyle {
 
 fn tui_icon_style() -> TuiIconStyle {
     match std::env::var("KRAMLI_ICON_STYLE")
-        .ok()
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
@@ -7192,8 +7185,7 @@ fn extract_html_image_source(notes: &str) -> Option<String> {
         let tag_start = search_start + relative_pos;
         let tag_end = lower[tag_start..]
             .find('>')
-            .map(|offset| tag_start + offset)
-            .unwrap_or(notes.len());
+            .map_or(notes.len(), |offset| tag_start + offset);
         let tag = &notes[tag_start..tag_end];
         if let Some(source) = html_attr_value(tag, "src")
             .or_else(|| html_attr_value(tag, "data-src"))
