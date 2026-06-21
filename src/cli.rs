@@ -608,6 +608,8 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    const TEST_KRAMLI_API_KEY_ENV: &str = "KRAMLI_API_KEY";
+
     #[test]
     fn list_update_and_batch_helpers_cover_branch_variants() {
         let body = update_list_body(
@@ -730,13 +732,19 @@ mod tests {
 
     #[tokio::test]
     async fn env_var_helper_restores_existing_values() {
-        std::env::set_var("KRAMLI_API_KEY", "before");
-        with_env_vars_async(&[("KRAMLI_API_KEY", "during")], || async {
-            assert_eq!(std::env::var("KRAMLI_API_KEY").as_deref(), Ok("during"));
+        std::env::set_var(TEST_KRAMLI_API_KEY_ENV, "before");
+        with_env_vars_async(&[(TEST_KRAMLI_API_KEY_ENV, "during")], || async {
+            assert_eq!(
+                std::env::var(TEST_KRAMLI_API_KEY_ENV).as_deref(),
+                Ok("during")
+            );
         })
         .await;
-        assert_eq!(std::env::var("KRAMLI_API_KEY").as_deref(), Ok("before"));
-        std::env::remove_var("KRAMLI_API_KEY");
+        assert_eq!(
+            std::env::var(TEST_KRAMLI_API_KEY_ENV).as_deref(),
+            Ok("before")
+        );
+        std::env::remove_var(TEST_KRAMLI_API_KEY_ENV);
     }
 
     #[tokio::test]
