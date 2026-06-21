@@ -769,8 +769,87 @@ mod tests {
     use std::time::Duration;
 
     use reqwest::Client;
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     use super::ApiClient;
+
+    struct TestResponse {
+        status: u16,
+        headers: Vec<(&'static str, &'static str)>,
+        body: Vec<u8>,
+    }
+
+    impl TestResponse {
+        fn json(value: Value) -> Self {
+            Self {
+                status: 200,
+                headers: vec![("Content-Type", "application/json")],
+                body: value.to_string().into_bytes(),
+            }
+        }
+
+        fn status(status: u16, body: impl Into<Vec<u8>>) -> Self {
+            Self {
+                status,
+                headers: Vec::new(),
+                body: body.into(),
+            }
+        }
+
+        fn bytes(body: impl Into<Vec<u8>>) -> Self {
+            Self {
+                status: 200,
+                headers: Vec::new(),
+                body: body.into(),
+            }
+        }
+    }
+
+    async fn api_with_responses(
+        responses: Vec<TestResponse>,
+    ) -> (ApiClient, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server address");
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.expect("accept request");
+                let mut buf = vec![0_u8; 8192];
+                let n = stream.read(&mut buf).await.expect("read request");
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                requests.push(request.lines().next().unwrap_or_default().to_string());
+
+                let reason = "OK";
+                let mut header = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    response.status,
+                    reason,
+                    response.body.len()
+                );
+                for (name, value) in response.headers {
+                    header.push_str(name);
+                    header.push_str(": ");
+                    header.push_str(value);
+                    header.push_str("\r\n");
+                }
+                header.push_str("\r\n");
+                stream
+                    .write_all(header.as_bytes())
+                    .await
+                    .expect("write response header");
+                stream
+                    .write_all(&response.body)
+                    .await
+                    .expect("write response body");
+            }
+            requests
+        });
+        (test_client(&format!("http://{addr}")), handle)
+    }
 
     #[test]
     fn allows_https() {
@@ -924,5 +1003,127 @@ mod tests {
             ApiClient::format_api_error_message(&[0xff, 0xfe]),
             "[2 bytes]"
         );
+    }
+
+    #[test]
+    fn private_resource_and_header_helpers_cover_edge_branches() {
+        let client = test_client("https://kramli.de:8443");
+
+        assert_eq!(
+            client.resource_url("https://cdn.example.com/a.png"),
+            "https://cdn.example.com/a.png"
+        );
+        assert!(!client.is_same_origin("not a url"));
+        assert!(!test_client("not a base").is_same_origin("https://kramli.de/a.png"));
+        assert!(client.headers().contains_key("X-API-Key"));
+        assert!(ApiClient::language_headers().contains_key(reqwest::header::ACCEPT_LANGUAGE));
+
+        assert!(!ApiClient::public_resource_host_allowed(""));
+        assert!(!ApiClient::public_resource_host_allowed("0.1.2.3"));
+        assert!(!ApiClient::public_resource_host_allowed("100.64.0.1"));
+        assert!(!ApiClient::public_resource_host_allowed("198.18.0.1"));
+        assert!(!ApiClient::public_resource_host_allowed("192.0.0.1"));
+        assert!(!ApiClient::public_resource_host_allowed("240.0.0.1"));
+        assert!(!ApiClient::public_resource_host_allowed("ff02::1"));
+        assert!(!ApiClient::public_resource_host_allowed("fe80::1"));
+        assert!(!ApiClient::public_resource_host_allowed("2001:db8::1"));
+        assert!(ApiClient::public_resource_host_allowed("example.com"));
+    }
+
+    #[test]
+    fn error_extraction_and_truncation_cover_fallbacks() {
+        assert_eq!(
+            ApiClient::format_api_error_message(br#"{"title":"Nope"}"#),
+            "Nope"
+        );
+        assert_eq!(
+            ApiClient::format_api_error_message(br#"{"description":"Nope again"}"#),
+            "Nope again"
+        );
+        assert_eq!(
+            ApiClient::format_api_error_message(br#"{"errors":["first",{"error":"second"},3]}"#),
+            "first; second"
+        );
+        assert_eq!(
+            ApiClient::format_api_error_message(br#"{"unknown":true}"#),
+            "{\"unknown\":true}"
+        );
+        assert_eq!(
+            ApiClient::extract_json_error_message(&json!({"errors": [3]})),
+            None
+        );
+        assert!(ApiClient::truncate_error_message(&"x".repeat(600)).ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn api_request_helpers_cover_success_and_error_paths() {
+        let (api, server) = api_with_responses(vec![
+            TestResponse::json(json!({"ok": true})),
+            TestResponse::json(json!({"query": true})),
+            TestResponse::json(json!({"posted": true})),
+            TestResponse::json(json!({"put": true})),
+            TestResponse::json(json!({"patched": true})),
+            TestResponse::json(json!({"deleted": true})),
+            TestResponse::status(204, Vec::new()),
+            TestResponse::status(400, br#"{"error":"bad delete"}"#.to_vec()),
+            TestResponse::status(500, b"server down".to_vec()),
+        ])
+        .await;
+
+        let got: Value = api.get("/ok").await.unwrap();
+        assert_eq!(got["ok"], true);
+        let queried: Value = api.get_query("/search", &[("q", "milk")]).await.unwrap();
+        assert_eq!(queried["query"], true);
+        let posted: Value = api.post("/items", &json!({"text": "Milk"})).await.unwrap();
+        assert_eq!(posted["posted"], true);
+        let put: Value = api.put("/items/1", &json!({"text": "Eggs"})).await.unwrap();
+        assert_eq!(put["put"], true);
+        let patched: Value = api.patch_json("/items/1/done", &json!({})).await.unwrap();
+        assert_eq!(patched["patched"], true);
+        let deleted: Value = api.delete("/items/1").await.unwrap();
+        assert_eq!(deleted["deleted"], true);
+        assert!(api.delete_ok("/items/1").await.unwrap());
+        assert!(api.delete_ok("/items/2").await.is_err());
+        assert!(api.get::<Value>("/fail").await.is_err());
+
+        let requests = server.await.expect("server finished");
+        assert_eq!(requests[0], "GET /api/ok HTTP/1.1");
+        assert!(requests[1].starts_with("GET /api/search?"));
+        assert_eq!(requests[2], "POST /api/items HTTP/1.1");
+        assert_eq!(requests[3], "PUT /api/items/1 HTTP/1.1");
+        assert_eq!(requests[4], "PATCH /api/items/1/done HTTP/1.1");
+        assert_eq!(requests[5], "DELETE /api/items/1 HTTP/1.1");
+        assert_eq!(requests[6], "DELETE /api/items/1 HTTP/1.1");
+        assert_eq!(requests[7], "DELETE /api/items/2 HTTP/1.1");
+        assert_eq!(requests[8], "GET /api/fail HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn resource_fetching_covers_same_public_external_and_error_paths() {
+        let (api, server) = api_with_responses(vec![
+            TestResponse::bytes(b"same".to_vec()),
+            TestResponse::bytes(b"public".to_vec()),
+            TestResponse::status(404, b"missing".to_vec()),
+        ])
+        .await;
+        let base_url = api.base_url_for_tests().to_string();
+
+        assert_eq!(api.get_bytes("/asset.png").await.unwrap(), b"same".to_vec());
+        assert_eq!(
+            api.get_bytes(&format!("{base_url}/external.png"))
+                .await
+                .unwrap(),
+            b"public".to_vec()
+        );
+        assert!(api
+            .get_bytes("http://example.com/insecure.png")
+            .await
+            .is_err());
+        assert!(api.get_bytes("/missing.png").await.is_err());
+
+        let requests = server.await.expect("server finished");
+        assert_eq!(requests[0], "GET /asset.png HTTP/1.1");
+        assert_eq!(requests[1], "GET /external.png HTTP/1.1");
+        assert_eq!(requests[2], "GET /missing.png HTTP/1.1");
     }
 }

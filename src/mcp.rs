@@ -780,6 +780,16 @@ mod tests {
             .as_array()
             .is_some_and(|tools| tools.len() >= 6));
 
+        let tool_without_credentials = handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "list_lists"}
+        }))
+        .await
+        .expect("tools/call error response");
+        assert_eq!(tool_without_credentials["error"]["code"], -32603);
+
         let unknown = handle_message(json!({"jsonrpc": "2.0", "id": 4, "method": "custom"}))
             .await
             .expect("unknown response");
@@ -1051,13 +1061,13 @@ mod tests {
     #[test]
     fn response_helpers_shape_json_rpc_and_tool_results() {
         let tool = tool_result(json!({"ok": true}), false);
-        assert_eq!(tool["isError"], false);
+        assert!(!tool["isError"].as_bool().unwrap_or(true));
         assert!(tool["content"][0]["text"]
             .as_str()
             .is_some_and(|text| text.contains("ok")));
 
         let text = tool_text_result("failed".to_string(), true);
-        assert_eq!(text["isError"], true);
+        assert!(text["isError"].as_bool().unwrap_or(false));
         assert_eq!(text["content"][0]["text"], "failed");
 
         let err = error_response(Value::from(9), -1, "nope");

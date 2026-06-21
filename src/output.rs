@@ -1623,6 +1623,15 @@ mod tests {
             crate::i18n::tr("common-unknown")
         );
 
+        let named_without_folder = ShoppingList {
+            folder_name: None,
+            ..sample_list(5, "Named")
+        };
+        assert_eq!(
+            list_display_name_with_folder(&named_without_folder),
+            "Named"
+        );
+
         let folder = Folder {
             id: 3,
             name: "Leaf".to_string(),
