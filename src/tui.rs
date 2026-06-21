@@ -93,6 +93,51 @@ enum FocusPane {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NavigationAction {
+    NextMode,
+    PreviousMode,
+    SwitchMode(ViewMode),
+    MoveMonth(i32),
+    MoveHorizontal { delta: i64, fallback: FocusPane },
+    MoveSelection(isize),
+    Enter,
+    Escape,
+    Help,
+    EdgeItem(bool),
+    Ignore,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MouseButtons {
+    left_down: bool,
+    left_drag: bool,
+    left_up: bool,
+}
+
+impl MouseButtons {
+    fn from_kind(kind: MouseEventKind) -> Option<Self> {
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) => Some(Self {
+                left_down: true,
+                left_drag: false,
+                left_up: false,
+            }),
+            MouseEventKind::Drag(MouseButton::Left) => Some(Self {
+                left_down: false,
+                left_drag: true,
+                left_up: false,
+            }),
+            MouseEventKind::Up(MouseButton::Left) => Some(Self {
+                left_down: false,
+                left_drag: false,
+                left_up: true,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FooterAction {
     Add,
     Refresh,
@@ -754,6 +799,34 @@ impl Drop for TerminalCleanupGuard {
 fn is_global_quit_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn navigation_action_for_key(code: KeyCode) -> NavigationAction {
+    match code {
+        KeyCode::Tab => NavigationAction::NextMode,
+        KeyCode::BackTab => NavigationAction::PreviousMode,
+        KeyCode::Char('1') => NavigationAction::SwitchMode(ViewMode::List),
+        KeyCode::Char('2') => NavigationAction::SwitchMode(ViewMode::Kanban),
+        KeyCode::Char('3') => NavigationAction::SwitchMode(ViewMode::Calendar),
+        KeyCode::PageUp | KeyCode::Char('[') => NavigationAction::MoveMonth(-1),
+        KeyCode::PageDown | KeyCode::Char(']') => NavigationAction::MoveMonth(1),
+        KeyCode::Left => NavigationAction::MoveHorizontal {
+            delta: -1,
+            fallback: FocusPane::Lists,
+        },
+        KeyCode::Right => NavigationAction::MoveHorizontal {
+            delta: 1,
+            fallback: FocusPane::Items,
+        },
+        KeyCode::Up => NavigationAction::MoveSelection(-1),
+        KeyCode::Down => NavigationAction::MoveSelection(1),
+        KeyCode::Enter => NavigationAction::Enter,
+        KeyCode::Esc => NavigationAction::Escape,
+        KeyCode::Char('?') | KeyCode::F(1) => NavigationAction::Help,
+        KeyCode::Home => NavigationAction::EdgeItem(true),
+        KeyCode::End => NavigationAction::EdgeItem(false),
+        _ => NavigationAction::Ignore,
+    }
 }
 
 async fn run_event_loop(
@@ -2318,54 +2391,25 @@ impl App {
         let mut list_changed = false;
         let mut item_changed = false;
 
-        match key.code {
-            KeyCode::Tab => {
-                self.switch_mode(self.mode.next());
+        match navigation_action_for_key(key.code) {
+            NavigationAction::NextMode => self.switch_mode(self.mode.next()),
+            NavigationAction::PreviousMode => self.switch_mode(self.mode.prev()),
+            NavigationAction::SwitchMode(mode) => self.switch_mode(mode),
+            NavigationAction::MoveMonth(delta) => self.move_month_if_calendar_items(delta),
+            NavigationAction::MoveHorizontal { delta, fallback } => {
+                self.move_horizontal_or_focus(delta, fallback);
             }
-            KeyCode::BackTab => {
-                self.switch_mode(self.mode.prev());
+            NavigationAction::MoveSelection(delta) => {
+                self.move_selection_by_key(key, delta, &mut list_changed, &mut item_changed)
+                    .await?;
             }
-            KeyCode::Char('1') => self.switch_mode(ViewMode::List),
-            KeyCode::Char('2') => self.switch_mode(ViewMode::Kanban),
-            KeyCode::Char('3') => self.switch_mode(ViewMode::Calendar),
-            KeyCode::PageUp | KeyCode::Char('[') => {
-                if self.mode == ViewMode::Calendar && self.focus == FocusPane::Items {
-                    self.move_calendar_month_selection(-1);
-                }
+            NavigationAction::Enter => list_changed = self.handle_enter_key(key)?,
+            NavigationAction::Escape => self.handle_escape_key(),
+            NavigationAction::Help => self.show_help = true,
+            NavigationAction::EdgeItem(first) => {
+                item_changed = self.select_visible_edge_item(first)
             }
-            KeyCode::PageDown | KeyCode::Char(']') => {
-                if self.mode == ViewMode::Calendar && self.focus == FocusPane::Items {
-                    self.move_calendar_month_selection(1);
-                }
-            }
-            KeyCode::Left => {
-                if self.mode == ViewMode::Calendar && self.focus == FocusPane::Items {
-                    self.move_calendar_date_selection(-1);
-                } else {
-                    self.focus = FocusPane::Lists;
-                }
-            }
-            KeyCode::Right => {
-                if self.mode == ViewMode::Calendar && self.focus == FocusPane::Items {
-                    self.move_calendar_date_selection(1);
-                } else {
-                    self.focus = FocusPane::Items;
-                }
-            }
-            KeyCode::Up => {
-                self.move_selection_by_key(key, -1, &mut list_changed, &mut item_changed)
-                    .await?
-            }
-            KeyCode::Down => {
-                self.move_selection_by_key(key, 1, &mut list_changed, &mut item_changed)
-                    .await?
-            }
-            KeyCode::Enter => list_changed = self.handle_enter_key(key)?,
-            KeyCode::Esc => self.handle_escape_key(),
-            KeyCode::Char('?') | KeyCode::F(1) => self.show_help = true,
-            KeyCode::Home => item_changed = self.select_visible_edge_item(true),
-            KeyCode::End => item_changed = self.select_visible_edge_item(false),
-            _ => {}
+            NavigationAction::Ignore => {}
         }
 
         Ok((list_changed, item_changed))
@@ -2377,6 +2421,20 @@ impl App {
         self.clear_calendar_drag_state();
         if self.mode == ViewMode::Calendar {
             self.sync_calendar_date_to_selected_item();
+        }
+    }
+
+    fn move_month_if_calendar_items(&mut self, delta: i32) {
+        if self.mode == ViewMode::Calendar && self.focus == FocusPane::Items {
+            self.move_calendar_month_selection(delta);
+        }
+    }
+
+    fn move_horizontal_or_focus(&mut self, delta: i64, fallback: FocusPane) {
+        if self.mode == ViewMode::Calendar && self.focus == FocusPane::Items {
+            self.move_calendar_date_selection(delta);
+        } else {
+            self.focus = fallback;
         }
     }
 
@@ -2641,142 +2699,51 @@ impl App {
     }
 
     async fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> Result<(), String> {
-        if self.show_help {
-            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                self.show_help = false;
-            }
+        if self.handle_help_mouse(mouse) {
             return Ok(());
         }
 
-        let left_down = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left));
-        let left_drag = matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left));
-        let left_up = matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left));
-
-        match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                if self.focus == FocusPane::Items && self.mode == ViewMode::Calendar {
-                    self.move_calendar_month_selection(-1);
-                    return Ok(());
-                }
-                if self.focus == FocusPane::Items
-                    && self.mode == ViewMode::Kanban
-                    && mouse.modifiers.contains(KeyModifiers::SHIFT)
-                {
-                    let _ = self.move_kanban_column_selection(-1);
-                    return Ok(());
-                }
-                self.scroll_active(-3);
-                return Ok(());
-            }
-            MouseEventKind::ScrollDown => {
-                if self.focus == FocusPane::Items && self.mode == ViewMode::Calendar {
-                    self.move_calendar_month_selection(1);
-                    return Ok(());
-                }
-                if self.focus == FocusPane::Items
-                    && self.mode == ViewMode::Kanban
-                    && mouse.modifiers.contains(KeyModifiers::SHIFT)
-                {
-                    let _ = self.move_kanban_column_selection(1);
-                    return Ok(());
-                }
-                self.scroll_active(3);
-                return Ok(());
-            }
-            MouseEventKind::Down(MouseButton::Left)
-            | MouseEventKind::Drag(MouseButton::Left)
-            | MouseEventKind::Up(MouseButton::Left) => {}
-            _ => return Ok(()),
+        if self.handle_mouse_scroll(mouse) {
+            return Ok(());
         }
 
+        let Some(buttons) = MouseButtons::from_kind(mouse.kind) else {
+            return Ok(());
+        };
         let previous_item = self.selected_item;
-
         let layout = ui_layout(area);
 
-        if left_up && !rect_contains(layout.content, mouse.column, mouse.row) {
+        if buttons.left_up && !rect_contains(layout.content, mouse.column, mouse.row) {
             self.clear_drag_state();
         }
 
-        for (idx, rect) in layout.tab_chunks.iter().enumerate() {
-            if left_down && rect_contains(*rect, mouse.column, mouse.row) {
-                self.mode = match idx {
-                    0 => ViewMode::List,
-                    1 => ViewMode::Kanban,
-                    _ => ViewMode::Calendar,
-                };
-                self.clear_drag_state();
-                return Ok(());
-            }
+        if self.handle_tab_mouse(mouse, &layout, buttons.left_down) {
+            return Ok(());
         }
-
-        for (action, rect) in footer_buttons(layout.footer, &self.key_bindings) {
-            if left_down && rect_contains(rect, mouse.column, mouse.row) {
-                self.trigger_footer_action(action).await?;
-                return Ok(());
-            }
-        }
-
-        let list_rows_area = item_rows_area(list_panel_rows_area(layout.lists));
-        if left_down && rect_contains(list_rows_area, mouse.column, mouse.row) {
-            self.focus = FocusPane::Lists;
-            let panel_rows = list_panel_rows(&self.lists);
-            let row = self.list_scroll + mouse.row.saturating_sub(list_rows_area.y) as usize;
-            if let Some(list_index) = panel_rows.get(row).and_then(|row| row.list_index) {
-                self.selected_list = list_index;
-                self.calendar_selected_date = None;
-                self.calendar_visible_month = None;
-                self.reload_items();
-                self.send_auto_handoff_viewing_background();
-                self.focus = FocusPane::Items;
-            }
-            self.clear_drag_state();
+        if self
+            .handle_footer_mouse(mouse, layout.footer, buttons.left_down)
+            .await?
+        {
             return Ok(());
         }
 
-        if rect_contains(layout.lists, mouse.column, mouse.row) {
-            if left_up {
-                self.clear_drag_state();
-            }
+        if self.handle_list_panel_mouse(mouse, layout.lists, buttons.left_down) {
             return Ok(());
         }
 
-        if !rect_contains(layout.content, mouse.column, mouse.row) {
-            if left_up {
-                self.clear_drag_state();
-            }
+        if self.handle_non_content_mouse(mouse, &layout, buttons.left_up) {
             return Ok(());
         }
 
         self.focus = FocusPane::Items;
-        if self.items.is_empty() {
-            if left_up {
-                self.clear_drag_state();
-            }
-            self.status = Some(item_placeholder(self));
+        if self.handle_empty_items_mouse(buttons.left_up) {
             return Ok(());
         }
 
-        match self.mode {
-            ViewMode::List => {
-                self.handle_list_mode_mouse(mouse, layout.content, left_down)?;
-            }
-            ViewMode::Kanban => {
-                self.handle_kanban_mode_mouse(mouse, layout.content, left_down, left_drag, left_up)
-                    .await?;
-            }
-            ViewMode::Calendar => {
-                self.handle_calendar_mode_mouse(
-                    mouse,
-                    layout.content,
-                    left_down,
-                    left_drag,
-                    left_up,
-                )
-                .await?;
-            }
-        }
+        self.handle_mode_mouse(mouse, layout.content, buttons)
+            .await?;
 
-        if left_up {
+        if buttons.left_up {
             self.clear_drag_state();
         }
 
@@ -2786,6 +2753,167 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn handle_help_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if !self.show_help {
+            return false;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.show_help = false;
+        }
+        true
+    }
+
+    fn handle_mouse_scroll(&mut self, mouse: MouseEvent) -> bool {
+        let delta = match mouse.kind {
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::ScrollDown => 1,
+            _ => return false,
+        };
+        self.apply_mouse_scroll(delta, mouse.modifiers);
+        true
+    }
+
+    fn apply_mouse_scroll(&mut self, delta: i32, modifiers: KeyModifiers) {
+        if self.focus == FocusPane::Items && self.mode == ViewMode::Calendar {
+            self.move_calendar_month_selection(delta);
+        } else if self.focus == FocusPane::Items
+            && self.mode == ViewMode::Kanban
+            && modifiers.contains(KeyModifiers::SHIFT)
+        {
+            let _ = self.move_kanban_column_selection(delta as isize);
+        } else {
+            self.scroll_active((delta * 3) as isize);
+        }
+    }
+
+    fn handle_tab_mouse(&mut self, mouse: MouseEvent, layout: &UiLayout, left_down: bool) -> bool {
+        if !left_down {
+            return false;
+        }
+        let Some(idx) = layout
+            .tab_chunks
+            .iter()
+            .position(|rect| rect_contains(*rect, mouse.column, mouse.row))
+        else {
+            return false;
+        };
+
+        self.mode = match idx {
+            0 => ViewMode::List,
+            1 => ViewMode::Kanban,
+            _ => ViewMode::Calendar,
+        };
+        self.clear_drag_state();
+        true
+    }
+
+    async fn handle_footer_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        footer: Rect,
+        left_down: bool,
+    ) -> Result<bool, String> {
+        if !left_down {
+            return Ok(false);
+        }
+        let Some(action) = footer_buttons(footer, &self.key_bindings)
+            .into_iter()
+            .find_map(|(action, rect)| {
+                rect_contains(rect, mouse.column, mouse.row).then_some(action)
+            })
+        else {
+            return Ok(false);
+        };
+
+        self.trigger_footer_action(action).await?;
+        Ok(true)
+    }
+
+    fn handle_list_panel_mouse(&mut self, mouse: MouseEvent, lists: Rect, left_down: bool) -> bool {
+        let list_rows_area = item_rows_area(list_panel_rows_area(lists));
+        if left_down && rect_contains(list_rows_area, mouse.column, mouse.row) {
+            self.select_list_panel_row(mouse, list_rows_area);
+            self.clear_drag_state();
+            return true;
+        }
+        false
+    }
+
+    fn select_list_panel_row(&mut self, mouse: MouseEvent, list_rows_area: Rect) {
+        self.focus = FocusPane::Lists;
+        let panel_rows = list_panel_rows(&self.lists);
+        let row = self.list_scroll + mouse.row.saturating_sub(list_rows_area.y) as usize;
+        let Some(list_index) = panel_rows.get(row).and_then(|row| row.list_index) else {
+            return;
+        };
+
+        self.selected_list = list_index;
+        self.calendar_selected_date = None;
+        self.calendar_visible_month = None;
+        self.reload_items();
+        self.send_auto_handoff_viewing_background();
+        self.focus = FocusPane::Items;
+    }
+
+    fn handle_non_content_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        layout: &UiLayout,
+        left_up: bool,
+    ) -> bool {
+        let in_lists = rect_contains(layout.lists, mouse.column, mouse.row);
+        let in_content = rect_contains(layout.content, mouse.column, mouse.row);
+        if !in_lists && in_content {
+            return false;
+        }
+        if left_up {
+            self.clear_drag_state();
+        }
+        true
+    }
+
+    fn handle_empty_items_mouse(&mut self, left_up: bool) -> bool {
+        if !self.items.is_empty() {
+            return false;
+        }
+        if left_up {
+            self.clear_drag_state();
+        }
+        self.status = Some(item_placeholder(self));
+        true
+    }
+
+    async fn handle_mode_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        content: Rect,
+        buttons: MouseButtons,
+    ) -> Result<(), String> {
+        match self.mode {
+            ViewMode::List => self.handle_list_mode_mouse(mouse, content, buttons.left_down),
+            ViewMode::Kanban => {
+                self.handle_kanban_mode_mouse(
+                    mouse,
+                    content,
+                    buttons.left_down,
+                    buttons.left_drag,
+                    buttons.left_up,
+                )
+                .await
+            }
+            ViewMode::Calendar => {
+                self.handle_calendar_mode_mouse(
+                    mouse,
+                    content,
+                    buttons.left_down,
+                    buttons.left_drag,
+                    buttons.left_up,
+                )
+                .await
+            }
+        }
     }
 
     fn handle_list_mode_mouse(

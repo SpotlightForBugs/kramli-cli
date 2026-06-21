@@ -570,6 +570,43 @@ struct ScheduleLine {
     value: String,
 }
 
+struct ItemStatusParts {
+    check: String,
+    priority: String,
+}
+
+struct ItemComments<'a> {
+    comments: &'a [ItemComment],
+}
+
+impl<'a> ItemComments<'a> {
+    fn print(self) {
+        if self.comments.is_empty() {
+            return;
+        }
+
+        println!();
+        println!(
+            "  {} ({})",
+            tr("label-comments").bold(),
+            self.comments.len()
+        );
+        for comment in self.comments {
+            let who = comment
+                .user_name
+                .as_deref()
+                .or(comment.user_email.as_deref())
+                .unwrap_or("?");
+            let text = comment.text.as_deref().unwrap_or("");
+            let when = comment
+                .created_at
+                .as_deref()
+                .map_or("", |s| &s[..s.len().min(16)]);
+            println!("    {}  {}  {text}", when.dimmed(), who.bold());
+        }
+    }
+}
+
 fn schedule_lines(item: &ListItem) -> Vec<ScheduleLine> {
     let mut lines = Vec::new();
 
@@ -634,113 +671,156 @@ fn schedule_lines(item: &ListItem) -> Vec<ScheduleLine> {
     lines
 }
 
-/// Print detailed information for a single item and its comments.
-pub(crate) fn print_item_detail(item: &ListItem, comments: &[ItemComment]) {
+fn item_status_parts(item: &ListItem) -> ItemStatusParts {
     let check = if item.is_done.unwrap_or(false) {
         "✓".green().to_string()
     } else {
         "○".to_string()
     };
-    let pri = match item.priority.as_deref() {
+    let priority = match item.priority.as_deref() {
         Some("high") => " !!!".red().to_string(),
         Some("medium") => " !!".yellow().to_string(),
         Some("low") => " !".dimmed().to_string(),
         _ => String::default(),
     };
+    ItemStatusParts { check, priority }
+}
+
+fn print_item_quantity(item: &ListItem) {
+    if let Some(quantity) = item.quantity.as_deref().filter(|value| !value.is_empty()) {
+        println!("  {}  {quantity}", tr("label-quantity").dimmed());
+    }
+}
+
+fn print_item_schedule(item: &ListItem) {
+    for line in schedule_lines(item) {
+        println!("  {}  {}", tr(line.label_key).dimmed(), line.value);
+    }
+}
+
+fn print_item_progress(item: &ListItem) {
+    if let Some(progress) = item.progress.as_deref() {
+        println!("  {}  {progress}", tr("label-state").dimmed());
+    }
+}
+
+fn print_item_color(item: &ListItem) {
+    if let Some(color) = item.color.as_deref() {
+        let dot = color_dot(Some(color));
+        println!("  {}  {color}{dot}", tr("label-color").dimmed());
+    }
+}
+
+fn print_item_tags(item: &ListItem) {
+    let Some(tags) = item.tags.as_ref().filter(|tags| !tags.is_empty()) else {
+        return;
+    };
+    let tags: Vec<String> = tags
+        .iter()
+        .map(|tag| format!("#{tag}").cyan().to_string())
+        .collect();
+    println!("  {}  {}", tr("label-tags").dimmed(), tags.join("  "));
+}
+
+fn print_item_assignees(item: &ListItem) {
+    let Some(assigned) = item
+        .assigned_to
+        .as_ref()
+        .filter(|assigned| !assigned.is_empty())
+    else {
+        return;
+    };
+    let ids: Vec<String> = assigned.iter().map(|id| id.to_string()).collect();
+    println!("  {}  {}", tr("label-assigned").dimmed(), ids.join(", "));
+}
+
+fn print_item_notes(item: &ListItem) {
+    let Some(notes) = item.notes.as_deref() else {
+        return;
+    };
+    let plain = strip_html(notes);
+    if plain.trim().is_empty() {
+        return;
+    }
+
+    println!("  {}", tr("label-notes").magenta());
+    for line in plain.lines() {
+        println!("    {line}");
+    }
+}
+
+fn print_item_tldr(item: &ListItem) {
+    if let Some(tldr) = item.tldr.as_deref().filter(|value| !value.is_empty()) {
+        println!("  {}  {tldr}", tr("label-tldr").blue());
+    }
+}
+
+fn print_item_image(item: &ListItem) {
+    if let Some(url) = item.image_url.as_deref() {
+        println!("  {}  {url}", tr("label-image").dimmed());
+    }
+}
+
+fn print_item_attachments(item: &ListItem) {
+    let Some(attachments) = item
+        .attachments
+        .as_ref()
+        .filter(|attachments| !attachments.is_empty())
+    else {
+        return;
+    };
+
     println!(
-        "{check} {}{pri}  {}",
+        "  {} ({})",
+        tr("label-attachments").dimmed(),
+        attachments.len()
+    );
+    for attachment in attachments {
+        let name = attachment
+            .original_filename
+            .as_deref()
+            .or(attachment.filename.as_deref())
+            .unwrap_or("?");
+        let size = attachment
+            .file_size
+            .map_or_else(String::default, human_size);
+        let url = attachment.url.as_deref().unwrap_or("");
+        println!("    • {name}  {size}  {}", url.dimmed());
+    }
+}
+
+fn print_item_timestamps(item: &ListItem) {
+    if let Some(created) = item.created_at.as_deref() {
+        let display = &created[..created.len().min(16)];
+        println!("  {}  {display}", tr("label-created").dimmed());
+    }
+    if let Some(updated) = item.updated_at.as_deref() {
+        let display = &updated[..updated.len().min(16)];
+        println!("  {}  {display}", tr("label-updated").dimmed());
+    }
+}
+
+/// Print detailed information for a single item and its comments.
+pub(crate) fn print_item_detail(item: &ListItem, comments: &[ItemComment]) {
+    let ItemStatusParts { check, priority } = item_status_parts(item);
+    println!(
+        "{check} {}{priority}  {}",
         item.text.bold(),
         format!("(#{})", item.id).dimmed()
     );
 
-    if let Some(ref q) = item.quantity {
-        if !q.is_empty() {
-            println!("  {}  {q}", tr("label-quantity").dimmed());
-        }
-    }
-    for line in schedule_lines(item) {
-        println!("  {}  {}", tr(line.label_key).dimmed(), line.value);
-    }
-    if let Some(ref p) = item.progress {
-        println!("  {}  {p}", tr("label-state").dimmed());
-    }
-    if let Some(ref c) = item.color {
-        let dot = color_dot(Some(c));
-        println!("  {}  {c}{dot}", tr("label-color").dimmed());
-    }
-    if let Some(ref tags) = item.tags {
-        if !tags.is_empty() {
-            let t: Vec<String> = tags
-                .iter()
-                .map(|t| format!("#{t}").cyan().to_string())
-                .collect();
-            println!("  {}  {}", tr("label-tags").dimmed(), t.join("  "));
-        }
-    }
-    if let Some(ref assigned) = item.assigned_to {
-        if !assigned.is_empty() {
-            let ids: Vec<String> = assigned.iter().map(|id| id.to_string()).collect();
-            println!("  {}  {}", tr("label-assigned").dimmed(), ids.join(", "));
-        }
-    }
-    if let Some(ref notes) = item.notes {
-        let plain = strip_html(notes);
-        if !plain.trim().is_empty() {
-            println!("  {}", tr("label-notes").magenta());
-            for line in plain.lines() {
-                println!("    {line}");
-            }
-        }
-    }
-    if let Some(ref tldr) = item.tldr {
-        if !tldr.is_empty() {
-            println!("  {}  {tldr}", tr("label-tldr").blue());
-        }
-    }
-    if let Some(ref url) = item.image_url {
-        println!("  {}  {url}", tr("label-image").dimmed());
-    }
-    if let Some(ref atts) = item.attachments {
-        if !atts.is_empty() {
-            println!("  {} ({})", tr("label-attachments").dimmed(), atts.len());
-            for a in atts {
-                let name = a
-                    .original_filename
-                    .as_deref()
-                    .or(a.filename.as_deref())
-                    .unwrap_or("?");
-                let size = a.file_size.map_or_else(String::default, human_size);
-                let url = a.url.as_deref().unwrap_or("");
-                println!("    • {name}  {size}  {}", url.dimmed());
-            }
-        }
-    }
-    if let Some(ref created) = item.created_at {
-        let display = &created[..created.len().min(16)];
-        println!("  {}  {display}", tr("label-created").dimmed());
-    }
-    if let Some(ref updated) = item.updated_at {
-        let display = &updated[..updated.len().min(16)];
-        println!("  {}  {display}", tr("label-updated").dimmed());
-    }
-    // Comments
-    if !comments.is_empty() {
-        println!();
-        println!("  {} ({})", tr("label-comments").bold(), comments.len());
-        for c in comments {
-            let who = c
-                .user_name
-                .as_deref()
-                .or(c.user_email.as_deref())
-                .unwrap_or("?");
-            let text = c.text.as_deref().unwrap_or("");
-            let when = c
-                .created_at
-                .as_deref()
-                .map_or("", |s| &s[..s.len().min(16)]);
-            println!("    {}  {}  {text}", when.dimmed(), who.bold());
-        }
-    }
+    print_item_quantity(item);
+    print_item_schedule(item);
+    print_item_progress(item);
+    print_item_color(item);
+    print_item_tags(item);
+    print_item_assignees(item);
+    print_item_notes(item);
+    print_item_tldr(item);
+    print_item_image(item);
+    print_item_attachments(item);
+    print_item_timestamps(item);
+    ItemComments { comments }.print();
     println!();
 }
 
