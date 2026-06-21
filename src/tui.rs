@@ -250,12 +250,17 @@ struct KeyBindings {
 
 impl KeyBindings {
     fn from_env() -> Self {
+        Self::from_sources(|action| std::env::var(action.key_env_name()).ok())
+    }
+
+    fn from_sources(mut source: impl FnMut(FooterAction) -> Option<String>) -> Self {
         let mut bindings = default_key_bindings();
         for (action, binding) in &mut bindings {
-            if let Ok(raw) = std::env::var(action.key_env_name()) {
-                if let Some(parsed) = parse_key_binding(&raw) {
-                    *binding = parsed;
-                }
+            let Some(raw) = source(*action) else {
+                continue;
+            };
+            if let Some(parsed) = parse_key_binding(&raw) {
+                *binding = parsed;
             }
         }
         Self { bindings }
@@ -8051,6 +8056,108 @@ mod tests {
         );
     }
 
+    #[test]
+    fn view_modes_and_key_binding_sources_cover_branch_variants() {
+        assert_eq!(ViewMode::List.next(), ViewMode::Kanban);
+        assert_eq!(ViewMode::Kanban.next(), ViewMode::Calendar);
+        assert_eq!(ViewMode::Calendar.next(), ViewMode::List);
+        assert_eq!(ViewMode::List.prev(), ViewMode::Calendar);
+        assert_eq!(ViewMode::Kanban.prev(), ViewMode::List);
+        assert_eq!(ViewMode::Calendar.prev(), ViewMode::Kanban);
+
+        let bindings = KeyBindings::from_sources(|action| match action {
+            FooterAction::Edit => Some("ctrl+x".to_string()),
+            FooterAction::Add => Some("not-a-valid-key".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(
+            bindings.action_for_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            Some(FooterAction::Edit)
+        );
+        assert_eq!(
+            bindings.action_for_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty())),
+            Some(FooterAction::Add)
+        );
+    }
+
+    #[test]
+    fn layout_and_column_helpers_cover_edge_branches() {
+        let state_columns = list_states_to_columns(Some(&[
+            ApiListState {
+                name: Some(" Open ".to_string()),
+                color: None,
+                is_done: Some(false),
+            },
+            ApiListState {
+                name: Some("".to_string()),
+                color: None,
+                is_done: Some(true),
+            },
+            ApiListState {
+                name: Some("Done".to_string()),
+                color: None,
+                is_done: Some(true),
+            },
+        ]));
+        assert_eq!(state_columns.len(), 2);
+        assert_eq!(state_columns[0].name, "Open");
+        assert!(state_columns[1].is_done);
+        assert!(list_states_to_columns(None).is_empty());
+
+        let (wide_list, wide_detail) = list_mode_layout(Rect::new(0, 0, 120, 24));
+        assert_eq!(wide_list.y, wide_detail.y);
+        assert!(wide_list.width > wide_detail.width);
+        assert!(kanban_chunks(Rect::new(0, 0, 80, 20), 0).is_empty());
+        assert_eq!(kanban_visible_range(Rect::new(0, 0, 80, 20), 0, 0), (0, 0));
+        assert_eq!(kanban_visible_range(Rect::new(0, 0, 120, 20), 2, 1), (0, 2));
+        assert_eq!(kanban_visible_range(Rect::new(0, 0, 58, 20), 5, 4), (3, 2));
+
+        let bindings = KeyBindings {
+            bindings: default_key_bindings(),
+        };
+        assert!(footer_buttons(Rect::new(0, 0, 10, 1), &bindings).is_empty());
+        assert!(footer_buttons(Rect::new(0, 0, 1, 5), &bindings).is_empty());
+        assert!(!footer_buttons(Rect::new(0, 0, 24, 6), &bindings).is_empty());
+
+        assert_eq!(scroll_to_visible(5, 3, 4), 3);
+        assert_eq!(scroll_to_visible(2, 8, 4), 5);
+        assert_eq!(scroll_to_visible(2, 3, 4), 2);
+    }
+
+    #[test]
+    fn calendar_layout_helpers_cover_empty_and_agenda_branches() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "No date")];
+        app.calendar_visible_month = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 1,
+        });
+
+        let tiny = app.calendar_layout(Rect::new(0, 0, 1, 1));
+        assert!(tiny.month_lines.is_empty());
+        assert!(tiny.agenda_lines.is_empty());
+
+        let dated = BTreeMap::new();
+        let selected_date = SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 20,
+        };
+        app.calendar_selected_date = Some(selected_date);
+        assert!(app
+            .calendar_agenda_entries(&dated, &[], selected_date, 0)
+            .is_empty());
+        let selected_empty = app.calendar_agenda_entries(&dated, &[], selected_date, 4);
+        assert!(selected_empty[0].0.contains("2026-07-20"));
+
+        app.calendar_selected_date = None;
+        let month_empty = app.calendar_agenda_entries(&dated, &[], selected_date, 4);
+        assert!(!month_empty.is_empty());
+    }
+
     #[tokio::test]
     async fn app_navigation_helpers_update_mode_focus_and_selection() {
         let mut app = test_app();
@@ -8105,6 +8212,194 @@ mod tests {
             .unwrap();
         assert!(list_changed);
         assert_eq!(app.focus, FocusPane::Items);
+    }
+
+    #[tokio::test]
+    async fn app_state_helpers_cover_calendar_scroll_and_comment_branches() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Alpha"), sample_item(2, "Beta")];
+        app.items[1].due_date = Some("2026-07-21".to_string());
+        app.item_filter = "beta".to_string();
+        assert_eq!(app.visible_item_indices(), vec![1]);
+        assert_eq!(
+            app.default_calendar_date(),
+            SimpleDate {
+                year: 2026,
+                month: 7,
+                day: 21
+            }
+        );
+
+        app.calendar_selected_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 1,
+        });
+        app.item_filter.clear();
+        app.move_calendar_date_selection(20);
+        assert_eq!(app.selected_item, 1);
+        assert_eq!(
+            app.calendar_visible_month,
+            Some(SimpleDate {
+                year: 2026,
+                month: 7,
+                day: 1
+            })
+        );
+        app.move_calendar_month_selection(1);
+        assert_eq!(
+            app.calendar_visible_month,
+            Some(SimpleDate {
+                year: 2026,
+                month: 8,
+                day: 1
+            })
+        );
+
+        let mut no_item_app = test_app();
+        no_item_app.load_comments_for_selected_item();
+        assert!(no_item_app.comments_cache.is_empty());
+        app.comments_cache.insert(1, Vec::new());
+        app.selected_item = 0;
+        app.load_comments_for_selected_item();
+        assert!(app.comments_cache.contains_key(&1));
+
+        app.focus = FocusPane::Lists;
+        app.lists
+            .push(test_shopping_list(2, "Second", None, None, None, false));
+        app.items_cache.insert(2, vec![sample_item(3, "Cached")]);
+        app.scroll_active(1);
+        assert_eq!(app.selected_list, 1);
+
+        app.focus = FocusPane::Items;
+        app.mode = ViewMode::Kanban;
+        app.selected_item = 0;
+        app.scroll_active(1);
+        assert_eq!(app.selected_item, 0);
+
+        app.mode = ViewMode::List;
+        app.item_filter = "missing".to_string();
+        app.scroll_active(1);
+        assert_eq!(app.selected_item, 0);
+    }
+
+    #[tokio::test]
+    async fn app_navigation_and_mouse_helpers_cover_false_and_editor_branches() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "One")];
+        app.items_cache.insert(1, app.items.clone());
+
+        app.handle_navigation_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.mode, ViewMode::Calendar);
+        app.handle_navigation_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(app.show_help);
+        app.show_help = false;
+
+        app.mode = ViewMode::List;
+        app.focus = FocusPane::Items;
+        app.handle_navigation_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.focus, FocusPane::Lists);
+
+        let (changed, _) = app
+            .handle_navigation_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(!changed);
+
+        app.mode = ViewMode::Calendar;
+        app.focus = FocusPane::Items;
+        app.calendar_selected_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 20,
+        });
+        app.handle_navigation_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(app.editor.is_some());
+        app.editor = None;
+
+        app.handle_navigation_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.editor.is_some());
+        app.editor = None;
+
+        app.calendar_drag_item = Some(0);
+        app.handle_navigation_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(app.calendar_drag_item.is_none());
+
+        app.item_filter = "missing".to_string();
+        let (_, item_changed) = app
+            .handle_navigation_key(KeyEvent::new(KeyCode::Home, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(!item_changed);
+
+        app.item_filter.clear();
+        assert!(!app.handle_help_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1)));
+        assert!(!app.handle_mouse_scroll(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1)));
+
+        let area = Rect::new(0, 0, 120, 40);
+        let layout = ui_layout(area);
+        assert!(!app.handle_tab_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.footer.x,
+                layout.footer.y
+            ),
+            &layout,
+            true,
+        ));
+        assert!(!app.handle_tab_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                layout.tab_chunks[0].x,
+                layout.tab_chunks[0].y
+            ),
+            &layout,
+            false,
+        ));
+        assert!(!app
+            .handle_footer_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
+                layout.footer,
+                false
+            )
+            .await
+            .unwrap());
+        assert!(!app.handle_list_panel_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                layout.lists.x,
+                layout.lists.y
+            ),
+            layout.lists,
+            false,
+        ));
+        assert!(!app.handle_non_content_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.content.x,
+                layout.content.y
+            ),
+            &layout,
+            false,
+        ));
+        assert!(!app.handle_empty_items_mouse(false));
+
+        app.trigger_footer_action(FooterAction::Add).await.unwrap();
+        assert!(app.editor.is_some());
     }
 
     #[tokio::test]

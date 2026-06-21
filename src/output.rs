@@ -1154,8 +1154,9 @@ pub(crate) fn print_activity(entries: &[ActivityEntry]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        activity_detail_text, date_with_time, human_size, item_status_parts, parse_hex_color,
-        print_item_detail, reminder_offsets_label, schedule_lines, strip_html, ItemComments,
+        activity_detail_text, color_dot, date_with_time, human_size, item_status_parts,
+        parse_hex_color, print_item_detail, reminder_offsets_label, schedule_lines, strip_html,
+        ItemComments,
     };
     use crate::models::{Attachment, ItemComment, ListItem};
     use serde_json::json;
@@ -1352,5 +1353,26 @@ mod tests {
 
         let empty = ItemComments { comments: &[] };
         empty.print();
+    }
+
+    #[test]
+    fn item_detail_helpers_cover_empty_and_priority_branches() {
+        assert_eq!(color_dot(None), "");
+        assert_eq!(color_dot(Some("not-a-color")), "");
+
+        let mut item = minimal_item();
+        item.priority = Some("medium".to_string());
+        assert!(item_status_parts(&item).priority.contains("!!"));
+
+        item.priority = Some("low".to_string());
+        assert!(item_status_parts(&item).priority.contains('!'));
+
+        item.priority = None;
+        assert_eq!(item_status_parts(&item).priority, "");
+
+        print_item_detail(&item, &[]);
+
+        item.notes = Some("<p>  </p>".to_string());
+        print_item_detail(&item, &[]);
     }
 }
