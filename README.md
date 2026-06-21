@@ -4,7 +4,9 @@
 
 <h1 align="center">kramli-cli</h1>
 
- <p> [![DeepSource](https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli.svg/?label=code+coverage&show_trend=true&token=R3u8WNRSja7eRF8JiJrmNkUZ)](https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli/) 
+ <p align="center"> 
+  
+[![DeepSource](https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli.svg/?label=code+coverage&show_trend=true&token=R3u8WNRSja7eRF8JiJrmNkUZ)](https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli/) 
   [![DeepSource](https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli.svg/?label=resolved+issues&show_trend=true&token=R3u8WNRSja7eRF8JiJrmNkUZ)](https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli/)</p>
 
 </p>
