@@ -20,6 +20,8 @@ const SAFE_TAG_KEYS: &[&str] = &[
     "outcome",
     "view",
 ];
+const KRAMLI_TRACES_SAMPLE_RATE_ENV: &str = "KRAMLI_TRACES_SAMPLE_RATE";
+const KRAMLI_CAPTURE_COMMAND_ERRORS_ENV: &str = "KRAMLI_CAPTURE_COMMAND_ERRORS";
 
 /// Returns `true` when telemetry should be active.
 ///
@@ -30,12 +32,13 @@ const SAFE_TAG_KEYS: &[&str] = &[
 ///   `1`/`true`/`on`/`yes` and `0`/`false`/`off`/`no`
 ///
 /// Default: disabled until the user answers the first-run prompt.
-pub fn is_enabled() -> bool {
+pub(crate) fn is_enabled() -> bool {
     Config::load().telemetry_enabled()
 }
 
-pub fn traces_sample_rate() -> f32 {
-    std::env::var("KRAMLI_TRACES_SAMPLE_RATE")
+/// Return the Sentry trace sampling rate from environment configuration.
+pub(crate) fn traces_sample_rate() -> f32 {
+    std::env::var(KRAMLI_TRACES_SAMPLE_RATE_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<f32>().ok())
         .filter(|value| value.is_finite())
@@ -46,8 +49,8 @@ pub fn traces_sample_rate() -> f32 {
 /// not found, validation, network errors). Keep Sentry issues focused on
 /// crashes by requiring an explicit opt-in before capturing command `Err`s as
 /// error events. Panic/default integrations still report real crashes.
-pub fn should_capture_command_error(_message: &str) -> bool {
-    std::env::var("KRAMLI_CAPTURE_COMMAND_ERRORS")
+pub(crate) fn should_capture_command_error(_message: &str) -> bool {
+    std::env::var(KRAMLI_CAPTURE_COMMAND_ERRORS_ENV)
         .ok()
         .and_then(|raw| parse_bool(&raw))
         .unwrap_or(false)
@@ -69,7 +72,7 @@ fn parse_bool(raw: &str) -> Option<bool> {
 ///   contain emails, list/item contents, etc.),
 /// - redacts `kramli_…` API keys, and
 /// - redacts email addresses.
-pub fn scrub_message(message: &str) -> String {
+pub(crate) fn scrub_message(message: &str) -> String {
     // 1. Drop raw response bodies appended by the API client (e.g.
     //    "Could not parse response: …\nBody: {…}").
     let without_body = body_prefix(message);
@@ -150,7 +153,7 @@ fn secret_marker(token: &str) -> String {
 }
 
 /// `before_send` hook: scrub the human-readable parts of an event.
-pub fn scrub_event(mut event: Event<'static>) -> Option<Event<'static>> {
+pub(crate) fn scrub_event(mut event: Event<'static>) -> Option<Event<'static>> {
     // Keep only minimal diagnostics.
     event.culprit = None;
     event.transaction = event
@@ -194,14 +197,16 @@ pub fn scrub_event(mut event: Event<'static>) -> Option<Event<'static>> {
     Some(event)
 }
 
-pub struct TraceTransaction {
+/// RAII wrapper around a Sentry transaction.
+pub(crate) struct TraceTransaction {
     inner: Option<sentry::Transaction>,
     previous_span: Option<sentry::TransactionOrSpan>,
     finished: bool,
 }
 
 impl TraceTransaction {
-    pub fn start(name: &'static str, op: &'static str) -> Self {
+    /// Start a transaction and install it as the active span.
+    pub(crate) fn start(name: &'static str, op: &'static str) -> Self {
         if !is_enabled() {
             return Self {
                 inner: None,
@@ -222,7 +227,8 @@ impl TraceTransaction {
         }
     }
 
-    pub fn set_tag(&self, key: &str, value: impl ToString) {
+    /// Attach a safe low-cardinality tag to the transaction.
+    pub(crate) fn set_tag(&self, key: &str, value: impl ToString) {
         if is_safe_tag(key, &value.to_string()) {
             if let Some(transaction) = &self.inner {
                 transaction.set_tag(key, value);
@@ -230,13 +236,15 @@ impl TraceTransaction {
         }
     }
 
-    pub fn set_data_i64(&self, key: &str, value: i64) {
+    /// Attach integer measurement data to the transaction.
+    pub(crate) fn set_data_i64(&self, key: &str, value: i64) {
         if let Some(transaction) = &self.inner {
             transaction.set_data(key, Value::from(value));
         }
     }
 
-    pub fn finish(mut self, ok: bool) {
+    /// Finish the transaction with an OK or error status.
+    pub(crate) fn finish(mut self, ok: bool) {
         self.finish_with_status(if ok {
             SpanStatus::Ok
         } else {
@@ -264,13 +272,15 @@ impl Drop for TraceTransaction {
     }
 }
 
-pub struct TraceSpan {
+/// RAII wrapper around a child Sentry span.
+pub(crate) struct TraceSpan {
     inner: Option<sentry::Span>,
     finished: bool,
 }
 
 impl TraceSpan {
-    pub fn child(op: &'static str, description: &'static str) -> Self {
+    /// Start a child span under the active transaction or span.
+    pub(crate) fn child(op: &'static str, description: &'static str) -> Self {
         if !is_enabled() {
             return Self {
                 inner: None,
@@ -285,7 +295,8 @@ impl TraceSpan {
         }
     }
 
-    pub fn set_tag(&self, key: &str, value: impl ToString) {
+    /// Attach a safe low-cardinality tag to the span.
+    pub(crate) fn set_tag(&self, key: &str, value: impl ToString) {
         if is_safe_tag(key, &value.to_string()) {
             if let Some(span) = &self.inner {
                 span.set_tag(key, value);
@@ -293,13 +304,15 @@ impl TraceSpan {
         }
     }
 
-    pub fn set_data_i64(&self, key: &str, value: i64) {
+    /// Attach integer measurement data to the span.
+    pub(crate) fn set_data_i64(&self, key: &str, value: i64) {
         if let Some(span) = &self.inner {
             span.set_data(key, Value::from(value));
         }
     }
 
-    pub fn set_status(&self, ok: bool) {
+    /// Mark the span as successful or failed.
+    pub(crate) fn set_status(&self, ok: bool) {
         if let Some(span) = &self.inner {
             span.set_status(if ok {
                 SpanStatus::Ok
@@ -309,7 +322,8 @@ impl TraceSpan {
         }
     }
 
-    pub fn finish(mut self) {
+    /// Finish the span successfully unless it was already finished.
+    pub(crate) fn finish(mut self) {
         self.finish_with_status(None);
     }
 
@@ -333,7 +347,8 @@ impl Drop for TraceSpan {
     }
 }
 
-pub fn route_template(path: &str) -> String {
+/// Convert an API path into a low-cardinality route template.
+pub(crate) fn route_template(path: &str) -> String {
     let without_query = path.split('?').next().unwrap_or(path);
     let mut out = Vec::new();
     for segment in without_query
@@ -355,7 +370,8 @@ pub fn route_template(path: &str) -> String {
     }
 }
 
-pub fn status_class(status: u16) -> String {
+/// Convert an HTTP status code to a `2xx`-style class label.
+pub(crate) fn status_class(status: u16) -> String {
     format!("{}xx", status / 100)
 }
 

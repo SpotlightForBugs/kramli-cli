@@ -46,6 +46,20 @@ const DRAG_TARGET_COLOR: Color = Color::Yellow;
 const BOOTSTRAP_ICON_BASE_URL: &str = "https://icons.getbootstrap.com/assets/icons";
 const DEFAULT_LIST_ICON: &str = "tag";
 const ARCHIVED_LIST_ICON: &str = "archive";
+const KRAMLI_DEVICE_LABEL_ENV: &str = "KRAMLI_DEVICE_LABEL";
+const KRAMLI_AUTO_HANDOFF_ENV: &str = "KRAMLI_AUTO_HANDOFF";
+const KRAMLI_TUI_IMAGE_PROTOCOL_ENV: &str = "KRAMLI_TUI_IMAGE_PROTOCOL";
+const KRAMLI_TUI_IMAGES_ENV: &str = "KRAMLI_TUI_IMAGES";
+const TERM_ENV: &str = "TERM";
+const TERM_PROGRAM_ENV: &str = "TERM_PROGRAM";
+const LC_TERMINAL_ENV: &str = "LC_TERMINAL";
+const KITTY_WINDOW_ID_ENV: &str = "KITTY_WINDOW_ID";
+const ITERM_SESSION_ID_ENV: &str = "ITERM_SESSION_ID";
+const WT_SESSION_ENV: &str = "WT_SESSION";
+const KRAMLI_ICON_STYLE_ENV: &str = "KRAMLI_ICON_STYLE";
+const KRAMLI_TUI_THEME_ENV: &str = "KRAMLI_TUI_THEME";
+const COLORFGBG_ENV: &str = "COLORFGBG";
+const KRAMLI_TUI_ICON_COLOR_ENV: &str = "KRAMLI_TUI_ICON_COLOR";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ViewMode {
@@ -620,7 +634,8 @@ const ITEM_EDITOR_FIELDS: [EditorField; 14] = [
 ];
 const SIMPLE_EDITOR_FIELDS: [EditorField; 1] = [EditorField::Text];
 
-pub async fn run_tui() -> Result<(), String> {
+/// Run the full-screen terminal UI.
+pub(crate) async fn run_tui() -> Result<(), String> {
     let transaction = crate::telemetry::TraceTransaction::start("tui.session", "ui");
     transaction.set_tag("mode", "interactive");
     let cfg = Config::load();
@@ -2271,57 +2286,48 @@ impl App {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<(), String> {
-        if self.show_help {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::F(1) => {
-                    self.show_help = false;
-                }
-                _ => {}
-            }
+        if self.handle_help_key(key) {
             return Ok(());
         }
-
-        let mut list_changed = false;
-        let mut item_changed = false;
 
         if let Some(action) = self.key_bindings.action_for_key(key) {
             self.trigger_footer_action(action).await?;
             return Ok(());
         }
 
+        let (list_changed, item_changed) = self.handle_navigation_key(key).await?;
+        self.apply_key_change_effects(list_changed, item_changed);
+        Ok(())
+    }
+
+    fn handle_help_key(&mut self, key: KeyEvent) -> bool {
+        if !self.show_help {
+            return false;
+        }
+
+        if matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::F(1)
+        ) {
+            self.show_help = false;
+        }
+        true
+    }
+
+    async fn handle_navigation_key(&mut self, key: KeyEvent) -> Result<(bool, bool), String> {
+        let mut list_changed = false;
+        let mut item_changed = false;
+
         match key.code {
             KeyCode::Tab => {
-                self.mode = self.mode.next();
-                self.clear_kanban_drag_state();
-                self.clear_calendar_drag_state();
-                if self.mode == ViewMode::Calendar {
-                    self.sync_calendar_date_to_selected_item();
-                }
+                self.switch_mode(self.mode.next());
             }
             KeyCode::BackTab => {
-                self.mode = self.mode.prev();
-                self.clear_kanban_drag_state();
-                self.clear_calendar_drag_state();
-                if self.mode == ViewMode::Calendar {
-                    self.sync_calendar_date_to_selected_item();
-                }
+                self.switch_mode(self.mode.prev());
             }
-            KeyCode::Char('1') => {
-                self.mode = ViewMode::List;
-                self.clear_kanban_drag_state();
-                self.clear_calendar_drag_state();
-            }
-            KeyCode::Char('2') => {
-                self.mode = ViewMode::Kanban;
-                self.clear_kanban_drag_state();
-                self.clear_calendar_drag_state();
-            }
-            KeyCode::Char('3') => {
-                self.mode = ViewMode::Calendar;
-                self.clear_kanban_drag_state();
-                self.clear_calendar_drag_state();
-                self.sync_calendar_date_to_selected_item();
-            }
+            KeyCode::Char('1') => self.switch_mode(ViewMode::List),
+            KeyCode::Char('2') => self.switch_mode(ViewMode::Kanban),
+            KeyCode::Char('3') => self.switch_mode(ViewMode::Calendar),
             KeyCode::PageUp | KeyCode::Char('[') => {
                 if self.mode == ViewMode::Calendar && self.focus == FocusPane::Items {
                     self.move_calendar_month_selection(-1);
@@ -2346,122 +2352,146 @@ impl App {
                     self.focus = FocusPane::Items;
                 }
             }
-            KeyCode::Up => match self.focus {
-                FocusPane::Lists => {
-                    if !self.lists.is_empty() {
-                        let new_index = wrapped_index(self.selected_list, -1, self.lists.len());
-                        if new_index != self.selected_list {
-                            self.selected_list = new_index;
-                            list_changed = true;
-                        }
-                    }
-                }
-                FocusPane::Items => {
-                    if self.mode == ViewMode::Calendar {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            if self.move_selected_item_calendar_hours(-1).await? {
-                                item_changed = true;
-                            }
-                        } else {
-                            self.move_calendar_date_selection(-7);
-                        }
-                    } else if self.mode == ViewMode::Kanban {
-                        if self.move_kanban_selection_wrapped(-1) {
-                            item_changed = true;
-                        }
-                    } else {
-                        let visible = self.visible_item_indices();
-                        if !visible.is_empty() {
-                            let pos = self.selected_visible_position(&visible);
-                            let next_pos = wrapped_index(pos, -1, visible.len());
-                            if next_pos != pos {
-                                self.selected_item = visible[next_pos];
-                                item_changed = true;
-                            }
-                        }
-                    }
-                }
-            },
-            KeyCode::Down => match self.focus {
-                FocusPane::Lists => {
-                    if !self.lists.is_empty() {
-                        let new_index = wrapped_index(self.selected_list, 1, self.lists.len());
-                        if new_index != self.selected_list {
-                            self.selected_list = new_index;
-                            list_changed = true;
-                        }
-                    }
-                }
-                FocusPane::Items => {
-                    if self.mode == ViewMode::Calendar {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            if self.move_selected_item_calendar_hours(1).await? {
-                                item_changed = true;
-                            }
-                        } else {
-                            self.move_calendar_date_selection(7);
-                        }
-                    } else if self.mode == ViewMode::Kanban {
-                        if self.move_kanban_selection_wrapped(1) {
-                            item_changed = true;
-                        }
-                    } else {
-                        let visible = self.visible_item_indices();
-                        if !visible.is_empty() {
-                            let pos = self.selected_visible_position(&visible);
-                            let next_pos = wrapped_index(pos, 1, visible.len());
-                            if next_pos != pos {
-                                self.selected_item = visible[next_pos];
-                                item_changed = true;
-                            }
-                        }
-                    }
-                }
-            },
-            KeyCode::Enter => {
-                if matches!(self.focus, FocusPane::Lists) {
-                    list_changed = true;
-                    self.focus = FocusPane::Items;
-                } else if self.mode == ViewMode::Calendar && self.calendar_selected_date.is_some() {
-                    if key.modifiers.contains(KeyModifiers::CONTROL) {
-                        self.open_editor()?;
-                    } else {
-                        self.open_add_editor()?;
-                    }
-                } else {
-                    self.open_editor()?;
-                }
+            KeyCode::Up => {
+                self.move_selection_by_key(key, -1, &mut list_changed, &mut item_changed)
+                    .await?
             }
-            KeyCode::Esc => {
-                if self.mode == ViewMode::Calendar && self.calendar_drag_item.is_some() {
-                    self.clear_calendar_drag_state();
-                } else if self.mode == ViewMode::Calendar && self.calendar_selected_date.is_some() {
-                    self.calendar_selected_date = None;
-                    self.clear_calendar_drag_state();
-                }
+            KeyCode::Down => {
+                self.move_selection_by_key(key, 1, &mut list_changed, &mut item_changed)
+                    .await?
             }
+            KeyCode::Enter => list_changed = self.handle_enter_key(key)?,
+            KeyCode::Esc => self.handle_escape_key(),
             KeyCode::Char('?') | KeyCode::F(1) => self.show_help = true,
-            KeyCode::Home => {
-                let visible = self.visible_item_indices();
-                if let Some(first) = visible.first().copied() {
-                    if self.selected_item != first {
-                        self.selected_item = first;
-                        item_changed = true;
-                    }
-                }
-            }
-            KeyCode::End => {
-                let visible = self.visible_item_indices();
-                if let Some(last) = visible.last().copied() {
-                    if self.selected_item != last {
-                        self.selected_item = last;
-                        item_changed = true;
-                    }
-                }
-            }
+            KeyCode::Home => item_changed = self.select_visible_edge_item(true),
+            KeyCode::End => item_changed = self.select_visible_edge_item(false),
             _ => {}
         }
 
+        Ok((list_changed, item_changed))
+    }
+
+    fn switch_mode(&mut self, mode: ViewMode) {
+        self.mode = mode;
+        self.clear_kanban_drag_state();
+        self.clear_calendar_drag_state();
+        if self.mode == ViewMode::Calendar {
+            self.sync_calendar_date_to_selected_item();
+        }
+    }
+
+    async fn move_selection_by_key(
+        &mut self,
+        key: KeyEvent,
+        delta: isize,
+        list_changed: &mut bool,
+        item_changed: &mut bool,
+    ) -> Result<(), String> {
+        match self.focus {
+            FocusPane::Lists => *list_changed = self.move_selected_list(delta),
+            FocusPane::Items => {
+                *item_changed = self.move_selected_item_by_key(key, delta).await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn move_selected_list(&mut self, delta: isize) -> bool {
+        if self.lists.is_empty() {
+            return false;
+        }
+        let new_index = wrapped_index(self.selected_list, delta, self.lists.len());
+        if new_index == self.selected_list {
+            return false;
+        }
+        self.selected_list = new_index;
+        true
+    }
+
+    async fn move_selected_item_by_key(
+        &mut self,
+        key: KeyEvent,
+        delta: isize,
+    ) -> Result<bool, String> {
+        if self.mode == ViewMode::Calendar {
+            return self.move_calendar_selection_by_key(key, delta).await;
+        }
+        if self.mode == ViewMode::Kanban {
+            return Ok(self.move_kanban_selection_wrapped(delta));
+        }
+        Ok(self.move_visible_list_selection(delta))
+    }
+
+    async fn move_calendar_selection_by_key(
+        &mut self,
+        key: KeyEvent,
+        delta: isize,
+    ) -> Result<bool, String> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return self.move_selected_item_calendar_hours(delta as i32).await;
+        }
+        self.move_calendar_date_selection(delta as i64 * 7);
+        Ok(false)
+    }
+
+    fn move_visible_list_selection(&mut self, delta: isize) -> bool {
+        let visible = self.visible_item_indices();
+        if visible.is_empty() {
+            return false;
+        }
+        let pos = self.selected_visible_position(&visible);
+        let next_pos = wrapped_index(pos, delta, visible.len());
+        if next_pos == pos {
+            return false;
+        }
+        self.selected_item = visible[next_pos];
+        true
+    }
+
+    fn handle_enter_key(&mut self, key: KeyEvent) -> Result<bool, String> {
+        if matches!(self.focus, FocusPane::Lists) {
+            self.focus = FocusPane::Items;
+            return Ok(true);
+        }
+        if self.mode == ViewMode::Calendar && self.calendar_selected_date.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                self.open_editor()?;
+            } else {
+                self.open_add_editor()?;
+            }
+            return Ok(false);
+        }
+        self.open_editor()?;
+        Ok(false)
+    }
+
+    fn handle_escape_key(&mut self) {
+        if self.mode == ViewMode::Calendar && self.calendar_drag_item.is_some() {
+            self.clear_calendar_drag_state();
+        } else if self.mode == ViewMode::Calendar && self.calendar_selected_date.is_some() {
+            self.calendar_selected_date = None;
+            self.clear_calendar_drag_state();
+        }
+    }
+
+    fn select_visible_edge_item(&mut self, first: bool) -> bool {
+        let visible = self.visible_item_indices();
+        let target = if first {
+            visible.first().copied()
+        } else {
+            visible.last().copied()
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        if self.selected_item == target {
+            return false;
+        }
+        self.selected_item = target;
+        true
+    }
+
+    fn apply_key_change_effects(&mut self, list_changed: bool, item_changed: bool) {
         if list_changed {
             self.calendar_selected_date = None;
             self.calendar_visible_month = None;
@@ -2473,8 +2503,6 @@ impl App {
         } else if item_changed && self.mode == ViewMode::Calendar {
             self.sync_calendar_date_to_selected_item();
         }
-
-        Ok(())
     }
 
     async fn handle_editor_key(&mut self, key: KeyEvent) -> Result<(), String> {
@@ -2730,228 +2758,21 @@ impl App {
 
         match self.mode {
             ViewMode::List => {
-                let (list_rect, detail_rect) = list_mode_layout(layout.content);
-                if left_down && rect_contains(detail_rect, mouse.column, mouse.row) {
-                    self.open_selected_image_background()?;
-                    return Ok(());
-                }
-                let list_items_area = item_rows_area(list_rect);
-                if left_down && rect_contains(list_items_area, mouse.column, mouse.row) {
-                    let visible = self.visible_item_indices();
-                    let row = mouse.row.saturating_sub(list_items_area.y) as usize;
-                    let row_width = list_rect.width.saturating_sub(2) as usize;
-                    if let Some(clicked) = visible_item_at_wrapped_row(
-                        &self.items,
-                        &visible,
-                        self.item_scroll,
-                        row,
-                        row_width,
-                    ) {
-                        self.selected_item = clicked;
-                        if self.register_item_click(clicked) {
-                            self.open_editor()?;
-                            return Ok(());
-                        }
-                    }
-                }
+                self.handle_list_mode_mouse(mouse, layout.content, left_down)?;
             }
             ViewMode::Kanban => {
-                let (columns, buckets) = self.kanban_buckets();
-                if !columns.is_empty() {
-                    let selected_column = buckets
-                        .iter()
-                        .position(|bucket| bucket.contains(&self.selected_item))
-                        .unwrap_or(0);
-                    let (start_col, visible_count) =
-                        kanban_visible_range(layout.content, columns.len(), selected_column);
-                    let chunks = kanban_chunks(layout.content, visible_count);
-                    let hovered_column = kanban_column_at(&chunks, mouse.column, mouse.row)
-                        .map(|index| index + start_col);
-
-                    if left_drag {
-                        if self.kanban_drag_item.is_some() {
-                            self.kanban_drag_started = true;
-                            self.kanban_drag_target_column = hovered_column;
-                        }
-                        return Ok(());
-                    }
-
-                    if left_up {
-                        if let Some(item_index) = self.kanban_drag_item.take() {
-                            let source_column = self.kanban_drag_source_column.take();
-                            let drag_started = self.kanban_drag_started;
-                            self.kanban_drag_started = false;
-                            let target_column =
-                                self.kanban_drag_target_column.take().or(hovered_column);
-                            if drag_started {
-                                if let Some(target_column) = target_column {
-                                    if source_column != Some(target_column) {
-                                        self.move_item_to_kanban_column(item_index, target_column)
-                                            .await?;
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if !left_down {
-                        return Ok(());
-                    }
-
-                    for (local_index, rect) in chunks.iter().enumerate() {
-                        let col_index = start_col + local_index;
-                        let column_items_area = item_rows_area(*rect);
-                        if !rect_contains(column_items_area, mouse.column, mouse.row) {
-                            continue;
-                        }
-                        let row = mouse.row.saturating_sub(column_items_area.y) as usize;
-                        let max_rows = rect.height.saturating_sub(2) as usize;
-                        let total = buckets[col_index].len();
-                        let (start, item_count, show_top, _show_bottom) =
-                            kanban_window(&buckets[col_index], self.selected_item, max_rows);
-                        let item_row_offset = if show_top { 1 } else { 0 };
-                        if row >= item_row_offset && row < item_row_offset + item_count {
-                            let clicked_item = buckets[col_index][start + row - item_row_offset];
-                            self.selected_item = clicked_item;
-                            if self.register_item_click(clicked_item) {
-                                self.open_editor()?;
-                                return Ok(());
-                            }
-                            self.kanban_drag_item = Some(clicked_item);
-                            self.kanban_drag_source_column = Some(col_index);
-                            self.kanban_drag_target_column = Some(col_index);
-                            self.kanban_drag_started = false;
-                        } else if total > start + item_count {
-                            self.clear_kanban_drag_state();
-                            self.kanban_drag_target_column = Some(col_index);
-                        }
-                        break;
-                    }
-                }
+                self.handle_kanban_mode_mouse(mouse, layout.content, left_down, left_drag, left_up)
+                    .await?;
             }
             ViewMode::Calendar => {
-                if left_drag {
-                    if self.calendar_drag_item.is_some() {
-                        let month = self.pointer_calendar_month();
-                        self.calendar_drag_started = true;
-                        self.calendar_drag_target_date =
-                            calendar_pointer_date(layout.content, mouse.column, mouse.row, month);
-                    }
-                    return Ok(());
-                }
-
-                if left_up {
-                    if self.calendar_drag_started {
-                        if let Some(item_index) = self.calendar_drag_item.take() {
-                            let source_date = self.calendar_drag_source_date.take();
-                            self.calendar_drag_started = false;
-                            let hovered_date = {
-                                let month = self.pointer_calendar_month();
-                                calendar_pointer_date(
-                                    layout.content,
-                                    mouse.column,
-                                    mouse.row,
-                                    month,
-                                )
-                            };
-                            let target_date =
-                                self.calendar_drag_target_date.take().or(hovered_date);
-                            if let Some(target_date) = target_date {
-                                self.calendar_selected_date = Some(target_date);
-                                self.calendar_visible_month = Some(start_of_month(target_date));
-                                if source_date != Some(target_date) {
-                                    self.move_item_to_calendar_date(item_index, target_date)
-                                        .await?;
-                                    self.clear_calendar_drag_state();
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        self.clear_calendar_drag_state();
-                    } else if self.calendar_drag_item.is_some() {
-                        self.status = Some(tr("tui-help-calendar-3"));
-                    }
-                    return Ok(());
-                }
-
-                if !left_down {
-                    return Ok(());
-                }
-
-                let calendar = self.calendar_layout(layout.content);
-                let hovered_date = calendar_date_at(&calendar, mouse.column, mouse.row);
-                let hovered_item = calendar_item_at(&calendar, mouse.column, mouse.row);
-                let clicked_agenda = rect_contains(calendar.agenda_area, mouse.column, mouse.row);
-                let clicked_agenda_header = clicked_agenda && mouse.row == calendar.agenda_area.y;
-                let agenda_inner = calendar.agenda_area.inner(Margin {
-                    vertical: 1,
-                    horizontal: 1,
-                });
-                let clicked_agenda_empty = self.calendar_selected_date.is_some()
-                    && rect_contains(agenda_inner, mouse.column, mouse.row)
-                    && mouse.row.saturating_sub(agenda_inner.y) as usize
-                        >= calendar.agenda_lines.len();
-
-                if clicked_agenda_header && self.calendar_selected_date.is_some() {
-                    self.calendar_selected_date = None;
-                    self.clear_calendar_drag_state();
-                    self.status = Some(tr("tui-help-calendar-2"));
-                    return Ok(());
-                }
-
-                if let Some(item_index) = hovered_item {
-                    self.selected_item = item_index;
-                    if self.register_item_click(item_index) {
-                        self.clear_calendar_drag_state();
-                        self.open_editor()?;
-                        return Ok(());
-                    }
-                    if clicked_agenda {
-                        self.calendar_drag_item = Some(item_index);
-                        self.calendar_drag_source_date = self.items[item_index]
-                            .due_date
-                            .as_deref()
-                            .and_then(parse_iso_date);
-                        self.calendar_drag_target_date = None;
-                        self.calendar_drag_started = false;
-                        self.status = Some(tr("tui-help-calendar-3"));
-                    } else {
-                        if let Some(date) = self.items[item_index]
-                            .due_date
-                            .as_deref()
-                            .and_then(parse_iso_date)
-                        {
-                            self.calendar_selected_date = Some(date);
-                            self.calendar_visible_month = Some(start_of_month(date));
-                        }
-                        self.clear_calendar_drag_state();
-                    }
-                } else if let Some(date) = hovered_date {
-                    if let Some(item_index) = self.calendar_drag_item {
-                        self.selected_item = item_index;
-                        self.calendar_selected_date = Some(date);
-                        self.calendar_visible_month = Some(start_of_month(date));
-                        if self.calendar_drag_source_date != Some(date) {
-                            self.move_item_to_calendar_date(item_index, date).await?;
-                        }
-                        self.clear_calendar_drag_state();
-                        return Ok(());
-                    }
-                    if self.calendar_selected_date == Some(date) {
-                        self.calendar_selected_date = None;
-                        self.status = Some(tr("tui-help-calendar-2"));
-                    } else {
-                        self.calendar_selected_date = Some(date);
-                        self.status = Some(tr("tui-help-calendar-3"));
-                    }
-                    self.calendar_visible_month = Some(start_of_month(date));
-                    self.clear_calendar_drag_state();
-                } else if clicked_agenda_empty {
-                    self.clear_calendar_drag_state();
-                    self.open_add_editor()?;
-                    return Ok(());
-                }
+                self.handle_calendar_mode_mouse(
+                    mouse,
+                    layout.content,
+                    left_down,
+                    left_drag,
+                    left_up,
+                )
+                .await?;
             }
         }
 
@@ -2965,6 +2786,369 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn handle_list_mode_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        content: Rect,
+        left_down: bool,
+    ) -> Result<(), String> {
+        let (list_rect, detail_rect) = list_mode_layout(content);
+        if left_down && rect_contains(detail_rect, mouse.column, mouse.row) {
+            self.open_selected_image_background()?;
+            return Ok(());
+        }
+
+        let list_items_area = item_rows_area(list_rect);
+        if left_down && rect_contains(list_items_area, mouse.column, mouse.row) {
+            self.select_list_mode_item_at(mouse, list_rect, list_items_area)?;
+        }
+
+        Ok(())
+    }
+
+    fn select_list_mode_item_at(
+        &mut self,
+        mouse: MouseEvent,
+        list_rect: Rect,
+        list_items_area: Rect,
+    ) -> Result<(), String> {
+        let visible = self.visible_item_indices();
+        let row = mouse.row.saturating_sub(list_items_area.y) as usize;
+        let row_width = list_rect.width.saturating_sub(2) as usize;
+        let Some(clicked) =
+            visible_item_at_wrapped_row(&self.items, &visible, self.item_scroll, row, row_width)
+        else {
+            return Ok(());
+        };
+
+        self.selected_item = clicked;
+        if self.register_item_click(clicked) {
+            self.open_editor()?;
+        }
+
+        Ok(())
+    }
+
+    async fn handle_kanban_mode_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        content: Rect,
+        left_down: bool,
+        left_drag: bool,
+        left_up: bool,
+    ) -> Result<(), String> {
+        let (columns, buckets) = self.kanban_buckets();
+        if columns.is_empty() {
+            return Ok(());
+        }
+
+        let selected_column = buckets
+            .iter()
+            .position(|bucket| bucket.contains(&self.selected_item))
+            .unwrap_or(0);
+        let (start_col, visible_count) =
+            kanban_visible_range(content, columns.len(), selected_column);
+        let chunks = kanban_chunks(content, visible_count);
+        let hovered_column =
+            kanban_column_at(&chunks, mouse.column, mouse.row).map(|index| index + start_col);
+
+        if left_drag {
+            self.update_kanban_drag_target(hovered_column);
+            return Ok(());
+        }
+
+        if left_up && self.finish_kanban_drag(hovered_column).await? {
+            return Ok(());
+        }
+
+        if left_down {
+            self.start_kanban_mouse_selection(mouse, start_col, &chunks, &buckets)?;
+        }
+
+        Ok(())
+    }
+
+    fn update_kanban_drag_target(&mut self, hovered_column: Option<usize>) {
+        if self.kanban_drag_item.is_some() {
+            self.kanban_drag_started = true;
+            self.kanban_drag_target_column = hovered_column;
+        }
+    }
+
+    async fn finish_kanban_drag(&mut self, hovered_column: Option<usize>) -> Result<bool, String> {
+        let Some(item_index) = self.kanban_drag_item.take() else {
+            return Ok(false);
+        };
+
+        let source_column = self.kanban_drag_source_column.take();
+        let drag_started = self.kanban_drag_started;
+        self.kanban_drag_started = false;
+        let target_column = self.kanban_drag_target_column.take().or(hovered_column);
+
+        if drag_started {
+            if let Some(target_column) = target_column {
+                if source_column != Some(target_column) {
+                    self.move_item_to_kanban_column(item_index, target_column)
+                        .await?;
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn start_kanban_mouse_selection(
+        &mut self,
+        mouse: MouseEvent,
+        start_col: usize,
+        chunks: &[Rect],
+        buckets: &[Vec<usize>],
+    ) -> Result<(), String> {
+        for (local_index, rect) in chunks.iter().enumerate() {
+            let col_index = start_col + local_index;
+            let column_items_area = item_rows_area(*rect);
+            if !rect_contains(column_items_area, mouse.column, mouse.row) {
+                continue;
+            }
+
+            self.select_kanban_column_item(mouse, *rect, column_items_area, col_index, buckets)?;
+            break;
+        }
+
+        Ok(())
+    }
+
+    fn select_kanban_column_item(
+        &mut self,
+        mouse: MouseEvent,
+        column_rect: Rect,
+        column_items_area: Rect,
+        col_index: usize,
+        buckets: &[Vec<usize>],
+    ) -> Result<(), String> {
+        let row = mouse.row.saturating_sub(column_items_area.y) as usize;
+        let max_rows = column_rect.height.saturating_sub(2) as usize;
+        let total = buckets[col_index].len();
+        let (start, item_count, show_top, _show_bottom) =
+            kanban_window(&buckets[col_index], self.selected_item, max_rows);
+        let item_row_offset = if show_top { 1 } else { 0 };
+
+        if row >= item_row_offset && row < item_row_offset + item_count {
+            let clicked_item = buckets[col_index][start + row - item_row_offset];
+            self.selected_item = clicked_item;
+            if self.register_item_click(clicked_item) {
+                self.open_editor()?;
+                return Ok(());
+            }
+            self.kanban_drag_item = Some(clicked_item);
+            self.kanban_drag_source_column = Some(col_index);
+            self.kanban_drag_target_column = Some(col_index);
+            self.kanban_drag_started = false;
+        } else if total > start + item_count {
+            self.clear_kanban_drag_state();
+            self.kanban_drag_target_column = Some(col_index);
+        }
+
+        Ok(())
+    }
+
+    async fn handle_calendar_mode_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        content: Rect,
+        left_down: bool,
+        left_drag: bool,
+        left_up: bool,
+    ) -> Result<(), String> {
+        if left_drag {
+            self.update_calendar_drag_target(content, mouse);
+            return Ok(());
+        }
+
+        if left_up {
+            self.finish_calendar_drag(content, mouse).await?;
+            return Ok(());
+        }
+
+        if left_down {
+            self.handle_calendar_click(content, mouse).await?;
+        }
+
+        Ok(())
+    }
+
+    fn update_calendar_drag_target(&mut self, content: Rect, mouse: MouseEvent) {
+        if self.calendar_drag_item.is_some() {
+            let month = self.pointer_calendar_month();
+            self.calendar_drag_started = true;
+            self.calendar_drag_target_date =
+                calendar_pointer_date(content, mouse.column, mouse.row, month);
+        }
+    }
+
+    async fn finish_calendar_drag(
+        &mut self,
+        content: Rect,
+        mouse: MouseEvent,
+    ) -> Result<(), String> {
+        if self.calendar_drag_started {
+            self.finish_started_calendar_drag(content, mouse).await?;
+        } else if self.calendar_drag_item.is_some() {
+            self.status = Some(tr("tui-help-calendar-3"));
+        }
+
+        Ok(())
+    }
+
+    async fn finish_started_calendar_drag(
+        &mut self,
+        content: Rect,
+        mouse: MouseEvent,
+    ) -> Result<(), String> {
+        if let Some(item_index) = self.calendar_drag_item.take() {
+            let source_date = self.calendar_drag_source_date.take();
+            self.calendar_drag_started = false;
+            let month = self.pointer_calendar_month();
+            let hovered_date = calendar_pointer_date(content, mouse.column, mouse.row, month);
+            let target_date = self.calendar_drag_target_date.take().or(hovered_date);
+
+            if let Some(target_date) = target_date {
+                self.calendar_selected_date = Some(target_date);
+                self.calendar_visible_month = Some(start_of_month(target_date));
+                if source_date != Some(target_date) {
+                    self.move_item_to_calendar_date(item_index, target_date)
+                        .await?;
+                    self.clear_calendar_drag_state();
+                    return Ok(());
+                }
+            }
+        }
+
+        self.clear_calendar_drag_state();
+        Ok(())
+    }
+
+    async fn handle_calendar_click(
+        &mut self,
+        content: Rect,
+        mouse: MouseEvent,
+    ) -> Result<(), String> {
+        let calendar = self.calendar_layout(content);
+        if self.handle_calendar_agenda_header_click(&calendar, mouse) {
+            return Ok(());
+        }
+
+        if let Some(item_index) = calendar_item_at(&calendar, mouse.column, mouse.row) {
+            let clicked_agenda = rect_contains(calendar.agenda_area, mouse.column, mouse.row);
+            self.handle_calendar_item_click(item_index, clicked_agenda)?;
+        } else if let Some(date) = calendar_date_at(&calendar, mouse.column, mouse.row) {
+            self.handle_calendar_date_click(date).await?;
+        } else if self.calendar_clicked_empty_agenda(&calendar, mouse) {
+            self.clear_calendar_drag_state();
+            self.open_add_editor()?;
+        }
+
+        Ok(())
+    }
+
+    fn handle_calendar_agenda_header_click(
+        &mut self,
+        calendar: &CalendarLayout,
+        mouse: MouseEvent,
+    ) -> bool {
+        let clicked_agenda = rect_contains(calendar.agenda_area, mouse.column, mouse.row);
+        let clicked_header = clicked_agenda && mouse.row == calendar.agenda_area.y;
+        if !clicked_header || self.calendar_selected_date.is_none() {
+            return false;
+        }
+
+        self.calendar_selected_date = None;
+        self.clear_calendar_drag_state();
+        self.status = Some(tr("tui-help-calendar-2"));
+        true
+    }
+
+    fn handle_calendar_item_click(
+        &mut self,
+        item_index: usize,
+        clicked_agenda: bool,
+    ) -> Result<(), String> {
+        self.selected_item = item_index;
+        if self.register_item_click(item_index) {
+            self.clear_calendar_drag_state();
+            self.open_editor()?;
+            return Ok(());
+        }
+
+        if clicked_agenda {
+            self.start_calendar_item_drag(item_index);
+        } else {
+            self.select_calendar_item_date(item_index);
+        }
+
+        Ok(())
+    }
+
+    fn start_calendar_item_drag(&mut self, item_index: usize) {
+        self.calendar_drag_item = Some(item_index);
+        self.calendar_drag_source_date = self.items[item_index]
+            .due_date
+            .as_deref()
+            .and_then(parse_iso_date);
+        self.calendar_drag_target_date = None;
+        self.calendar_drag_started = false;
+        self.status = Some(tr("tui-help-calendar-3"));
+    }
+
+    fn select_calendar_item_date(&mut self, item_index: usize) {
+        if let Some(date) = self.items[item_index]
+            .due_date
+            .as_deref()
+            .and_then(parse_iso_date)
+        {
+            self.calendar_selected_date = Some(date);
+            self.calendar_visible_month = Some(start_of_month(date));
+        }
+        self.clear_calendar_drag_state();
+    }
+
+    async fn handle_calendar_date_click(&mut self, date: SimpleDate) -> Result<(), String> {
+        if let Some(item_index) = self.calendar_drag_item {
+            self.selected_item = item_index;
+            self.calendar_selected_date = Some(date);
+            self.calendar_visible_month = Some(start_of_month(date));
+            if self.calendar_drag_source_date != Some(date) {
+                self.move_item_to_calendar_date(item_index, date).await?;
+            }
+            self.clear_calendar_drag_state();
+            return Ok(());
+        }
+
+        if self.calendar_selected_date == Some(date) {
+            self.calendar_selected_date = None;
+            self.status = Some(tr("tui-help-calendar-2"));
+        } else {
+            self.calendar_selected_date = Some(date);
+            self.status = Some(tr("tui-help-calendar-3"));
+        }
+
+        self.calendar_visible_month = Some(start_of_month(date));
+        self.clear_calendar_drag_state();
+        Ok(())
+    }
+
+    fn calendar_clicked_empty_agenda(&self, calendar: &CalendarLayout, mouse: MouseEvent) -> bool {
+        let agenda_inner = calendar.agenda_area.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+
+        self.calendar_selected_date.is_some()
+            && rect_contains(agenda_inner, mouse.column, mouse.row)
+            && mouse.row.saturating_sub(agenda_inner.y) as usize >= calendar.agenda_lines.len()
     }
 
     async fn handle_editor_mouse(&mut self, mouse: MouseEvent, area: Rect) -> Result<(), String> {
@@ -3271,7 +3455,7 @@ impl App {
         };
 
         let progress_name = column.name.trim().to_string();
-        if item.progress.as_deref().map(str::trim).unwrap_or_default() != progress_name {
+        if item.progress.as_deref().map_or("", str::trim) != progress_name {
             let mut body = Map::new();
             body.insert("progress".to_string(), Value::String(progress_name));
             let updated: ListItem = self
@@ -3869,8 +4053,7 @@ fn civil_from_days(days: i64) -> SimpleDate {
 fn today_utc() -> SimpleDate {
     let days = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| (duration.as_secs() / 86_400) as i64)
-        .unwrap_or(0);
+        .map_or(0, |duration| (duration.as_secs() / 86_400) as i64);
     civil_from_days(days)
 }
 
@@ -4233,7 +4416,7 @@ fn invite_url_from_response(resp: &Value) -> Option<String> {
 }
 
 fn default_handoff_device_label() -> String {
-    std::env::var("KRAMLI_DEVICE_LABEL")
+    std::env::var(KRAMLI_DEVICE_LABEL_ENV)
         .ok()
         .map(|value| value.trim().chars().take(80).collect::<String>())
         .filter(|value| !value.is_empty())
@@ -4249,7 +4432,7 @@ fn should_send_auto_handoff(
 }
 
 fn auto_handoff_enabled() -> bool {
-    auto_handoff_enabled_from_value(std::env::var("KRAMLI_AUTO_HANDOFF").ok().as_deref())
+    auto_handoff_enabled_from_value(std::env::var(KRAMLI_AUTO_HANDOFF_ENV).ok().as_deref())
 }
 
 fn auto_handoff_enabled_from_value(raw: Option<&str>) -> bool {
@@ -5699,7 +5882,7 @@ impl ImageProtocolPreference {
 }
 
 fn image_protocol_preference() -> ImageProtocolPreference {
-    if let Ok(raw) = std::env::var("KRAMLI_TUI_IMAGE_PROTOCOL") {
+    if let Ok(raw) = std::env::var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV) {
         let value = raw.trim().to_ascii_lowercase();
         return match value.as_str() {
             "off" | "none" | "disabled" | "0" => ImageProtocolPreference::Off,
@@ -5714,7 +5897,7 @@ fn image_protocol_preference() -> ImageProtocolPreference {
         };
     }
 
-    if std::env::var("KRAMLI_TUI_IMAGES").is_ok_and(|value| value == "0") {
+    if std::env::var(KRAMLI_TUI_IMAGES_ENV).is_ok_and(|value| value == "0") {
         return ImageProtocolPreference::Off;
     }
 
@@ -5747,14 +5930,14 @@ fn image_runtime_debug_lines(
     picker: &Picker,
     inline_enabled: bool,
 ) -> Vec<String> {
-    let term = std::env::var("TERM").unwrap_or_else(|_| "-".to_string());
-    let term_program = std::env::var("TERM_PROGRAM").unwrap_or_else(|_| "-".to_string());
-    let lc_terminal = std::env::var("LC_TERMINAL").unwrap_or_else(|_| "-".to_string());
-    let explicit_protocol = std::env::var("KRAMLI_TUI_IMAGE_PROTOCOL")
+    let term = std::env::var(TERM_ENV).unwrap_or_else(|_| "-".to_string());
+    let term_program = std::env::var(TERM_PROGRAM_ENV).unwrap_or_else(|_| "-".to_string());
+    let lc_terminal = std::env::var(LC_TERMINAL_ENV).unwrap_or_else(|_| "-".to_string());
+    let explicit_protocol = std::env::var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "(unset)".to_string());
-    let explicit_images = std::env::var("KRAMLI_TUI_IMAGES")
+    let explicit_images = std::env::var(KRAMLI_TUI_IMAGES_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "(unset)".to_string());
@@ -5775,7 +5958,7 @@ fn image_runtime_debug_lines(
         format!(
             "img lc_terminal={} iterm_session={}",
             lc_terminal,
-            if std::env::var("ITERM_SESSION_ID").is_ok() {
+            if std::env::var(ITERM_SESSION_ID_ENV).is_ok() {
                 "set"
             } else {
                 "unset"
@@ -5789,22 +5972,22 @@ fn image_runtime_debug_lines(
 }
 
 fn autodetect_protocol_fallback() -> Option<ProtocolType> {
-    let term = std::env::var("TERM")
+    let term = std::env::var(TERM_ENV)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let term_program = std::env::var("TERM_PROGRAM")
+    let term_program = std::env::var(TERM_PROGRAM_ENV)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let lc_terminal = std::env::var("LC_TERMINAL")
+    let lc_terminal = std::env::var(LC_TERMINAL_ENV)
         .unwrap_or_default()
         .to_ascii_lowercase();
     detected_protocol_from_env_values(
         &term,
         &term_program,
         &lc_terminal,
-        std::env::var("KITTY_WINDOW_ID").is_ok(),
-        std::env::var("ITERM_SESSION_ID").is_ok(),
-        std::env::var("WT_SESSION").is_ok(),
+        std::env::var(KITTY_WINDOW_ID_ENV).is_ok(),
+        std::env::var(ITERM_SESSION_ID_ENV).is_ok(),
+        std::env::var(WT_SESSION_ENV).is_ok(),
     )
 }
 
@@ -5930,20 +6113,20 @@ fn env_override_for_probed_protocol(
 }
 
 fn should_probe_terminal_images() -> bool {
-    if std::env::var("KRAMLI_TUI_IMAGES").is_ok_and(|value| value == "0") {
+    if std::env::var(KRAMLI_TUI_IMAGES_ENV).is_ok_and(|value| value == "0") {
         return false;
     }
-    if std::env::var("KRAMLI_TUI_IMAGES").is_ok_and(|value| value == "1") {
+    if std::env::var(KRAMLI_TUI_IMAGES_ENV).is_ok_and(|value| value == "1") {
         return true;
     }
 
-    let term = std::env::var("TERM")
+    let term = std::env::var(TERM_ENV)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let term_program = std::env::var("TERM_PROGRAM")
+    let term_program = std::env::var(TERM_PROGRAM_ENV)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let lc_terminal = std::env::var("LC_TERMINAL")
+    let lc_terminal = std::env::var(LC_TERMINAL_ENV)
         .unwrap_or_default()
         .to_ascii_lowercase();
 
@@ -5951,9 +6134,9 @@ fn should_probe_terminal_images() -> bool {
         &term,
         &term_program,
         &lc_terminal,
-        std::env::var("KITTY_WINDOW_ID").is_ok(),
-        std::env::var("ITERM_SESSION_ID").is_ok(),
-        std::env::var("WT_SESSION").is_ok(),
+        std::env::var(KITTY_WINDOW_ID_ENV).is_ok(),
+        std::env::var(ITERM_SESSION_ID_ENV).is_ok(),
+        std::env::var(WT_SESSION_ENV).is_ok(),
     )
     .is_some()
 }
@@ -6880,7 +7063,7 @@ enum TuiIconStyle {
 }
 
 fn tui_icon_style() -> TuiIconStyle {
-    match std::env::var("KRAMLI_ICON_STYLE")
+    match std::env::var(KRAMLI_ICON_STYLE_ENV)
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
@@ -7083,9 +7266,9 @@ fn render_bootstrap_svg_icon_with_color(svg: &[u8], color: &str) -> Result<Dynam
 
 fn icon_svg_color() -> String {
     icon_svg_color_from_values(
-        std::env::var("KRAMLI_TUI_THEME").ok().as_deref(),
-        std::env::var("COLORFGBG").ok().as_deref(),
-        std::env::var("KRAMLI_TUI_ICON_COLOR").ok().as_deref(),
+        std::env::var(KRAMLI_TUI_THEME_ENV).ok().as_deref(),
+        std::env::var(COLORFGBG_ENV).ok().as_deref(),
+        std::env::var(KRAMLI_TUI_ICON_COLOR_ENV).ok().as_deref(),
     )
 }
 
@@ -7225,9 +7408,10 @@ fn html_attr_value(tag: &str, attr: &str) -> Option<String> {
         }
 
         let rest = &tag[value_start..];
-        let end = rest
-            .find(|ch: char| ch.is_whitespace() || ch == '>')
-            .unwrap_or(rest.len());
+        let end = match rest.find(|ch: char| ch.is_whitespace() || ch == '>') {
+            Some(end) => end,
+            None => rest.len(),
+        };
         return Some(rest[..end].to_string());
     }
     None
@@ -7292,7 +7476,7 @@ async fn fetch_and_open_image(api: ApiClient, source: String) -> Result<String, 
 }
 
 fn temp_image_path(source: &str) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = DefaultHasher::default();
     source.hash(&mut hasher);
     let hash = hasher.finish();
     let millis = SystemTime::now()

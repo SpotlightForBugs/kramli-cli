@@ -16,6 +16,10 @@ use crate::models::*;
 use crate::output;
 use crate::telemetry;
 
+const NO_COLOR_ENV: &str = "NO_COLOR";
+const KRAMLI_DEVICE_LABEL_ENV: &str = "KRAMLI_DEVICE_LABEL";
+const KRAMLI_ACK_TOKEN_ENV: &str = "KRAMLI_ACK_TOKEN";
+
 #[derive(Parser)]
 #[command(
     name = "kramli",
@@ -23,21 +27,23 @@ use crate::telemetry;
     version,
     propagate_version = true
 )]
-pub struct Cli {
+/// Parsed command-line interface for `kramli`.
+pub(crate) struct Cli {
     /// Output machine-readable JSON instead of human-friendly text.
     #[arg(long, global = true)]
-    pub json: bool,
+    pub(crate) json: bool,
 
     /// Start a full-screen terminal UI
     #[arg(short = 'i', long)]
-    pub interactive: bool,
+    pub(crate) interactive: bool,
 
     #[command(subcommand)]
-    pub command: Option<Commands>,
+    pub(crate) command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
-pub enum Commands {
+/// Top-level CLI commands.
+pub(crate) enum Commands {
     /// Log in with an API key (create one at kramli.de/settings#api-keys)
     Login {
         /// Server URL (default: https://kramli.de)
@@ -169,7 +175,8 @@ struct SemverTriplet {
 // ─── Subcommands ───
 
 #[derive(Subcommand)]
-pub enum ListCmd {
+/// List management subcommands.
+pub(crate) enum ListCmd {
     /// List all lists
     #[command(alias = "ls")]
     List,
@@ -521,7 +528,8 @@ mod tests {
 }
 
 #[derive(Subcommand)]
-pub enum ItemCmd {
+/// Item management subcommands.
+pub(crate) enum ItemCmd {
     /// List all items in a list
     #[command(alias = "ls")]
     List {
@@ -669,7 +677,8 @@ pub enum ItemCmd {
 }
 
 #[derive(Subcommand)]
-pub enum FolderCmd {
+/// Folder management subcommands.
+pub(crate) enum FolderCmd {
     #[command(alias = "ls")]
     List,
     Create {
@@ -699,7 +708,8 @@ pub enum FolderCmd {
 }
 
 #[derive(Subcommand)]
-pub enum MemberCmd {
+/// Sharing and membership subcommands.
+pub(crate) enum MemberCmd {
     #[command(alias = "ls")]
     List {
         #[arg(value_parser = resolve_list_reference)]
@@ -741,7 +751,8 @@ pub enum MemberCmd {
 }
 
 #[derive(Subcommand)]
-pub enum KeyCmd {
+/// API key management subcommands.
+pub(crate) enum KeyCmd {
     /// List API keys
     #[command(alias = "ls")]
     List,
@@ -760,7 +771,8 @@ pub enum KeyCmd {
 }
 
 #[derive(Subcommand)]
-pub enum SecurityCmd {
+/// Account security subcommands.
+pub(crate) enum SecurityCmd {
     /// Security level, factors, and login alert emails
     Status,
     /// Confirm an unusual login (token from email/security notice)
@@ -771,13 +783,15 @@ pub enum SecurityCmd {
 }
 
 #[derive(Subcommand)]
-pub enum PrivacyCmd {
+/// Local privacy preference subcommands.
+pub(crate) enum PrivacyCmd {
     /// Reset telemetry and Bootstrap icon preferences so Kramli asks again
     Reset,
 }
 
 #[derive(Subcommand)]
-pub enum HandoffCmd {
+/// Cross-device handoff subcommands.
+pub(crate) enum HandoffCmd {
     /// Mark a list as currently viewed on this device
     Viewing {
         #[arg(value_parser = resolve_list_reference)]
@@ -802,7 +816,8 @@ pub enum HandoffCmd {
 
 // ─── Dispatch ───
 
-pub async fn run(cli: Cli) -> Result<(), String> {
+/// Execute a parsed CLI invocation.
+pub(crate) async fn run(cli: Cli) -> Result<(), String> {
     let command_label = if cli.interactive {
         "interactive"
     } else {
@@ -838,7 +853,7 @@ pub async fn run(cli: Cli) -> Result<(), String> {
 
 async fn run_inner(cli: Cli) -> Result<(), String> {
     // Honour NO_COLOR convention (https://no-color.org/)
-    if std::env::var("NO_COLOR").is_ok() || cli.json {
+    if std::env::var(NO_COLOR_ENV).is_ok() || cli.json {
         set_override(false);
     }
 
@@ -1025,7 +1040,7 @@ fn apply_profile_locale_now(profile: &Profile) {
 }
 
 fn profile_json_with_lang(profile: &Profile) -> Value {
-    let mut out = serde_json::to_value(profile).unwrap_or_else(|_| json!({}));
+    let mut out = serde_json::to_value(profile).unwrap_or_else(|_| empty_json_object());
     if let Some(obj) = out.as_object_mut() {
         let source = effective_lang_source(profile);
         let profile_lang = profile_lang(profile);
@@ -1347,8 +1362,7 @@ fn handoff_body(
 fn unix_timestamp_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |duration| duration.as_secs() as i64)
 }
 
 fn parse_semver_triplet(raw: &str) -> Option<SemverTriplet> {
@@ -1682,95 +1696,23 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
             oldest,
             limit,
         } => {
-            let list = if as_json {
-                None
-            } else {
-                api.get::<ShoppingList>(&format!("/lists/{list_id}"))
-                    .await
-                    .ok()
-            };
-            let items: Vec<ListItem> = api.get(&format!("/lists/{list_id}/items")).await?;
-            let state_filter = state
-                .map(|value| value.trim().to_ascii_lowercase())
-                .filter(|value| !value.is_empty());
-            let contains_filter = contains
-                .map(|value| value.trim().to_ascii_lowercase())
-                .filter(|value| !value.is_empty());
-            let mut filtered: Vec<ListItem> = items
-                .into_iter()
-                .filter(|item| {
-                    let is_done = item.is_done.unwrap_or(false);
-                    if open && is_done {
-                        return false;
-                    }
-                    if completed && !is_done {
-                        return false;
-                    }
-
-                    if let Some(state_value) = state_filter.as_deref() {
-                        let item_state = item
-                            .progress
-                            .as_deref()
-                            .unwrap_or("")
-                            .trim()
-                            .to_ascii_lowercase();
-                        if item_state != state_value {
-                            return false;
-                        }
-                    }
-
-                    if let Some(query) = contains_filter.as_deref() {
-                        let text = item.text.to_ascii_lowercase();
-                        if !text.contains(query) {
-                            return false;
-                        }
-                    }
-
-                    true
-                })
-                .collect();
-
-            if newest {
-                filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            } else if oldest {
-                filtered.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-            }
-
-            if let Some(max) = limit {
-                filtered.truncate(max);
-            }
-
-            json_or!(
-                as_json,
-                filtered,
-                output::print_items_for_list(list.as_ref(), &filtered)
-            );
-            maybe_auto_handoff(
+            run_items_list(
                 &api,
-                list_id,
-                list.as_ref().map(|l| l.name.as_str()),
                 as_json,
+                ItemListArgs {
+                    list_id,
+                    open,
+                    completed,
+                    state,
+                    contains,
+                    newest,
+                    oldest,
+                    limit,
+                },
             )
-            .await;
+            .await?
         }
-        ItemCmd::Show { id } => {
-            // Fetch item from its list (the items endpoint returns full data)
-            let comments: Vec<crate::models::ItemComment> =
-                api.get(&format!("/items/{id}/comments")).await?;
-            let (item, _) = find_item_across_lists(&api, id)
-                .await?
-                .ok_or_else(|| tr_args("cli-item-not-found", &[("id", id.to_string())]))?;
-            if as_json {
-                let mut val = serde_json::to_value(&item).unwrap_or_default();
-                val["comments"] = serde_json::to_value(&comments).unwrap_or_default();
-                println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
-            } else {
-                output::print_item_detail(&item, &comments);
-            }
-            if let Some(list_id) = item.list_id {
-                maybe_auto_handoff(&api, list_id, None, as_json).await;
-            }
-        }
+        ItemCmd::Show { id } => run_items_show(&api, as_json, id).await?,
         ItemCmd::Add {
             list_id,
             text,
@@ -1792,57 +1734,32 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
             color,
             progress,
         } => {
-            let tag_vec = tags.map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
-            let reminder = effective_reminder_value(
-                reminder,
-                reminder_details_provided(&reminder_time, reminder_days_before, &reminder_offsets),
-            );
-            let body = CreateItem {
-                text,
-                quantity,
-                notes,
-                due_date: due,
-                due_time,
-                planned_date: planned,
-                planned_time,
-                reminder,
-                reminder_time,
-                reminder_days_before,
-                reminder_offsets,
-                travel_time_minutes,
-                priority,
-                tags: tag_vec,
-                parent_item_id: parent,
-            };
-            // Build a Value so we can add extra fields (assign, color)
-            let mut val = serde_json::to_value(&body).map_err(|e| e.to_string())?;
-            if let Some(a) = assign {
-                let ids: Vec<Value> = a
-                    .split(',')
-                    .filter_map(|s| s.trim().parse::<i64>().ok())
-                    .map(Value::from)
-                    .collect();
-                val["assigned_to"] = Value::Array(ids);
-            }
-            if let Some(c) = color {
-                val["color"] = Value::String(c);
-            }
-            if let Some(progress_value) = normalize_progress_value(progress) {
-                val["progress"] = progress_value;
-            }
-            let item: ListItem = api.post(&format!("/lists/{list_id}/items"), &val).await?;
-            if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&item).unwrap_or_default()
-                );
-            } else {
-                println!(
-                    "{} {}",
-                    "✓".green(),
-                    tr_args("cli-item-created", &[("id", item.id.to_string())])
-                );
-            }
+            run_items_add(
+                &api,
+                as_json,
+                ItemAddArgs {
+                    list_id,
+                    text,
+                    quantity,
+                    due,
+                    due_time,
+                    planned,
+                    planned_time,
+                    reminder,
+                    reminder_time,
+                    reminder_days_before,
+                    reminder_offsets,
+                    travel_time_minutes,
+                    priority,
+                    tags,
+                    notes,
+                    parent,
+                    assign,
+                    color,
+                    progress,
+                },
+            )
+            .await?
         }
         ItemCmd::Update {
             id,
@@ -1864,230 +1781,542 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
             color,
             progress,
         } => {
-            let tags_provided = tags.is_some();
-            let mut body = serde_json::Map::new();
-            let reminder = effective_reminder_value(
-                reminder,
-                reminder_details_provided(&reminder_time, reminder_days_before, &reminder_offsets),
-            );
-            if let Some(t) = text {
-                body.insert("text".into(), Value::String(t));
-            }
-            if let Some(q) = quantity {
-                body.insert("quantity".into(), Value::String(q));
-            }
-            if let Some(d) = due {
-                body.insert("due_date".into(), Value::String(d));
-            }
-            if let Some(due_time) = due_time {
-                body.insert("due_time".into(), Value::String(due_time));
-            }
-            if let Some(planned) = planned {
-                body.insert("planned_date".into(), Value::String(planned));
-            }
-            if let Some(planned_time) = planned_time {
-                body.insert("planned_time".into(), Value::String(planned_time));
-            }
-            if let Some(r) = reminder {
-                body.insert("reminder".into(), Value::Bool(r));
-            }
-            if let Some(rt) = reminder_time {
-                body.insert("reminder_time".into(), Value::String(rt));
-            }
-            if let Some(days) = reminder_days_before {
-                body.insert("reminder_days_before".into(), Value::from(days));
-            }
-            if let Some(offsets) = reminder_offsets {
-                body.insert(
-                    "reminder_offsets".into(),
-                    Value::Array(offsets.into_iter().map(Value::from).collect()),
-                );
-            }
-            if let Some(minutes) = travel_time_minutes {
-                body.insert("travel_time_minutes".into(), Value::from(minutes));
-            }
-            if let Some(p) = priority {
-                body.insert("priority".into(), Value::String(p));
-            }
-            if let Some(n) = notes {
-                body.insert("notes".into(), Value::String(n));
-            }
-            if let Some(c) = color {
-                body.insert("color".into(), Value::String(c));
-            }
-            if let Some(progress_value) = normalize_progress_value(progress) {
-                body.insert("progress".into(), progress_value);
-            }
-            if let Some(t) = tags {
-                let arr: Vec<Value> = t
-                    .split(',')
-                    .map(|s| Value::String(s.trim().to_string()))
-                    .collect();
-                body.insert("tags".into(), Value::Array(arr));
-            }
-            if let Some(a) = assign {
-                let ids: Vec<Value> = a
-                    .split(',')
-                    .filter_map(|s| s.trim().parse::<i64>().ok())
-                    .map(Value::from)
-                    .collect();
-                body.insert("assigned_to".into(), Value::Array(ids));
-            }
-            if body.is_empty() {
-                return Err(tr("cli-no-changes"));
-            }
-            let mut item: ListItem = api.put(&format!("/items/{id}"), &body).await?;
-            if !tags_provided {
-                enrich_item_tags_from_list(&api, &mut item).await;
-            }
-            json_or!(
-                as_json,
-                item,
-                println!("{} {}", "✓".green(), tr("cli-item-updated"))
-            );
-        }
-        ItemCmd::Done { id } => {
-            let mut resp: Value = api
-                .patch_json(&format!("/items/{id}/done"), &json!({}))
-                .await?;
-            enrich_done_response_tags(&api, id, &mut resp).await;
-            if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&resp).unwrap_or_default()
-                );
-            } else {
-                println!("{} {}", "✓".green(), tr("cli-item-toggled"));
-            }
-        }
-        ItemCmd::Vote { id } => {
-            let resp: Value = api
-                .patch_json(&format!("/items/{id}/upvote"), &json!({}))
-                .await?;
-            if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&resp).unwrap_or_default()
-                );
-            } else {
-                let upvoted_by_me = resp
-                    .get("upvoted_by_me")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false);
-                let upvote_count = resp
-                    .get("upvote_count")
-                    .and_then(|value| value.as_i64())
-                    .unwrap_or(0);
-                if upvoted_by_me {
-                    println!(
-                        "{} {}",
-                        "✓".green(),
-                        tr_args(
-                            "cli-item-upvoted",
-                            &[("id", id.to_string()), ("count", upvote_count.to_string())],
-                        )
-                    );
-                } else {
-                    println!(
-                        "{} {}",
-                        "✓".green(),
-                        tr_args(
-                            "cli-item-vote-removed",
-                            &[("id", id.to_string()), ("count", upvote_count.to_string())],
-                        )
-                    );
-                }
-            }
-        }
-        ItemCmd::Delete { id } => {
-            let resp: OkResponse = api.delete(&format!("/items/{id}")).await?;
-            if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&resp).unwrap_or_default()
-                );
-            } else {
-                println!("{} {}", "✓".green(), tr("cli-item-deleted"));
-                if let Some(t) = resp.undo_token {
-                    println!("  {}: {t}", tr("label-undo-token"));
-                }
-            }
-        }
-        ItemCmd::DoneList { list_id } => {
-            let list = if as_json {
-                None
-            } else {
-                api.get::<ShoppingList>(&format!("/lists/{list_id}"))
-                    .await
-                    .ok()
-            };
-            let items: Vec<ListItem> = api.get(&format!("/lists/{list_id}/items")).await?;
-            let done: Vec<ListItem> = items
-                .into_iter()
-                .filter(|i| i.is_done.unwrap_or(false))
-                .collect();
-            if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&done).unwrap_or_default()
-                );
-            } else if done.is_empty() {
-                println!("{}", tr("cli-no-completed-items").dimmed());
-            } else {
-                output::print_items_for_list(list.as_ref(), &done);
-            }
-            maybe_auto_handoff(
+            run_items_update(
                 &api,
-                list_id,
-                list.as_ref().map(|l| l.name.as_str()),
                 as_json,
+                ItemUpdateArgs {
+                    id,
+                    text,
+                    quantity,
+                    due,
+                    due_time,
+                    planned,
+                    planned_time,
+                    reminder,
+                    reminder_time,
+                    reminder_days_before,
+                    reminder_offsets,
+                    travel_time_minutes,
+                    priority,
+                    tags,
+                    notes,
+                    assign,
+                    color,
+                    progress,
+                },
             )
-            .await;
+            .await?
         }
-        ItemCmd::Comment { id, text } => {
-            let resp: Value = api
-                .post(&format!("/items/{id}/comments"), &json!({"text": text}))
-                .await?;
-            if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&resp).unwrap_or_default()
-                );
-            } else {
-                println!("{} {}", "✓".green(), tr("cli-comment-added"));
-            }
+        ItemCmd::Done { id } => run_items_done(&api, as_json, id).await?,
+        ItemCmd::Vote { id } => run_items_vote(&api, as_json, id).await?,
+        ItemCmd::Delete { id } => run_items_delete(&api, as_json, id).await?,
+        ItemCmd::DoneList { list_id } => run_items_done_list(&api, as_json, list_id).await?,
+        ItemCmd::Comment { id, text } => run_items_comment(&api, as_json, id, text).await?,
+        ItemCmd::CheckAll { list_id } => run_items_check_all(&api, as_json, list_id).await?,
+        ItemCmd::ClearDone { list_id } => run_items_clear_done(&api, as_json, list_id).await?,
+    }
+    Ok(())
+}
+
+struct ItemListArgs {
+    list_id: i64,
+    open: bool,
+    completed: bool,
+    state: Option<String>,
+    contains: Option<String>,
+    newest: bool,
+    oldest: bool,
+    limit: Option<usize>,
+}
+
+async fn run_items_list(api: &ApiClient, as_json: bool, args: ItemListArgs) -> Result<(), String> {
+    let ItemListArgs {
+        list_id,
+        open,
+        completed,
+        state,
+        contains,
+        newest,
+        oldest,
+        limit,
+    } = args;
+    let list = if as_json {
+        None
+    } else {
+        api.get::<ShoppingList>(&format!("/lists/{list_id}"))
+            .await
+            .ok()
+    };
+    let items: Vec<ListItem> = api.get(&format!("/lists/{list_id}/items")).await?;
+    let state_filter = state
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let contains_filter = contains
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let mut filtered: Vec<ListItem> = items
+        .into_iter()
+        .filter(|item| {
+            item_matches_filters(
+                item,
+                open,
+                completed,
+                state_filter.as_deref(),
+                contains_filter.as_deref(),
+            )
+        })
+        .collect();
+
+    if newest {
+        filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    } else if oldest {
+        filtered.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    }
+
+    if let Some(max) = limit {
+        filtered.truncate(max);
+    }
+
+    json_or!(
+        as_json,
+        filtered,
+        output::print_items_for_list(list.as_ref(), &filtered)
+    );
+    maybe_auto_handoff(
+        api,
+        list_id,
+        list.as_ref().map(|l| l.name.as_str()),
+        as_json,
+    )
+    .await;
+    Ok(())
+}
+
+fn item_matches_filters(
+    item: &ListItem,
+    open: bool,
+    completed: bool,
+    state_filter: Option<&str>,
+    contains_filter: Option<&str>,
+) -> bool {
+    let is_done = item.is_done.unwrap_or(false);
+    if open && is_done {
+        return false;
+    }
+    if completed && !is_done {
+        return false;
+    }
+
+    if let Some(state_value) = state_filter {
+        let item_state = item
+            .progress
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if item_state != state_value {
+            return false;
         }
-        ItemCmd::CheckAll { list_id } => {
-            let resp: Value = api
-                .post(&format!("/lists/{list_id}/check-all"), &json!({}))
-                .await?;
-            if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&resp).unwrap_or_default()
-                );
-            } else {
-                println!("{} {}", "✓".green(), tr("cli-check-all-done"));
-            }
+    }
+
+    if let Some(query) = contains_filter {
+        let text = item.text.to_ascii_lowercase();
+        if !text.contains(query) {
+            return false;
         }
-        ItemCmd::ClearDone { list_id } => {
-            let resp: Value = api
-                .post(&format!("/lists/{list_id}/clear-done"), &json!({}))
-                .await?;
-            if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&resp).unwrap_or_default()
-                );
-            } else {
-                let count = resp.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-                println!(
-                    "{} {}",
-                    "✓".green(),
-                    tr_args("cli-clear-done", &[("count", count.to_string())])
-                );
-            }
+    }
+
+    true
+}
+
+async fn run_items_show(api: &ApiClient, as_json: bool, id: i64) -> Result<(), String> {
+    let comments: Vec<crate::models::ItemComment> =
+        api.get(&format!("/items/{id}/comments")).await?;
+    let (item, _) = find_item_across_lists(api, id)
+        .await?
+        .ok_or_else(|| tr_args("cli-item-not-found", &[("id", id.to_string())]))?;
+    if as_json {
+        let mut val = serde_json::to_value(&item).unwrap_or_default();
+        val["comments"] = serde_json::to_value(&comments).unwrap_or_default();
+        println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
+    } else {
+        output::print_item_detail(&item, &comments);
+    }
+    if let Some(list_id) = item.list_id {
+        maybe_auto_handoff(api, list_id, None, as_json).await;
+    }
+    Ok(())
+}
+
+struct ItemAddArgs {
+    list_id: i64,
+    text: String,
+    quantity: Option<String>,
+    due: Option<String>,
+    due_time: Option<String>,
+    planned: Option<String>,
+    planned_time: Option<String>,
+    reminder: Option<bool>,
+    reminder_time: Option<String>,
+    reminder_days_before: Option<i64>,
+    reminder_offsets: Option<Vec<i64>>,
+    travel_time_minutes: Option<i64>,
+    priority: Option<String>,
+    tags: Option<String>,
+    notes: Option<String>,
+    parent: Option<i64>,
+    assign: Option<String>,
+    color: Option<String>,
+    progress: Option<String>,
+}
+
+async fn run_items_add(api: &ApiClient, as_json: bool, args: ItemAddArgs) -> Result<(), String> {
+    let ItemAddArgs {
+        list_id,
+        text,
+        quantity,
+        due,
+        due_time,
+        planned,
+        planned_time,
+        reminder,
+        reminder_time,
+        reminder_days_before,
+        reminder_offsets,
+        travel_time_minutes,
+        priority,
+        tags,
+        notes,
+        parent,
+        assign,
+        color,
+        progress,
+    } = args;
+    let tag_vec = tags.map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
+    let reminder = effective_reminder_value(
+        reminder,
+        reminder_details_provided(&reminder_time, reminder_days_before, &reminder_offsets),
+    );
+    let body = CreateItem {
+        text,
+        quantity,
+        notes,
+        due_date: due,
+        due_time,
+        planned_date: planned,
+        planned_time,
+        reminder,
+        reminder_time,
+        reminder_days_before,
+        reminder_offsets,
+        travel_time_minutes,
+        priority,
+        tags: tag_vec,
+        parent_item_id: parent,
+    };
+    let mut val = serde_json::to_value(&body).map_err(|e| e.to_string())?;
+    if let Some(a) = assign {
+        val["assigned_to"] = Value::Array(parse_id_values(&a));
+    }
+    if let Some(c) = color {
+        val["color"] = Value::String(c);
+    }
+    if let Some(progress_value) = normalize_progress_value(progress) {
+        val["progress"] = progress_value;
+    }
+    let item: ListItem = api.post(&format!("/lists/{list_id}/items"), &val).await?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&item).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "{} {}",
+            "✓".green(),
+            tr_args("cli-item-created", &[("id", item.id.to_string())])
+        );
+    }
+    Ok(())
+}
+
+struct ItemUpdateArgs {
+    id: i64,
+    text: Option<String>,
+    quantity: Option<String>,
+    due: Option<String>,
+    due_time: Option<String>,
+    planned: Option<String>,
+    planned_time: Option<String>,
+    reminder: Option<bool>,
+    reminder_time: Option<String>,
+    reminder_days_before: Option<i64>,
+    reminder_offsets: Option<Vec<i64>>,
+    travel_time_minutes: Option<i64>,
+    priority: Option<String>,
+    tags: Option<String>,
+    notes: Option<String>,
+    assign: Option<String>,
+    color: Option<String>,
+    progress: Option<String>,
+}
+
+async fn run_items_update(
+    api: &ApiClient,
+    as_json: bool,
+    args: ItemUpdateArgs,
+) -> Result<(), String> {
+    let ItemUpdateArgs {
+        id,
+        text,
+        quantity,
+        due,
+        due_time,
+        planned,
+        planned_time,
+        reminder,
+        reminder_time,
+        reminder_days_before,
+        reminder_offsets,
+        travel_time_minutes,
+        priority,
+        tags,
+        notes,
+        assign,
+        color,
+        progress,
+    } = args;
+    let tags_provided = tags.is_some();
+    let mut body = serde_json::Map::new();
+    let reminder = effective_reminder_value(
+        reminder,
+        reminder_details_provided(&reminder_time, reminder_days_before, &reminder_offsets),
+    );
+    insert_string(&mut body, "text", text);
+    insert_string(&mut body, "quantity", quantity);
+    insert_string(&mut body, "due_date", due);
+    insert_string(&mut body, "due_time", due_time);
+    insert_string(&mut body, "planned_date", planned);
+    insert_string(&mut body, "planned_time", planned_time);
+    if let Some(r) = reminder {
+        body.insert("reminder".into(), Value::Bool(r));
+    }
+    insert_string(&mut body, "reminder_time", reminder_time);
+    if let Some(days) = reminder_days_before {
+        body.insert("reminder_days_before".into(), Value::from(days));
+    }
+    if let Some(offsets) = reminder_offsets {
+        body.insert(
+            "reminder_offsets".into(),
+            Value::Array(offsets.into_iter().map(Value::from).collect()),
+        );
+    }
+    if let Some(minutes) = travel_time_minutes {
+        body.insert("travel_time_minutes".into(), Value::from(minutes));
+    }
+    insert_string(&mut body, "priority", priority);
+    insert_string(&mut body, "notes", notes);
+    insert_string(&mut body, "color", color);
+    if let Some(progress_value) = normalize_progress_value(progress) {
+        body.insert("progress".into(), progress_value);
+    }
+    if let Some(t) = tags {
+        let arr: Vec<Value> = t
+            .split(',')
+            .map(|s| Value::String(s.trim().to_string()))
+            .collect();
+        body.insert("tags".into(), Value::Array(arr));
+    }
+    if let Some(a) = assign {
+        body.insert("assigned_to".into(), Value::Array(parse_id_values(&a)));
+    }
+    if body.is_empty() {
+        return Err(tr("cli-no-changes"));
+    }
+    let mut item: ListItem = api.put(&format!("/items/{id}"), &body).await?;
+    if !tags_provided {
+        enrich_item_tags_from_list(api, &mut item).await;
+    }
+    json_or!(
+        as_json,
+        item,
+        println!("{} {}", "✓".green(), tr("cli-item-updated"))
+    );
+    Ok(())
+}
+
+fn insert_string(body: &mut serde_json::Map<String, Value>, key: &str, value: Option<String>) {
+    if let Some(value) = value {
+        body.insert(key.into(), Value::String(value));
+    }
+}
+
+fn parse_id_values(raw: &str) -> Vec<Value> {
+    raw.split(',')
+        .filter_map(|s| s.trim().parse::<i64>().ok())
+        .map(Value::from)
+        .collect()
+}
+
+fn empty_json_object() -> Value {
+    Value::Object(serde_json::Map::new())
+}
+
+async fn run_items_done(api: &ApiClient, as_json: bool, id: i64) -> Result<(), String> {
+    let mut resp: Value = api
+        .patch_json(&format!("/items/{id}/done"), &empty_json_object())
+        .await?;
+    enrich_done_response_tags(api, id, &mut resp).await;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resp).unwrap_or_default()
+        );
+    } else {
+        println!("{} {}", "✓".green(), tr("cli-item-toggled"));
+    }
+    Ok(())
+}
+
+async fn run_items_vote(api: &ApiClient, as_json: bool, id: i64) -> Result<(), String> {
+    let resp: Value = api
+        .patch_json(&format!("/items/{id}/upvote"), &empty_json_object())
+        .await?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resp).unwrap_or_default()
+        );
+        return Ok(());
+    }
+
+    let upvoted_by_me = resp
+        .get("upvoted_by_me")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let upvote_count = resp
+        .get("upvote_count")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
+    let key = if upvoted_by_me {
+        "cli-item-upvoted"
+    } else {
+        "cli-item-vote-removed"
+    };
+    println!(
+        "{} {}",
+        "✓".green(),
+        tr_args(
+            key,
+            &[("id", id.to_string()), ("count", upvote_count.to_string())],
+        )
+    );
+    Ok(())
+}
+
+async fn run_items_delete(api: &ApiClient, as_json: bool, id: i64) -> Result<(), String> {
+    let resp: OkResponse = api.delete(&format!("/items/{id}")).await?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resp).unwrap_or_default()
+        );
+    } else {
+        println!("{} {}", "✓".green(), tr("cli-item-deleted"));
+        if let Some(t) = resp.undo_token {
+            println!("  {}: {t}", tr("label-undo-token"));
         }
+    }
+    Ok(())
+}
+
+async fn run_items_done_list(api: &ApiClient, as_json: bool, list_id: i64) -> Result<(), String> {
+    let list = if as_json {
+        None
+    } else {
+        api.get::<ShoppingList>(&format!("/lists/{list_id}"))
+            .await
+            .ok()
+    };
+    let items: Vec<ListItem> = api.get(&format!("/lists/{list_id}/items")).await?;
+    let done: Vec<ListItem> = items
+        .into_iter()
+        .filter(|i| i.is_done.unwrap_or(false))
+        .collect();
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&done).unwrap_or_default()
+        );
+    } else if done.is_empty() {
+        println!("{}", tr("cli-no-completed-items").dimmed());
+    } else {
+        output::print_items_for_list(list.as_ref(), &done);
+    }
+    maybe_auto_handoff(
+        api,
+        list_id,
+        list.as_ref().map(|l| l.name.as_str()),
+        as_json,
+    )
+    .await;
+    Ok(())
+}
+
+async fn run_items_comment(
+    api: &ApiClient,
+    as_json: bool,
+    id: i64,
+    text: String,
+) -> Result<(), String> {
+    let resp: Value = api
+        .post(&format!("/items/{id}/comments"), &json!({"text": text}))
+        .await?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resp).unwrap_or_default()
+        );
+    } else {
+        println!("{} {}", "✓".green(), tr("cli-comment-added"));
+    }
+    Ok(())
+}
+
+async fn run_items_check_all(api: &ApiClient, as_json: bool, list_id: i64) -> Result<(), String> {
+    let resp: Value = api
+        .post(&format!("/lists/{list_id}/check-all"), &empty_json_object())
+        .await?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resp).unwrap_or_default()
+        );
+    } else {
+        println!("{} {}", "✓".green(), tr("cli-check-all-done"));
+    }
+    Ok(())
+}
+
+async fn run_items_clear_done(api: &ApiClient, as_json: bool, list_id: i64) -> Result<(), String> {
+    let resp: Value = api
+        .post(
+            &format!("/lists/{list_id}/clear-done"),
+            &empty_json_object(),
+        )
+        .await?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resp).unwrap_or_default()
+        );
+    } else {
+        let count = resp.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+        println!(
+            "{} {}",
+            "✓".green(),
+            tr_args("cli-clear-done", &[("count", count.to_string())])
+        );
     }
     Ok(())
 }
@@ -2208,7 +2437,10 @@ async fn run_members(cmd: MemberCmd, as_json: bool) -> Result<(), String> {
         }
         MemberCmd::InviteLink { list_id } => {
             let resp: Value = api
-                .post(&format!("/lists/{list_id}/invite-link"), &json!({}))
+                .post(
+                    &format!("/lists/{list_id}/invite-link"),
+                    &empty_json_object(),
+                )
                 .await?;
             if as_json {
                 println!(
@@ -2230,7 +2462,7 @@ async fn run_members(cmd: MemberCmd, as_json: bool) -> Result<(), String> {
         }
         MemberCmd::Leave { list_id } => {
             let _: Value = api
-                .post(&format!("/lists/{list_id}/leave"), &json!({}))
+                .post(&format!("/lists/{list_id}/leave"), &empty_json_object())
                 .await?;
             println!("{} {}", "✓".green(), tr("cli-list-left"));
         }
@@ -2412,7 +2644,7 @@ async fn run_activity(list_id: i64, limit: u32, as_json: bool) -> Result<(), Str
 async fn run_undo(list_id: i64) -> Result<(), String> {
     let api = get_api()?;
     let _: Value = api
-        .post(&format!("/lists/{list_id}/undo"), &json!({}))
+        .post(&format!("/lists/{list_id}/undo"), &empty_json_object())
         .await?;
     println!("{} {}", "✓".green(), tr("cli-undo-done"));
     Ok(())
@@ -2421,7 +2653,7 @@ async fn run_undo(list_id: i64) -> Result<(), String> {
 async fn run_redo(list_id: i64) -> Result<(), String> {
     let api = get_api()?;
     let _: Value = api
-        .post(&format!("/lists/{list_id}/redo"), &json!({}))
+        .post(&format!("/lists/{list_id}/redo"), &empty_json_object())
         .await?;
     println!("{} {}", "✓".green(), tr("cli-redo-done"));
     Ok(())
@@ -2442,7 +2674,7 @@ fn default_handoff_device_label(raw: Option<String>) -> String {
     if let Some(value) = normalize_optional_text(raw) {
         return value.chars().take(80).collect();
     }
-    if let Ok(value) = std::env::var("KRAMLI_DEVICE_LABEL") {
+    if let Ok(value) = std::env::var(KRAMLI_DEVICE_LABEL_ENV) {
         if !value.trim().is_empty() {
             return value.trim().chars().take(80).collect();
         }
@@ -2481,7 +2713,7 @@ async fn run_handoff(cmd: HandoffCmd, as_json: bool) -> Result<(), String> {
             );
         }
         HandoffCmd::Clear => {
-            let resp: Value = api.post("/activity/clear", &json!({})).await?;
+            let resp: Value = api.post("/activity/clear", &empty_json_object()).await?;
             json_or!(
                 as_json,
                 resp,
@@ -2867,7 +3099,7 @@ async fn run_security(cmd: SecurityCmd, as_json: bool) -> Result<(), String> {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned)
-                .or_else(|| std::env::var("KRAMLI_ACK_TOKEN").ok());
+                .or_else(|| std::env::var(KRAMLI_ACK_TOKEN_ENV).ok());
             let Some(token) = token else {
                 return Err(tr("cli-security-ack-token-missing"));
             };
@@ -2882,19 +3114,22 @@ async fn run_security(cmd: SecurityCmd, as_json: bool) -> Result<(), String> {
             }
             if data.get("ok").and_then(Value::as_bool) == Some(true) {
                 let default_message = tr("cli-security-ack-confirmed");
-                let message = data
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or(default_message.as_str());
+                let message = match data.get("message").and_then(Value::as_str) {
+                    Some(message) => message,
+                    None => default_message.as_str(),
+                };
                 println!("{} {}", "✓".green(), message);
                 Ok(())
             } else {
                 let default_message = tr("cli-security-ack-failed");
-                let message = data
+                let message = match data
                     .get("error")
                     .or_else(|| data.get("message"))
                     .and_then(Value::as_str)
-                    .unwrap_or(default_message.as_str());
+                {
+                    Some(message) => message,
+                    None => default_message.as_str(),
+                };
                 Err(message.to_string())
             }
         }
@@ -2955,14 +3190,9 @@ async fn run_accept_terms(docs: Option<Vec<String>>, as_json: bool) -> Result<()
         }
     }
 
-    let body = if let Some(values) = normalized_docs {
-        if values.is_empty() {
-            json!({})
-        } else {
-            json!({ "docs": values })
-        }
-    } else {
-        json!({})
+    let body = match normalized_docs {
+        Some(values) if !values.is_empty() => json!({ "docs": values }),
+        _ => Value::Object(serde_json::Map::new()),
     };
 
     let resp: Value = api.post("/accept-terms", &body).await?;

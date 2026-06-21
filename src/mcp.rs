@@ -9,6 +9,10 @@ use crate::telemetry;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
 
+fn empty_json_object() -> Value {
+    Value::Object(Map::new())
+}
+
 #[derive(Clone, Copy)]
 enum MessageFraming {
     ContentLength,
@@ -20,7 +24,8 @@ struct IncomingMessage {
     framing: MessageFraming,
 }
 
-pub async fn run_stdio() -> Result<(), String> {
+/// Run the MCP server over standard input and output.
+pub(crate) async fn run_stdio() -> Result<(), String> {
     let mut stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut buffer = Vec::new();
@@ -57,7 +62,7 @@ async fn handle_message(message: Value) -> Option<Value> {
                 "version": env!("CARGO_PKG_VERSION")
             }
         })),
-        "ping" => Ok(json!({})),
+        "ping" => Ok(empty_json_object()),
         "tools/list" => Ok(json!({"tools": tools()})),
         "tools/call" => handle_tool_call(message.get("params").unwrap_or(&Value::Null)).await,
         _ => {
@@ -247,7 +252,7 @@ async fn update_item(api: &ApiClient, args: &Map<String, Value>) -> Result<Value
 
 async fn toggle_item_done(api: &ApiClient, args: &Map<String, Value>) -> Result<Value, String> {
     let id = required_i64(args, "id")?;
-    api.patch_json(&format!("/items/{id}/done"), &json!({}))
+    api.patch_json(&format!("/items/{id}/done"), &empty_json_object())
         .await
 }
 

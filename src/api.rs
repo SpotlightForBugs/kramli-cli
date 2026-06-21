@@ -12,8 +12,9 @@ use crate::config::Config;
 use crate::i18n::{current_locale_code, tr_args};
 use crate::telemetry;
 
+/// Authenticated HTTP client for the Kramli API.
 #[derive(Clone)]
-pub struct ApiClient {
+pub(crate) struct ApiClient {
     client: Client,
     base_url: String,
     api_key: String,
@@ -24,6 +25,8 @@ const DEFAULT_RATE_LIMIT_MS: u64 = 120;
 const MAX_429_RETRIES: u32 = 3;
 const MAX_RESOURCE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_MESSAGE_CHARS: usize = 500;
+const KRAMLI_RATE_LIMIT_MS_ENV: &str = "KRAMLI_RATE_LIMIT_MS";
+const KRAMLI_ALLOW_EXTERNAL_RESOURCES_ENV: &str = "KRAMLI_ALLOW_EXTERNAL_RESOURCES";
 
 fn metric_i64(value: impl TryInto<i64>) -> i64 {
     value.try_into().unwrap_or(i64::MAX)
@@ -32,7 +35,8 @@ fn metric_i64(value: impl TryInto<i64>) -> i64 {
 static LAST_REQUEST_AT: OnceLock<tokio::sync::Mutex<Option<Instant>>> = OnceLock::new();
 
 impl ApiClient {
-    pub fn new(config: &Config) -> Result<Self, String> {
+    /// Build an API client from persisted configuration and keychain credentials.
+    pub(crate) fn new(config: &Config) -> Result<Self, String> {
         let api_key = config.require_api_key()?;
         let base_url = config.base_url().trim_end_matches('/').to_string();
         Self::ensure_secure_base_url(&base_url)?;
@@ -81,7 +85,7 @@ impl ApiClient {
     }
 
     fn read_rate_limit_interval() -> Duration {
-        let millis = std::env::var("KRAMLI_RATE_LIMIT_MS")
+        let millis = std::env::var(KRAMLI_RATE_LIMIT_MS_ENV)
             .ok()
             .and_then(|raw| raw.trim().parse::<u64>().ok())
             .unwrap_or(DEFAULT_RATE_LIMIT_MS);
@@ -217,7 +221,7 @@ impl ApiClient {
 
     fn external_resources_enabled() -> bool {
         Self::external_resources_enabled_from(
-            std::env::var("KRAMLI_ALLOW_EXTERNAL_RESOURCES")
+            std::env::var(KRAMLI_ALLOW_EXTERNAL_RESOURCES_ENV)
                 .ok()
                 .as_deref(),
         )
@@ -430,7 +434,8 @@ impl ApiClient {
         }
     }
 
-    pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+    /// Send an authenticated GET request and deserialize the JSON response.
+    pub(crate) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
         let span = self.request_span("GET", path);
         let url = self.url(path);
         let headers = self.headers();
@@ -455,7 +460,8 @@ impl ApiClient {
         result
     }
 
-    pub async fn get_query<T: DeserializeOwned>(
+    /// Send an authenticated GET request with query parameters.
+    pub(crate) async fn get_query<T: DeserializeOwned>(
         &self,
         path: &str,
         query: &[(&str, &str)],
@@ -494,7 +500,8 @@ impl ApiClient {
         result
     }
 
-    pub async fn post<B: Serialize, T: DeserializeOwned>(
+    /// Send an authenticated POST request with a JSON body.
+    pub(crate) async fn post<B: Serialize, T: DeserializeOwned>(
         &self,
         path: &str,
         body: &B,
@@ -530,7 +537,8 @@ impl ApiClient {
         result
     }
 
-    pub async fn put<B: Serialize, T: DeserializeOwned>(
+    /// Send an authenticated PUT request with a JSON body.
+    pub(crate) async fn put<B: Serialize, T: DeserializeOwned>(
         &self,
         path: &str,
         body: &B,
@@ -566,7 +574,8 @@ impl ApiClient {
         result
     }
 
-    pub async fn patch_json<B: Serialize, T: DeserializeOwned>(
+    /// Send an authenticated PATCH request with a JSON body.
+    pub(crate) async fn patch_json<B: Serialize, T: DeserializeOwned>(
         &self,
         path: &str,
         body: &B,
@@ -602,7 +611,8 @@ impl ApiClient {
         result
     }
 
-    pub async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+    /// Send an authenticated DELETE request and deserialize the JSON response.
+    pub(crate) async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
         let span = self.request_span("DELETE", path);
         let url = self.url(path);
         let headers = self.headers();
@@ -627,7 +637,8 @@ impl ApiClient {
         result
     }
 
-    pub async fn delete_ok(&self, path: &str) -> Result<bool, String> {
+    /// Send an authenticated DELETE request that may return an empty success body.
+    pub(crate) async fn delete_ok(&self, path: &str) -> Result<bool, String> {
         let span = self.request_span("DELETE", path);
         let url = self.url(path);
         let headers = self.headers();
@@ -666,7 +677,8 @@ impl ApiClient {
         }
     }
 
-    pub async fn get_bytes(&self, path_or_url: &str) -> Result<Vec<u8>, String> {
+    /// Fetch a same-origin or explicitly allowed public resource as bytes.
+    pub(crate) async fn get_bytes(&self, path_or_url: &str) -> Result<Vec<u8>, String> {
         let url = self.resource_url(path_or_url);
         let span = telemetry::TraceSpan::child("http.client", "api.resource");
         span.set_tag("api.method", "GET");

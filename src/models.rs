@@ -5,236 +5,253 @@ use crate::i18n::{tr, tr_args};
 // ── List ──
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ShoppingList {
-    pub id: i64,
-    pub name: String,
-    pub icon: Option<String>,
-    pub color: Option<String>,
-    pub folder_id: Option<i64>,
-    pub folder_name: Option<String>,
-    pub archived: Option<bool>,
-    pub archive_mode: Option<String>,
-    pub view_mode: Option<String>,
-    pub role: Option<String>,
-    pub item_count: Option<i64>,
-    pub done_count: Option<i64>,
-    pub state_config: Option<String>,
-    pub states: Option<Vec<ListState>>,
-    pub created_at: Option<String>,
+/// Shopping list returned by the Kramli API.
+pub(crate) struct ShoppingList {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) icon: Option<String>,
+    pub(crate) color: Option<String>,
+    pub(crate) folder_id: Option<i64>,
+    pub(crate) folder_name: Option<String>,
+    pub(crate) archived: Option<bool>,
+    pub(crate) archive_mode: Option<String>,
+    pub(crate) view_mode: Option<String>,
+    pub(crate) role: Option<String>,
+    pub(crate) item_count: Option<i64>,
+    pub(crate) done_count: Option<i64>,
+    pub(crate) state_config: Option<String>,
+    pub(crate) states: Option<Vec<ListState>>,
+    pub(crate) created_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListState {
-    pub name: Option<String>,
-    pub color: Option<String>,
-    pub is_done: Option<bool>,
+/// Custom workflow state configured for a list.
+pub(crate) struct ListState {
+    pub(crate) name: Option<String>,
+    pub(crate) color: Option<String>,
+    pub(crate) is_done: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
-pub struct CreateList {
-    pub name: String,
+/// Request payload for creating a list.
+pub(crate) struct CreateList {
+    pub(crate) name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub icon: Option<String>,
+    pub(crate) icon: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub color: Option<String>,
+    pub(crate) color: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub folder_id: Option<i64>,
+    pub(crate) folder_id: Option<i64>,
 }
 
 // ── Item ──
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListItem {
-    pub id: i64,
-    pub list_id: Option<i64>,
-    pub text: String,
-    pub is_done: Option<bool>,
-    pub quantity: Option<String>,
-    pub notes: Option<String>,
-    pub tldr: Option<String>,
-    pub due_date: Option<String>,
-    pub due_time: Option<String>,
-    pub planned_date: Option<String>,
-    pub planned_time: Option<String>,
-    pub repeat_label: Option<String>,
-    pub reminder: Option<bool>,
-    pub reminder_time: Option<String>,
-    pub reminder_days_before: Option<i64>,
-    pub reminder_offsets: Option<Vec<i64>>,
-    pub travel_time_minutes: Option<i64>,
-    pub priority: Option<String>,
-    pub progress: Option<String>,
-    pub tags: Option<Vec<String>>,
-    pub parent_item_id: Option<i64>,
-    pub depth: Option<i64>,
-    pub position: Option<i64>,
-    pub completed_at: Option<String>,
-    pub created_at: Option<String>,
-    pub updated_at: Option<String>,
-    pub assigned_to: Option<Vec<i64>>,
-    pub child_count: Option<i64>,
-    pub done_child_count: Option<i64>,
-    pub comment_count: Option<i64>,
-    pub color: Option<String>,
-    pub image_url: Option<String>,
-    pub image_filename: Option<String>,
-    pub attachments: Option<Vec<Attachment>>,
+/// Item returned by the Kramli API.
+pub(crate) struct ListItem {
+    pub(crate) id: i64,
+    pub(crate) list_id: Option<i64>,
+    pub(crate) text: String,
+    pub(crate) is_done: Option<bool>,
+    pub(crate) quantity: Option<String>,
+    pub(crate) notes: Option<String>,
+    pub(crate) tldr: Option<String>,
+    pub(crate) due_date: Option<String>,
+    pub(crate) due_time: Option<String>,
+    pub(crate) planned_date: Option<String>,
+    pub(crate) planned_time: Option<String>,
+    pub(crate) repeat_label: Option<String>,
+    pub(crate) reminder: Option<bool>,
+    pub(crate) reminder_time: Option<String>,
+    pub(crate) reminder_days_before: Option<i64>,
+    pub(crate) reminder_offsets: Option<Vec<i64>>,
+    pub(crate) travel_time_minutes: Option<i64>,
+    pub(crate) priority: Option<String>,
+    pub(crate) progress: Option<String>,
+    pub(crate) tags: Option<Vec<String>>,
+    pub(crate) parent_item_id: Option<i64>,
+    pub(crate) depth: Option<i64>,
+    pub(crate) position: Option<i64>,
+    pub(crate) completed_at: Option<String>,
+    pub(crate) created_at: Option<String>,
+    pub(crate) updated_at: Option<String>,
+    pub(crate) assigned_to: Option<Vec<i64>>,
+    pub(crate) child_count: Option<i64>,
+    pub(crate) done_child_count: Option<i64>,
+    pub(crate) comment_count: Option<i64>,
+    pub(crate) color: Option<String>,
+    pub(crate) image_url: Option<String>,
+    pub(crate) image_filename: Option<String>,
+    pub(crate) attachments: Option<Vec<Attachment>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Attachment {
-    pub id: i64,
-    pub filename: Option<String>,
-    pub original_filename: Option<String>,
-    pub mime_type: Option<String>,
-    pub file_size: Option<i64>,
-    pub url: Option<String>,
+/// File attachment metadata for a list item.
+pub(crate) struct Attachment {
+    pub(crate) id: i64,
+    pub(crate) filename: Option<String>,
+    pub(crate) original_filename: Option<String>,
+    pub(crate) mime_type: Option<String>,
+    pub(crate) file_size: Option<i64>,
+    pub(crate) url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ItemComment {
-    pub id: i64,
-    pub text: Option<String>,
-    pub user_id: Option<i64>,
-    pub user_name: Option<String>,
-    pub user_email: Option<String>,
-    pub created_at: Option<String>,
+/// Comment attached to a list item.
+pub(crate) struct ItemComment {
+    pub(crate) id: i64,
+    pub(crate) text: Option<String>,
+    pub(crate) user_id: Option<i64>,
+    pub(crate) user_name: Option<String>,
+    pub(crate) user_email: Option<String>,
+    pub(crate) created_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
-pub struct CreateItem {
-    pub text: String,
+/// Request payload for creating an item.
+pub(crate) struct CreateItem {
+    pub(crate) text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub quantity: Option<String>,
+    pub(crate) quantity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub notes: Option<String>,
+    pub(crate) notes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub due_date: Option<String>,
+    pub(crate) due_date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub due_time: Option<String>,
+    pub(crate) due_time: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub planned_date: Option<String>,
+    pub(crate) planned_date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub planned_time: Option<String>,
+    pub(crate) planned_time: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reminder: Option<bool>,
+    pub(crate) reminder: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reminder_time: Option<String>,
+    pub(crate) reminder_time: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reminder_days_before: Option<i64>,
+    pub(crate) reminder_days_before: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reminder_offsets: Option<Vec<i64>>,
+    pub(crate) reminder_offsets: Option<Vec<i64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub travel_time_minutes: Option<i64>,
+    pub(crate) travel_time_minutes: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub priority: Option<String>,
+    pub(crate) priority: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tags: Option<Vec<String>>,
+    pub(crate) tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_item_id: Option<i64>,
+    pub(crate) parent_item_id: Option<i64>,
 }
 
 // ── Folder ──
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Folder {
-    pub id: i64,
-    pub name: String,
-    pub icon: Option<String>,
-    pub color: Option<String>,
+/// Folder returned by the Kramli API.
+pub(crate) struct Folder {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) icon: Option<String>,
+    pub(crate) color: Option<String>,
     #[serde(default, alias = "parent_id", alias = "parentFolderId")]
-    pub parent_folder_id: Option<i64>,
+    pub(crate) parent_folder_id: Option<i64>,
     #[serde(default, alias = "parent_name", alias = "parentFolderName")]
-    pub parent_folder_name: Option<String>,
-    pub position: Option<i64>,
-    pub created_at: Option<String>,
+    pub(crate) parent_folder_name: Option<String>,
+    pub(crate) position: Option<i64>,
+    pub(crate) created_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
-pub struct CreateFolder {
-    pub name: String,
+/// Request payload for creating a folder.
+pub(crate) struct CreateFolder {
+    pub(crate) name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub icon: Option<String>,
+    pub(crate) icon: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub color: Option<String>,
+    pub(crate) color: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_folder_id: Option<i64>,
+    pub(crate) parent_folder_id: Option<i64>,
 }
 
 // ── Member ──
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Member {
-    pub user_id: Option<i64>,
-    pub display_name: Option<String>,
-    pub email: Option<String>,
-    pub role: Option<String>,
+/// List member or pending invite returned by the API.
+pub(crate) struct Member {
+    pub(crate) user_id: Option<i64>,
+    pub(crate) display_name: Option<String>,
+    pub(crate) email: Option<String>,
+    pub(crate) role: Option<String>,
     #[serde(rename = "type")]
-    pub member_type: Option<String>,
+    pub(crate) member_type: Option<String>,
 }
 
 // ── Profile ──
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Profile {
-    pub id: Option<i64>,
-    pub display_name: Option<String>,
-    pub email: Option<String>,
-    pub photo_url: Option<String>,
+/// Current account profile returned by the API.
+pub(crate) struct Profile {
+    pub(crate) id: Option<i64>,
+    pub(crate) display_name: Option<String>,
+    pub(crate) email: Option<String>,
+    pub(crate) photo_url: Option<String>,
     #[serde(default, alias = "language", alias = "locale")]
-    pub lang: Option<String>,
-    pub is_anonymous: Option<bool>,
-    pub created_at: Option<String>,
+    pub(crate) lang: Option<String>,
+    pub(crate) is_anonymous: Option<bool>,
+    pub(crate) created_at: Option<String>,
     #[serde(default)]
-    pub legal: Option<ProfileLegalStatus>,
+    pub(crate) legal: Option<ProfileLegalStatus>,
     #[serde(default)]
-    pub terms_accepted: Option<bool>,
+    pub(crate) terms_accepted: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProfileLegalStatus {
+/// Legal document acceptance state for the profile.
+pub(crate) struct ProfileLegalStatus {
     #[serde(default)]
-    pub pending: Vec<ProfilePendingLegalDoc>,
+    pub(crate) pending: Vec<ProfilePendingLegalDoc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProfilePendingLegalDoc {
-    pub key: Option<String>,
+/// Pending legal document key for the profile.
+pub(crate) struct ProfilePendingLegalDoc {
+    pub(crate) key: Option<String>,
 }
 
 // ── Search ──
 
 #[derive(Debug, Serialize, Deserialize, Default)]
-pub struct SearchResults {
+/// Grouped search results.
+pub(crate) struct SearchResults {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lists: Option<Vec<SearchListHit>>,
+    pub(crate) lists: Option<Vec<SearchListHit>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub items: Option<Vec<SearchItemHit>>,
+    pub(crate) items: Option<Vec<SearchItemHit>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SearchHit {
+/// Flat search result hit used by legacy API responses.
+pub(crate) struct SearchHit {
     #[serde(rename = "type")]
-    pub hit_type: Option<String>,
-    pub id: i64,
-    pub name: Option<String>,
-    pub icon: Option<String>,
-    pub list_id: Option<i64>,
-    pub list_name: Option<String>,
-    pub list_icon: Option<String>,
-    pub text: Option<String>,
-    pub is_done: Option<bool>,
+    pub(crate) hit_type: Option<String>,
+    pub(crate) id: i64,
+    pub(crate) name: Option<String>,
+    pub(crate) icon: Option<String>,
+    pub(crate) list_id: Option<i64>,
+    pub(crate) list_name: Option<String>,
+    pub(crate) list_icon: Option<String>,
+    pub(crate) text: Option<String>,
+    pub(crate) is_done: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum SearchResponse {
+/// Search response in either grouped or flat API shape.
+pub(crate) enum SearchResponse {
     Grouped(SearchResults),
     Flat(Vec<SearchHit>),
 }
 
 impl SearchResponse {
-    pub fn from_value(value: serde_json::Value) -> Result<Self, String> {
+    /// Parse a flexible search response from raw JSON.
+    pub(crate) fn from_value(value: serde_json::Value) -> Result<Self, String> {
         match value {
             serde_json::Value::Null => Ok(Self::Flat(Vec::new())),
             serde_json::Value::Array(array) => Self::from_array(array),
@@ -322,7 +339,8 @@ impl SearchResponse {
         Err(tr("models-search-array-shape-unsupported"))
     }
 
-    pub fn into_grouped(self) -> SearchResults {
+    /// Convert grouped or flat search responses into grouped results.
+    pub(crate) fn into_grouped(self) -> SearchResults {
         match self {
             Self::Grouped(results) => results,
             Self::Flat(hits) => {
@@ -484,65 +502,71 @@ mod tests {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SearchListHit {
-    pub id: i64,
-    pub name: String,
-    pub icon: Option<String>,
-    pub color: Option<String>,
+/// Search hit representing a list.
+pub(crate) struct SearchListHit {
+    pub(crate) id: i64,
+    pub(crate) name: String,
+    pub(crate) icon: Option<String>,
+    pub(crate) color: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SearchItemHit {
-    pub id: i64,
-    pub text: String,
-    pub list_id: Option<i64>,
-    pub list_name: Option<String>,
-    pub is_done: Option<bool>,
+/// Search hit representing an item.
+pub(crate) struct SearchItemHit {
+    pub(crate) id: i64,
+    pub(crate) text: String,
+    pub(crate) list_id: Option<i64>,
+    pub(crate) list_name: Option<String>,
+    pub(crate) is_done: Option<bool>,
 }
 
 // ── Activity ──
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ActivityEntry {
-    pub id: Option<i64>,
-    pub list_id: Option<i64>,
-    pub user_id: Option<i64>,
-    pub action: Option<String>,
-    pub detail: Option<serde_json::Value>,
-    pub display_name: Option<String>,
+/// Activity feed entry returned by the API.
+pub(crate) struct ActivityEntry {
+    pub(crate) id: Option<i64>,
+    pub(crate) list_id: Option<i64>,
+    pub(crate) user_id: Option<i64>,
+    pub(crate) action: Option<String>,
+    pub(crate) detail: Option<serde_json::Value>,
+    pub(crate) display_name: Option<String>,
     #[serde(alias = "user_name")]
-    pub user_name: Option<String>,
-    pub nickname: Option<String>,
-    pub photo_url: Option<String>,
-    pub item_id: Option<i64>,
-    pub created_at: Option<String>,
+    pub(crate) user_name: Option<String>,
+    pub(crate) nickname: Option<String>,
+    pub(crate) photo_url: Option<String>,
+    pub(crate) item_id: Option<i64>,
+    pub(crate) created_at: Option<String>,
 }
 
 // ── Generic OK ──
 
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
-pub struct OkResponse {
-    pub ok: Option<bool>,
-    pub undo_token: Option<String>,
+/// Generic success response returned by mutation endpoints.
+pub(crate) struct OkResponse {
+    pub(crate) ok: Option<bool>,
+    pub(crate) undo_token: Option<String>,
 }
 
 // ── API Key ──
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ApiKey {
-    pub id: i64,
-    pub name: Option<String>,
-    pub scopes: Option<ApiKeyScopes>,
-    pub is_active: Option<bool>,
-    pub last_used_at: Option<String>,
-    pub usage_count: Option<i64>,
-    pub created_at: Option<String>,
+/// API key metadata returned by the account API.
+pub(crate) struct ApiKey {
+    pub(crate) id: i64,
+    pub(crate) name: Option<String>,
+    pub(crate) scopes: Option<ApiKeyScopes>,
+    pub(crate) is_active: Option<bool>,
+    pub(crate) last_used_at: Option<String>,
+    pub(crate) usage_count: Option<i64>,
+    pub(crate) created_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum ApiKeyScopes {
+/// API key scopes returned as either a string or an array.
+pub(crate) enum ApiKeyScopes {
     Single(String),
     Multiple(Vec<String>),
 }

@@ -6,7 +6,7 @@ use fluent_templates::{fluent_bundle::FluentValue, static_loader, Loader};
 use unic_langid::{langid, LanguageIdentifier};
 
 static_loader! {
-    pub static LOCALES = {
+    pub(crate) static LOCALES = {
         locales: "./locales",
         fallback_language: "en",
     };
@@ -17,6 +17,8 @@ static ACTIVE_LOCALE: OnceLock<RwLock<LanguageIdentifier>> = OnceLock::new();
 const SUPPORTED_LANGS: &[&str] = &[
     "en", "de", "fr", "es", "it", "nl", "pl", "pt", "ru", "tr", "uk", "ar", "ja", "ko", "zh",
 ];
+const KRAMLI_LANG_ENV: &str = "KRAMLI_LANG";
+const LOCALE_ENV_VARS: &[&str] = &[KRAMLI_LANG_ENV, "LC_ALL", "LC_MESSAGES", "LANG"];
 
 fn normalize_candidate(raw: &str) -> Option<String> {
     let first = raw.trim().split(',').next()?.trim();
@@ -67,7 +69,7 @@ fn locale_lock() -> &'static RwLock<LanguageIdentifier> {
 }
 
 fn detect_locale() -> LanguageIdentifier {
-    for var in ["KRAMLI_LANG", "LC_ALL", "LC_MESSAGES", "LANG"] {
+    for var in LOCALE_ENV_VARS {
         if let Ok(raw) = std::env::var(var) {
             if let Some(candidate) = normalize_candidate(&raw) {
                 return parse_supported_locale(&candidate);
@@ -78,25 +80,29 @@ fn detect_locale() -> LanguageIdentifier {
     langid!("en")
 }
 
-pub fn current_locale() -> LanguageIdentifier {
+/// Return the active locale used for translations.
+pub(crate) fn current_locale() -> LanguageIdentifier {
     locale_lock()
         .read()
         .expect("locale read lock poisoned")
         .clone()
 }
 
-pub fn current_locale_code() -> String {
+/// Return the active locale as a BCP-47 language tag.
+pub(crate) fn current_locale_code() -> String {
     current_locale().to_string()
 }
 
-pub fn is_explicit_lang_set() -> bool {
-    std::env::var("KRAMLI_LANG")
+/// Return whether the locale was explicitly selected with `KRAMLI_LANG`.
+pub(crate) fn is_explicit_lang_set() -> bool {
+    std::env::var(KRAMLI_LANG_ENV)
         .ok()
         .and_then(|raw| normalize_candidate(&raw))
         .is_some()
 }
 
-pub fn set_locale(raw: &str) -> bool {
+/// Set the active locale when the input is supported.
+pub(crate) fn set_locale(raw: &str) -> bool {
     let Some(candidate) = normalize_candidate(raw) else {
         return false;
     };
@@ -107,7 +113,8 @@ pub fn set_locale(raw: &str) -> bool {
     true
 }
 
-pub fn apply_profile_locale(raw: Option<&str>) -> bool {
+/// Apply a profile locale unless the user set an explicit environment locale.
+pub(crate) fn apply_profile_locale(raw: Option<&str>) -> bool {
     if is_explicit_lang_set() {
         return false;
     }
@@ -117,12 +124,14 @@ pub fn apply_profile_locale(raw: Option<&str>) -> bool {
     set_locale(value)
 }
 
-pub fn tr(key: &str) -> String {
+/// Translate a message key for the active locale.
+pub(crate) fn tr(key: &str) -> String {
     let locale = current_locale();
     LOCALES.lookup(&locale, key).to_string()
 }
 
-pub fn tr_args(key: &str, args: &[(&str, String)]) -> String {
+/// Translate a message key with named Fluent arguments.
+pub(crate) fn tr_args(key: &str, args: &[(&str, String)]) -> String {
     let mut fluent_args: HashMap<Cow<'static, str>, FluentValue<'static>> = HashMap::new();
     for (name, value) in args {
         fluent_args.insert(

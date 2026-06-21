@@ -11,39 +11,50 @@ use crate::i18n::{tr, tr_args};
 const DEFAULT_BASE_URL: &str = "https://kramli.de";
 const KEYRING_SERVICE: &str = "kramli-cli";
 const KEYRING_API_KEY: &str = "api-key";
+const KRAMLI_URL_ENV: &str = "KRAMLI_URL";
+const KRAMLI_API_KEY_ENV: &str = "KRAMLI_API_KEY";
+const DO_NOT_TRACK_ENV: &str = "DO_NOT_TRACK";
+const KRAMLI_NO_TELEMETRY_ENV: &str = "KRAMLI_NO_TELEMETRY";
+const KRAMLI_TELEMETRY_ENV: &str = "KRAMLI_TELEMETRY";
+const KRAMLI_BOOTSTRAP_ICONS_ENV: &str = "KRAMLI_BOOTSTRAP_ICONS";
+const KRAMLI_TUI_BOOTSTRAP_ICONS_ENV: &str = "KRAMLI_TUI_BOOTSTRAP_ICONS";
+const KRAMLI_LOAD_BOOTSTRAP_ICONS_ENV: &str = "KRAMLI_LOAD_BOOTSTRAP_ICONS";
 
 // ── On-disk config: non-sensitive settings only ──
 
 #[derive(Debug, Serialize, Deserialize, Default)]
-pub struct ConfigFile {
+/// Non-sensitive configuration persisted in the user's config file.
+pub(crate) struct ConfigFile {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<String>,
+    pub(crate) base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub telemetry_enabled: Option<bool>,
+    pub(crate) telemetry_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bootstrap_icons_enabled: Option<bool>,
+    pub(crate) bootstrap_icons_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub update_check_last: Option<i64>,
+    pub(crate) update_check_last: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub update_check_latest: Option<String>,
+    pub(crate) update_check_latest: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub update_check_url: Option<String>,
+    pub(crate) update_check_url: Option<String>,
 }
 
 // ── Public Config handle ──
 
-pub struct Config {
+/// Accessor for local configuration and keychain-backed credentials.
+pub(crate) struct Config {
     file: ConfigFile,
 }
 
 impl Config {
     /// Path to the config file: ~/.config/kramli/config.json
-    pub fn path() -> PathBuf {
+    pub(crate) fn path() -> PathBuf {
         let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
         base.join("kramli").join("config.json")
     }
 
-    pub fn load() -> Self {
+    /// Load configuration from disk, falling back to defaults on read errors.
+    pub(crate) fn load() -> Self {
         let path = Self::path();
         let file = if path.exists() {
             let data = fs::read_to_string(&path).unwrap_or_default();
@@ -54,7 +65,8 @@ impl Config {
         Self { file }
     }
 
-    pub fn save(&self) -> Result<(), String> {
+    /// Persist non-sensitive configuration to disk with user-only permissions.
+    pub(crate) fn save(&self) -> Result<(), String> {
         let path = Self::path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -77,8 +89,8 @@ impl Config {
     // ── Non-sensitive getters / setters ──
 
     /// Base URL: env `KRAMLI_URL` > config file > default.
-    pub fn base_url(&self) -> String {
-        if let Ok(url) = std::env::var("KRAMLI_URL") {
+    pub(crate) fn base_url(&self) -> String {
+        if let Ok(url) = std::env::var(KRAMLI_URL_ENV) {
             if !url.is_empty() {
                 return url;
             }
@@ -89,56 +101,68 @@ impl Config {
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
     }
 
-    pub fn set_base_url(&mut self, url: Option<String>) {
+    /// Set the configured API base URL.
+    pub(crate) fn set_base_url(&mut self, url: Option<String>) {
         self.file.base_url = url;
     }
 
-    pub fn telemetry_enabled(&self) -> bool {
+    /// Return whether telemetry is enabled by config or env override.
+    pub(crate) fn telemetry_enabled(&self) -> bool {
         telemetry_env_override()
             .or(self.file.telemetry_enabled)
             .unwrap_or(false)
     }
 
-    pub fn telemetry_preference_set(&self) -> bool {
+    /// Return whether the user or environment has made a telemetry choice.
+    pub(crate) fn telemetry_preference_set(&self) -> bool {
         telemetry_env_override().is_some() || self.file.telemetry_enabled.is_some()
     }
 
-    pub fn set_telemetry_enabled(&mut self, enabled: bool) {
+    /// Persist the user's telemetry preference.
+    pub(crate) fn set_telemetry_enabled(&mut self, enabled: bool) {
         self.file.telemetry_enabled = Some(enabled);
     }
 
-    pub fn bootstrap_icons_enabled(&self) -> bool {
+    /// Return whether Bootstrap icon rendering is enabled.
+    pub(crate) fn bootstrap_icons_enabled(&self) -> bool {
         bootstrap_icons_env_override()
             .or(self.file.bootstrap_icons_enabled)
             .unwrap_or(false)
     }
 
-    pub fn bootstrap_icons_preference_set(&self) -> bool {
+    /// Return whether the user or environment has made an icon-loading choice.
+    pub(crate) fn bootstrap_icons_preference_set(&self) -> bool {
         bootstrap_icons_env_override().is_some() || self.file.bootstrap_icons_enabled.is_some()
     }
 
-    pub fn set_bootstrap_icons_enabled(&mut self, enabled: bool) {
+    /// Persist the user's Bootstrap icon rendering preference.
+    pub(crate) fn set_bootstrap_icons_enabled(&mut self, enabled: bool) {
         self.file.bootstrap_icons_enabled = Some(enabled);
     }
 
-    pub fn reset_privacy_preferences(&mut self) {
+    /// Clear saved first-run privacy choices so they can be asked again.
+    pub(crate) fn reset_privacy_preferences(&mut self) {
         self.file.telemetry_enabled = None;
         self.file.bootstrap_icons_enabled = None;
     }
 
-    pub fn update_check_last(&self) -> Option<i64> {
+    /// Return the Unix timestamp of the last release check.
+    pub(crate) fn update_check_last(&self) -> Option<i64> {
         self.file.update_check_last
     }
 
-    pub fn update_check_latest(&self) -> Option<String> {
+    /// Return the latest release tag observed by the update checker.
+    pub(crate) fn update_check_latest(&self) -> Option<String> {
         self.file.update_check_latest.clone()
     }
 
-    pub fn update_check_url(&self) -> Option<String> {
+    /// Return the URL for the latest release observed by the update checker.
+    pub(crate) fn update_check_url(&self) -> Option<String> {
         self.file.update_check_url.clone()
     }
 
-    pub fn set_update_check_state(
+    /// Persist the result of a release update check.
+    pub(crate) fn set_update_check_state(
         &mut self,
         checked_at: i64,
         latest: Option<String>,
@@ -208,8 +232,8 @@ impl Config {
     }
 
     /// API key: env `KRAMLI_API_KEY` > OS keychain.
-    pub fn api_key(&self) -> Option<String> {
-        if let Ok(key) = std::env::var("KRAMLI_API_KEY") {
+    pub(crate) fn api_key(&self) -> Option<String> {
+        if let Ok(key) = std::env::var(KRAMLI_API_KEY_ENV) {
             if !key.is_empty() {
                 return Some(key);
             }
@@ -217,21 +241,24 @@ impl Config {
         Self::keychain_api_key().unwrap_or_default()
     }
 
-    pub fn set_api_key(&self, key: &str) -> Result<(), String> {
+    /// Store an API key in the OS keychain.
+    pub(crate) fn set_api_key(&self, key: &str) -> Result<(), String> {
         Self::keyring_entry(KEYRING_API_KEY)?
             .set_password(key)
             .map_err(|e| tr_args("config-store-key-error", &[("error", e.to_string())]))
     }
 
-    pub fn delete_api_key(&self) -> Result<(), String> {
+    /// Delete the stored API key from the OS keychain.
+    pub(crate) fn delete_api_key(&self) -> Result<(), String> {
         if let Ok(entry) = Self::keyring_entry(KEYRING_API_KEY) {
             let _ = entry.delete_credential();
         }
         Ok(())
     }
 
-    pub fn require_api_key(&self) -> Result<String, String> {
-        if let Ok(key) = std::env::var("KRAMLI_API_KEY") {
+    /// Return an API key or an actionable login error.
+    pub(crate) fn require_api_key(&self) -> Result<String, String> {
+        if let Ok(key) = std::env::var(KRAMLI_API_KEY_ENV) {
             if !key.is_empty() {
                 return Ok(key);
             }
@@ -242,19 +269,19 @@ impl Config {
         }
     }
 
-    pub fn has_api_key(&self) -> bool {
+    /// Return whether an API key is available from env or keychain.
+    pub(crate) fn has_api_key(&self) -> bool {
         self.api_key().is_some()
     }
 
     /// True when the API key was provided via env var (not keychain).
-    pub fn api_key_from_env(&self) -> bool {
-        std::env::var("KRAMLI_API_KEY")
-            .map(|k| !k.is_empty())
-            .unwrap_or(false)
+    pub(crate) fn api_key_from_env(&self) -> bool {
+        std::env::var(KRAMLI_API_KEY_ENV).is_ok_and(|key| !key.is_empty())
     }
 }
 
-pub fn parse_env_bool(raw: &str) -> Option<bool> {
+/// Parse common environment boolean spellings.
+pub(crate) fn parse_env_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "on" | "yes" => Some(true),
         "0" | "false" | "off" | "no" => Some(false),
@@ -262,7 +289,8 @@ pub fn parse_env_bool(raw: &str) -> Option<bool> {
     }
 }
 
-pub fn env_is_truthy(name: &str) -> bool {
+/// Return whether an environment variable is set to a truthy value.
+pub(crate) fn env_is_truthy(name: &str) -> bool {
     match std::env::var(name) {
         Ok(raw) => {
             let v = raw.trim().to_ascii_lowercase();
@@ -273,10 +301,10 @@ pub fn env_is_truthy(name: &str) -> bool {
 }
 
 fn telemetry_env_override() -> Option<bool> {
-    if env_is_truthy("DO_NOT_TRACK") || env_is_truthy("KRAMLI_NO_TELEMETRY") {
+    if env_is_truthy(DO_NOT_TRACK_ENV) || env_is_truthy(KRAMLI_NO_TELEMETRY_ENV) {
         return Some(false);
     }
-    std::env::var("KRAMLI_TELEMETRY")
+    std::env::var(KRAMLI_TELEMETRY_ENV)
         .ok()
         .as_deref()
         .and_then(parse_env_bool)
@@ -284,9 +312,9 @@ fn telemetry_env_override() -> Option<bool> {
 
 fn bootstrap_icons_env_override() -> Option<bool> {
     [
-        "KRAMLI_BOOTSTRAP_ICONS",
-        "KRAMLI_TUI_BOOTSTRAP_ICONS",
-        "KRAMLI_LOAD_BOOTSTRAP_ICONS",
+        KRAMLI_BOOTSTRAP_ICONS_ENV,
+        KRAMLI_TUI_BOOTSTRAP_ICONS_ENV,
+        KRAMLI_LOAD_BOOTSTRAP_ICONS_ENV,
     ]
     .into_iter()
     .find_map(|name| {

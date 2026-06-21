@@ -7,6 +7,8 @@ use crate::models::{
     ActivityEntry, Folder, ItemComment, ListItem, Member, SearchResults, ShoppingList,
 };
 
+const KRAMLI_ICON_STYLE_ENV: &str = "KRAMLI_ICON_STYLE";
+
 #[derive(Copy, Clone)]
 enum IconStyle {
     Label,
@@ -15,7 +17,7 @@ enum IconStyle {
 }
 
 fn icon_style() -> IconStyle {
-    match std::env::var("KRAMLI_ICON_STYLE")
+    match std::env::var(KRAMLI_ICON_STYLE_ENV)
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
@@ -392,7 +394,8 @@ fn activity_action_label(raw: &str) -> String {
 
 // ── Lists ──
 
-pub fn print_lists(lists: &[ShoppingList]) {
+/// Print a grouped, human-readable list overview.
+pub(crate) fn print_lists(lists: &[ShoppingList]) {
     if lists.is_empty() {
         println!("{}", tr("output-no-lists").dimmed());
         return;
@@ -447,7 +450,8 @@ pub fn print_lists(lists: &[ShoppingList]) {
     }
 }
 
-pub fn print_list_detail(l: &ShoppingList) {
+/// Print detailed information for a single list.
+pub(crate) fn print_list_detail(l: &ShoppingList) {
     let icon = colorize_text(l.color.as_deref(), &display_icon(l.icon.as_deref(), "list"));
     let name = colorize_bold_text(l.color.as_deref(), &l.name);
     println!("{icon}  {name} (#{}) ", l.id);
@@ -630,7 +634,8 @@ fn schedule_lines(item: &ListItem) -> Vec<ScheduleLine> {
     lines
 }
 
-pub fn print_item_detail(item: &ListItem, comments: &[ItemComment]) {
+/// Print detailed information for a single item and its comments.
+pub(crate) fn print_item_detail(item: &ListItem, comments: &[ItemComment]) {
     let check = if item.is_done.unwrap_or(false) {
         "✓".green().to_string()
     } else {
@@ -704,7 +709,7 @@ pub fn print_item_detail(item: &ListItem, comments: &[ItemComment]) {
                     .as_deref()
                     .or(a.filename.as_deref())
                     .unwrap_or("?");
-                let size = a.file_size.map(human_size).unwrap_or_default();
+                let size = a.file_size.map_or_else(String::default, human_size);
                 let url = a.url.as_deref().unwrap_or("");
                 println!("    • {name}  {size}  {}", url.dimmed());
             }
@@ -739,7 +744,8 @@ pub fn print_item_detail(item: &ListItem, comments: &[ItemComment]) {
     println!();
 }
 
-pub fn print_items(items: &[ListItem]) {
+/// Print a compact human-readable item list.
+pub(crate) fn print_items(items: &[ListItem]) {
     if items.is_empty() {
         println!("{}", tr("output-no-items").dimmed());
         return;
@@ -824,7 +830,8 @@ fn computed_item_depth(item: &ListItem, parent_by_id: &HashMap<i64, Option<i64>>
     depth
 }
 
-pub fn print_items_for_list(list: Option<&ShoppingList>, items: &[ListItem]) {
+/// Print a list heading followed by its items.
+pub(crate) fn print_items_for_list(list: Option<&ShoppingList>, items: &[ListItem]) {
     if let Some(list) = list {
         println!(
             "{}: {}",
@@ -894,7 +901,8 @@ mod wrap_and_icon_tests {
 
 // ── Folders ──
 
-pub fn print_folders(folders: &[Folder]) {
+/// Print folders grouped by their hierarchy.
+pub(crate) fn print_folders(folders: &[Folder]) {
     if folders.is_empty() {
         println!("{}", tr("output-no-folders").dimmed());
         return;
@@ -922,7 +930,8 @@ pub fn print_folders(folders: &[Folder]) {
 
 // ── Members ──
 
-pub fn print_members(members: &[Member]) {
+/// Print list members and pending invites.
+pub(crate) fn print_members(members: &[Member]) {
     if members.is_empty() {
         println!("{}", tr("output-no-members").dimmed());
         return;
@@ -950,7 +959,8 @@ pub fn print_members(members: &[Member]) {
 
 // ── Search ──
 
-pub fn print_search(results: &SearchResults) {
+/// Print grouped search results.
+pub(crate) fn print_search(results: &SearchResults) {
     let mut any = false;
     if let Some(ref lists) = results.lists {
         if !lists.is_empty() {
@@ -1033,7 +1043,8 @@ fn activity_detail_text(detail: Option<&serde_json::Value>) -> String {
     }
 }
 
-pub fn print_activity(entries: &[ActivityEntry]) {
+/// Print activity feed entries.
+pub(crate) fn print_activity(entries: &[ActivityEntry]) {
     if entries.is_empty() {
         println!("{}", tr("output-no-activity").dimmed());
         return;
