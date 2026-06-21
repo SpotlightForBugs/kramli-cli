@@ -8284,6 +8284,65 @@ mod tests {
         assert_eq!(app.selected_item, 0);
     }
 
+    #[test]
+    fn empty_state_and_progress_helpers_cover_remaining_branches() {
+        assert_eq!(editor_bool_label(Some(true)), tr("label-on"));
+        assert_eq!(editor_bool_label(Some(false)), tr("label-off"));
+
+        let mut app = test_app();
+        app.items = vec![sample_item(1, "Orphan")];
+        app.selected_item = 0;
+        app.load_items_for_selected_list(true);
+        assert!(app.items.is_empty());
+        assert_eq!(app.selected_item, 0);
+        assert!(app.detail_image.is_none());
+        assert!(app.detail_image_note.is_none());
+
+        app.focus = FocusPane::Lists;
+        app.scroll_active(1);
+        assert_eq!(app.selected_list, 0);
+        assert!(!app.move_selected_list(1));
+
+        app.lists = vec![
+            test_list(),
+            test_shopping_list(2, "Second", None, None, None, false),
+        ];
+        assert!(app.move_selected_list(1));
+        assert_eq!(app.selected_list, 1);
+
+        let mut done_only = test_list();
+        done_only.states = Some(vec![ApiListState {
+            name: Some("Done".to_string()),
+            color: None,
+            is_done: Some(true),
+        }]);
+        app.lists = vec![done_only];
+        app.selected_list = 0;
+        assert_eq!(app.default_progress_value(), "Done");
+        assert!(!app.move_kanban_selection(0));
+    }
+
+    #[test]
+    fn editor_opening_helpers_handle_empty_and_default_paths() {
+        let mut app = test_app();
+
+        app.open_editor().unwrap();
+        assert_eq!(app.status, Some(tr("output-no-items")));
+
+        app.status = None;
+        app.open_add_editor().unwrap();
+        assert_eq!(app.status, Some(tr("output-no-lists")));
+
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "One")];
+        app.focus = FocusPane::Items;
+        app.mode = ViewMode::List;
+        assert!(!app
+            .handle_enter_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap());
+        assert!(app.editor.is_some());
+    }
+
     #[tokio::test]
     async fn app_navigation_and_mouse_helpers_cover_false_and_editor_branches() {
         let mut app = test_app();
