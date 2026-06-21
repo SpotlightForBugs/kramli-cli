@@ -1,7 +1,9 @@
 use std::fs;
-use std::path::PathBuf;
-#[cfg(target_os = "macos")]
+use std::path::{Path, PathBuf};
+#[cfg(all(target_os = "macos", not(test)))]
 use std::process::Command;
+#[cfg(test)]
+use std::sync::Mutex;
 
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,9 @@ const KRAMLI_TELEMETRY_ENV: &str = "KRAMLI_TELEMETRY";
 const KRAMLI_BOOTSTRAP_ICONS_ENV: &str = "KRAMLI_BOOTSTRAP_ICONS";
 const KRAMLI_TUI_BOOTSTRAP_ICONS_ENV: &str = "KRAMLI_TUI_BOOTSTRAP_ICONS";
 const KRAMLI_LOAD_BOOTSTRAP_ICONS_ENV: &str = "KRAMLI_LOAD_BOOTSTRAP_ICONS";
+
+#[cfg(test)]
+static TEST_KEYCHAIN_API_KEY: Mutex<Option<Result<Option<String>, String>>> = Mutex::new(None);
 
 // ── On-disk config: non-sensitive settings only ──
 
@@ -56,8 +61,12 @@ impl Config {
     /// Load configuration from disk, falling back to defaults on read errors.
     pub(crate) fn load() -> Self {
         let path = Self::path();
+        Self::load_from_path(&path)
+    }
+
+    fn load_from_path(path: &Path) -> Self {
         let file = if path.exists() {
-            let data = fs::read_to_string(&path).unwrap_or_default();
+            let data = fs::read_to_string(path).unwrap_or_default();
             serde_json::from_str(&data).unwrap_or_default()
         } else {
             ConfigFile::default()
@@ -180,7 +189,22 @@ impl Config {
             .map_err(|e| tr_args("config-keychain-error", &[("error", e.to_string())]))
     }
 
+    #[cfg(test)]
     fn keychain_api_key() -> Result<Option<String>, String> {
+        TEST_KEYCHAIN_API_KEY
+            .lock()
+            .expect("keychain test lock poisoned")
+            .clone()
+            .unwrap_or(Ok(None))
+    }
+
+    #[cfg(not(test))]
+    fn keychain_api_key() -> Result<Option<String>, String> {
+        Self::real_keychain_api_key()
+    }
+
+    #[cfg(not(test))]
+    fn real_keychain_api_key() -> Result<Option<String>, String> {
         let entry = Self::keyring_entry(KEYRING_API_KEY)?;
         match entry.get_password() {
             Ok(key) => {
@@ -206,7 +230,7 @@ impl Config {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(test)))]
     fn api_key_via_security_cli() -> Option<String> {
         let output = Command::new("security")
             .args([
@@ -366,6 +390,23 @@ mod tests {
         }
     }
 
+    fn with_test_keychain<T>(value: Result<Option<String>, String>, f: impl FnOnce() -> T) -> T {
+        {
+            let mut keychain = TEST_KEYCHAIN_API_KEY
+                .lock()
+                .expect("keychain test lock poisoned");
+            *keychain = Some(value);
+        }
+
+        let result = f();
+
+        let mut keychain = TEST_KEYCHAIN_API_KEY
+            .lock()
+            .expect("keychain test lock poisoned");
+        *keychain = None;
+        result
+    }
+
     #[test]
     fn unset_preferences_are_disabled_until_user_answers() {
         let cfg = config_file(None, None);
@@ -422,6 +463,50 @@ mod tests {
         cfg.reset_privacy_preferences();
         assert!(!cfg.telemetry_preference_set());
         assert!(!cfg.bootstrap_icons_preference_set());
+    }
+
+    #[test]
+    fn load_from_existing_config_file_covers_parse_branch() {
+        let path = std::env::temp_dir().join(format!(
+            "kramli-config-test-{}-{}.json",
+            std::process::id(),
+            1
+        ));
+        fs::write(
+            &path,
+            r#"{
+                "base_url": "https://file.example",
+                "telemetry_enabled": true,
+                "bootstrap_icons_enabled": true,
+                "update_check_last": 123,
+                "update_check_latest": "v9.9.9",
+                "update_check_url": "https://file.example/release"
+            }"#,
+        )
+        .expect("write config fixture");
+
+        let cfg = Config::load_from_path(&path);
+        assert_eq!(cfg.base_url(), "https://file.example");
+        assert!(cfg.telemetry_enabled());
+        assert!(cfg.bootstrap_icons_enabled());
+        assert_eq!(cfg.update_check_last(), Some(123));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn keychain_fallback_branches_are_testable_without_system_keychain() {
+        with_test_keychain(Ok(Some("stored-key".to_string())), || {
+            let cfg = config_file(None, None);
+            assert_eq!(cfg.api_key().as_deref(), Some("stored-key"));
+            assert_eq!(cfg.require_api_key().as_deref(), Ok("stored-key"));
+        });
+
+        with_test_keychain(Ok(None), || {
+            let cfg = config_file(None, None);
+            assert_eq!(cfg.api_key(), None);
+            assert_eq!(cfg.require_api_key(), Err(tr("config-not-logged-in")));
+        });
     }
 
     #[test]

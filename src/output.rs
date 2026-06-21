@@ -1154,11 +1154,18 @@ pub(crate) fn print_activity(entries: &[ActivityEntry]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        activity_detail_text, color_dot, date_with_time, human_size, item_status_parts,
-        parse_hex_color, print_item_detail, reminder_offsets_label, schedule_lines, strip_html,
-        ItemComments,
+        activity_action_label, activity_detail_text, bootstrap_icon_asset_name, char_display_width,
+        color_dot, colorize_bold_text, colorize_text, date_with_time, display_icon,
+        folder_path_parts, human_size, item_status_parts, list_display_name_with_folder,
+        list_folder_parts, member_type_label, parse_hex_color, print_activity, print_folders,
+        print_item_detail, print_items, print_items_for_list, print_list_detail, print_lists,
+        print_members, print_search, reminder_offsets_label, role_label, schedule_lines,
+        strip_html, view_mode_label, visible_width_ansi, wrap_ansi_with_prefix, ItemComments,
     };
-    use crate::models::{Attachment, ItemComment, ListItem};
+    use crate::models::{
+        ActivityEntry, Attachment, Folder, ItemComment, ListItem, ListState, Member, SearchItemHit,
+        SearchListHit, SearchResults, ShoppingList,
+    };
     use serde_json::json;
 
     fn minimal_item() -> ListItem {
@@ -1197,6 +1204,37 @@ mod tests {
             image_url: None,
             image_filename: None,
             attachments: None,
+        }
+    }
+
+    fn sample_list(id: i64, name: &str) -> ShoppingList {
+        ShoppingList {
+            id,
+            name: name.to_string(),
+            icon: Some("bi-cart-fill".to_string()),
+            color: Some("#112233".to_string()),
+            folder_id: Some(9),
+            folder_name: Some("Shop / Weekly".to_string()),
+            archived: Some(false),
+            archive_mode: None,
+            view_mode: Some("board".to_string()),
+            role: Some("editor".to_string()),
+            item_count: Some(5),
+            done_count: Some(2),
+            state_config: None,
+            states: Some(vec![
+                ListState {
+                    name: Some("Open".to_string()),
+                    color: None,
+                    is_done: Some(false),
+                },
+                ListState {
+                    name: Some("Done".to_string()),
+                    color: None,
+                    is_done: Some(true),
+                },
+            ]),
+            created_at: Some("2026-01-01T00:00:00Z".to_string()),
         }
     }
 
@@ -1302,6 +1340,168 @@ mod tests {
         let pairs_rendered = activity_detail_text(Some(&with_pairs));
         assert!(pairs_rendered.contains("alpha=1"));
         assert!(pairs_rendered.contains("beta=x"));
+    }
+
+    #[test]
+    fn icon_wrapping_and_label_helpers_cover_branch_variants() {
+        assert_eq!(
+            bootstrap_icon_asset_name("bi-cart-fill"),
+            Some("cart-fill".to_string())
+        );
+        assert_eq!(
+            bootstrap_icon_asset_name("bootstrap-icons:egg_fried"),
+            Some("egg-fried".to_string())
+        );
+        assert_eq!(bootstrap_icon_asset_name("../cart-fill"), None);
+
+        assert_eq!(display_icon(None, "folder"), "[folder]");
+        assert_eq!(display_icon(Some("bi-cart-fill"), "list"), "[cart]");
+        assert_eq!(display_icon(Some("custom"), "list"), "[custom]");
+
+        assert_eq!(char_display_width('\t'), 4);
+        assert_eq!(char_display_width('\n'), 0);
+        assert_eq!(visible_width_ansi("\u{1b}[31mred\u{1b}[0m"), 3);
+        assert_eq!(wrap_ansi_with_prefix("abc", "> ", "  ", 4), "> abc");
+
+        assert!(colorize_text(Some("#010203"), "x").contains('x'));
+        assert!(colorize_bold_text(Some("#010203"), "x").contains('x'));
+        assert_eq!(colorize_text(Some("bad"), "x"), "x");
+
+        assert_eq!(role_label("owner"), crate::i18n::tr("role-owner"));
+        assert_eq!(role_label("custom"), "custom");
+        assert_eq!(
+            view_mode_label("calendar"),
+            crate::i18n::tr("view-calendar")
+        );
+        assert_eq!(view_mode_label("custom"), "custom");
+        assert_eq!(
+            member_type_label("invite"),
+            crate::i18n::tr("member-type-invite")
+        );
+        assert_eq!(member_type_label("bot"), "bot");
+        assert_eq!(
+            activity_action_label("item_created"),
+            crate::i18n::tr("activity-item-created")
+        );
+        assert_eq!(activity_action_label("custom"), "custom");
+    }
+
+    #[test]
+    fn list_folder_and_print_helpers_cover_human_output_paths() {
+        let list = sample_list(1, "Groceries");
+        assert_eq!(
+            list_display_name_with_folder(&list),
+            "Shop / Weekly / Groceries"
+        );
+        assert_eq!(list_folder_parts(&list), vec!["Shop", "Weekly"]);
+
+        let fallback_folder = ShoppingList {
+            folder_name: None,
+            ..sample_list(2, "")
+        };
+        assert_eq!(list_folder_parts(&fallback_folder), vec!["#9"]);
+        assert_eq!(
+            list_display_name_with_folder(&fallback_folder),
+            crate::i18n::tr("common-unknown")
+        );
+
+        let folder = Folder {
+            id: 3,
+            name: "Leaf".to_string(),
+            icon: Some("bi-folder2".to_string()),
+            color: Some("#445566".to_string()),
+            parent_folder_id: Some(2),
+            parent_folder_name: Some("Root / Child".to_string()),
+            position: Some(1),
+            created_at: Some("2026-01-01T00:00:00Z".to_string()),
+        };
+        assert_eq!(folder_path_parts(&folder), vec!["Root", "Child", "Leaf"]);
+
+        print_lists(&[]);
+        print_lists(&[list]);
+        print_list_detail(&sample_list(4, "Detail"));
+        print_folders(&[]);
+        print_folders(&[folder]);
+    }
+
+    #[test]
+    fn item_member_search_and_activity_printers_cover_output_paths() {
+        let mut parent = minimal_item();
+        parent.id = 10;
+        parent.text = "Parent".to_string();
+        parent.child_count = Some(2);
+        parent.done_child_count = Some(1);
+        parent.priority = Some("medium".to_string());
+        parent.quantity = Some("2".to_string());
+        parent.due_date = Some("2026-08-01".to_string());
+        parent.tags = Some(vec!["tag".to_string()]);
+        parent.progress = Some("Doing".to_string());
+
+        let mut child = minimal_item();
+        child.id = 11;
+        child.parent_item_id = Some(10);
+        child.is_done = Some(true);
+        child.depth = None;
+        child.priority = Some("low".to_string());
+
+        print_items(&[]);
+        print_items(&[parent.clone(), child]);
+        print_items_for_list(Some(&sample_list(5, "Items")), &[parent]);
+        print_items_for_list(None, &[]);
+
+        print_members(&[]);
+        print_members(&[
+            Member {
+                user_id: Some(1),
+                display_name: Some("Ada".to_string()),
+                email: Some("ada@example.test".to_string()),
+                role: Some("owner".to_string()),
+                member_type: Some("member".to_string()),
+            },
+            Member {
+                user_id: None,
+                display_name: None,
+                email: None,
+                role: Some("viewer".to_string()),
+                member_type: Some("invite".to_string()),
+            },
+        ]);
+
+        print_search(&SearchResults::default());
+        print_search(&SearchResults {
+            lists: Some(vec![SearchListHit {
+                id: 7,
+                name: "List hit".to_string(),
+                icon: Some("bi-tag".to_string()),
+                color: Some("#334455".to_string()),
+            }]),
+            items: Some(vec![SearchItemHit {
+                id: 8,
+                text: "Item hit".to_string(),
+                list_id: Some(7),
+                list_name: Some("List hit".to_string()),
+                is_done: Some(true),
+            }]),
+        });
+
+        assert_eq!(activity_detail_text(None), "");
+        assert_eq!(activity_detail_text(Some(&json!(null))), "");
+        assert_eq!(activity_detail_text(Some(&json!("raw"))), "raw");
+        assert_eq!(activity_detail_text(Some(&json!([1, 2]))), "[1,2]");
+        print_activity(&[]);
+        print_activity(&[ActivityEntry {
+            id: Some(1),
+            list_id: Some(2),
+            user_id: Some(3),
+            action: Some("item_updated".to_string()),
+            detail: Some(json!({"changes": ["a", "b"]})),
+            display_name: None,
+            user_name: Some("Grace".to_string()),
+            nickname: None,
+            photo_url: None,
+            item_id: Some(4),
+            created_at: Some("2026-01-01T00:00:00Z".to_string()),
+        }]);
     }
 
     #[test]

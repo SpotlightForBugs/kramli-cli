@@ -52,7 +52,11 @@ fn main() -> ExitCode {
 }
 
 fn init_telemetry() -> Option<sentry::ClientInitGuard> {
-    telemetry::is_enabled().then(|| {
+    init_telemetry_when(telemetry::is_enabled())
+}
+
+fn init_telemetry_when(enabled: bool) -> Option<sentry::ClientInitGuard> {
+    enabled.then(|| {
         sentry::init((
             "https://9435ede2d0d8eceedf3b3e0eb5cb6aff@o4509985277018112.ingest.de.sentry.io/4510966154002512",
             sentry::ClientOptions {
@@ -70,11 +74,16 @@ fn init_telemetry() -> Option<sentry::ClientInitGuard> {
     })
 }
 
+fn first_run_prompt_blocked(cli: &Cli, stdin_terminal: bool, stdout_terminal: bool) -> bool {
+    !should_prompt_first_run_preferences(cli) || !stdin_terminal || !stdout_terminal
+}
+
 fn ensure_first_run_preferences(cli: &Cli) -> Result<(), String> {
-    if !should_prompt_first_run_preferences(cli)
-        || !std::io::stdin().is_terminal()
-        || !std::io::stdout().is_terminal()
-    {
+    if first_run_prompt_blocked(
+        cli,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    ) {
         return Ok(());
     }
 
@@ -197,10 +206,34 @@ mod tests {
     }
 
     #[test]
+    fn first_run_prompt_blocker_covers_stream_combinations() {
+        let cli = cli_for(Some(Commands::Status));
+        assert!(first_run_prompt_blocked(&cli, false, true));
+        assert!(first_run_prompt_blocked(&cli, true, false));
+        assert!(!first_run_prompt_blocked(&cli, true, true));
+
+        let mut json_cli = cli_for(Some(Commands::Status));
+        json_cli.json = true;
+        assert!(first_run_prompt_blocked(&json_cli, true, true));
+    }
+
+    #[test]
     fn telemetry_init_respects_disable_environment() {
+        let guard = init_telemetry_when(false);
+        assert!(guard.is_none());
+    }
+
+    #[test]
+    fn telemetry_init_reads_disabled_environment() {
         std::env::set_var(DO_NOT_TRACK_ENV, "1");
         let guard = init_telemetry();
         std::env::remove_var(DO_NOT_TRACK_ENV);
         assert!(guard.is_none());
+    }
+
+    #[test]
+    fn telemetry_init_can_enable_guard_from_environment() {
+        let guard = init_telemetry_when(true);
+        assert!(guard.is_some());
     }
 }
