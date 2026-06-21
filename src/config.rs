@@ -327,6 +327,31 @@ fn bootstrap_icons_env_override() -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const TEST_BOOL_ENV: &str = "KRAMLI_TEST_BOOL";
+
+    fn with_env_vars<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        let previous: Vec<_> = vars
+            .iter()
+            .map(|(name, _)| (*name, std::env::var(name).ok()))
+            .collect();
+        for (name, value) in vars {
+            std::env::set_var(name, value);
+        }
+
+        let result = f();
+
+        for (name, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        result
+    }
 
     fn config_file(
         telemetry_enabled: Option<bool>,
@@ -366,5 +391,107 @@ mod tests {
         assert_eq!(parse_env_bool("0"), Some(false));
         assert_eq!(parse_env_bool("off"), Some(false));
         assert_eq!(parse_env_bool("later"), None);
+    }
+
+    #[test]
+    fn config_getters_setters_and_reset_cover_persisted_fields() {
+        let mut cfg = config_file(Some(true), Some(false));
+
+        cfg.set_base_url(Some("https://example.test".to_string()));
+        assert_eq!(cfg.base_url(), "https://example.test");
+
+        cfg.set_telemetry_enabled(false);
+        cfg.set_bootstrap_icons_enabled(true);
+        assert!(cfg.telemetry_preference_set());
+        assert!(cfg.bootstrap_icons_preference_set());
+        assert!(!cfg.telemetry_enabled());
+        assert!(cfg.bootstrap_icons_enabled());
+
+        cfg.set_update_check_state(
+            42,
+            Some("v9.9.9".to_string()),
+            Some("https://example.test/release".to_string()),
+        );
+        assert_eq!(cfg.update_check_last(), Some(42));
+        assert_eq!(cfg.update_check_latest().as_deref(), Some("v9.9.9"));
+        assert_eq!(
+            cfg.update_check_url().as_deref(),
+            Some("https://example.test/release")
+        );
+
+        cfg.reset_privacy_preferences();
+        assert!(!cfg.telemetry_preference_set());
+        assert!(!cfg.bootstrap_icons_preference_set());
+    }
+
+    #[test]
+    fn environment_overrides_cover_config_branches() {
+        with_env_vars(
+            &[
+                (KRAMLI_URL_ENV, "https://env.example"),
+                (KRAMLI_API_KEY_ENV, "env-key"),
+                (KRAMLI_TELEMETRY_ENV, "true"),
+                (KRAMLI_BOOTSTRAP_ICONS_ENV, "true"),
+            ],
+            || {
+                let cfg = config_file(Some(false), Some(false));
+                assert_eq!(cfg.base_url(), "https://env.example");
+                assert_eq!(cfg.api_key().as_deref(), Some("env-key"));
+                assert_eq!(cfg.require_api_key().as_deref(), Ok("env-key"));
+                assert!(cfg.has_api_key());
+                assert!(cfg.api_key_from_env());
+                assert!(cfg.telemetry_enabled());
+                assert!(cfg.telemetry_preference_set());
+                assert!(cfg.bootstrap_icons_enabled());
+                assert!(cfg.bootstrap_icons_preference_set());
+            },
+        );
+    }
+
+    #[test]
+    fn environment_helpers_cover_truthy_and_override_paths() {
+        with_env_vars(&[(TEST_BOOL_ENV, " YES ")], || {
+            assert!(env_is_truthy(TEST_BOOL_ENV));
+        });
+        with_env_vars(&[(TEST_BOOL_ENV, "off")], || {
+            assert!(!env_is_truthy(TEST_BOOL_ENV));
+        });
+        assert!(!env_is_truthy(TEST_BOOL_ENV));
+
+        with_env_vars(
+            &[(DO_NOT_TRACK_ENV, "1"), (KRAMLI_TELEMETRY_ENV, "true")],
+            || {
+                let cfg = config_file(None, None);
+                assert!(!cfg.telemetry_enabled());
+                assert!(cfg.telemetry_preference_set());
+            },
+        );
+
+        with_env_vars(&[(KRAMLI_TUI_BOOTSTRAP_ICONS_ENV, "true")], || {
+            let cfg = config_file(None, None);
+            assert!(cfg.bootstrap_icons_enabled());
+            assert!(cfg.bootstrap_icons_preference_set());
+        });
+
+        with_env_vars(&[(KRAMLI_LOAD_BOOTSTRAP_ICONS_ENV, "false")], || {
+            let cfg = config_file(None, Some(true));
+            assert!(!cfg.bootstrap_icons_enabled());
+            assert!(cfg.bootstrap_icons_preference_set());
+        });
+    }
+
+    #[test]
+    fn env_test_helper_restores_existing_values() {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        std::env::set_var(TEST_BOOL_ENV, "before");
+        drop(_guard);
+
+        with_env_vars(&[(TEST_BOOL_ENV, "during")], || {
+            assert_eq!(std::env::var(TEST_BOOL_ENV).as_deref(), Ok("during"));
+        });
+
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        assert_eq!(std::env::var(TEST_BOOL_ENV).as_deref(), Ok("before"));
+        std::env::remove_var(TEST_BOOL_ENV);
     }
 }

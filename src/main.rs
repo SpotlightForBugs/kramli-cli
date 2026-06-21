@@ -131,3 +131,76 @@ fn should_prompt_first_run_preferences(cli: &Cli) -> bool {
             )
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{HandoffCmd, PrivacyCmd};
+    use clap_complete::Shell;
+
+    const DO_NOT_TRACK_ENV: &str = "DO_NOT_TRACK";
+
+    fn cli_for(command: Option<Commands>) -> Cli {
+        Cli {
+            json: false,
+            interactive: false,
+            command,
+        }
+    }
+
+    #[test]
+    fn first_run_prompt_is_disabled_for_non_interactive_paths() {
+        let mut cli = cli_for(Some(Commands::Status));
+        cli.json = true;
+        assert!(!should_prompt_first_run_preferences(&cli));
+
+        assert!(!should_prompt_first_run_preferences(&cli_for(None)));
+        assert!(!should_prompt_first_run_preferences(&cli_for(Some(
+            Commands::Batch {
+                file: "-".to_string(),
+                keep_going: false,
+            },
+        ))));
+        assert!(!should_prompt_first_run_preferences(&cli_for(Some(
+            Commands::Completions { shell: Shell::Bash },
+        ))));
+        assert!(!should_prompt_first_run_preferences(&cli_for(Some(
+            Commands::Mcp
+        ))));
+        assert!(!should_prompt_first_run_preferences(&cli_for(Some(
+            Commands::Privacy {
+                action: PrivacyCmd::Reset,
+            },
+        ))));
+    }
+
+    #[test]
+    fn first_run_prompt_is_enabled_for_interactive_or_regular_commands() {
+        let mut cli = cli_for(None);
+        cli.interactive = true;
+        assert!(should_prompt_first_run_preferences(&cli));
+
+        assert!(should_prompt_first_run_preferences(&cli_for(Some(
+            Commands::Status,
+        ))));
+        assert!(should_prompt_first_run_preferences(&cli_for(Some(
+            Commands::Handoff {
+                action: HandoffCmd::Clear,
+            },
+        ))));
+    }
+
+    #[test]
+    fn first_run_preferences_skip_prompt_when_streams_are_not_terminal() {
+        let cli = cli_for(Some(Commands::Status));
+        assert!(ensure_first_run_preferences(&cli).is_ok());
+    }
+
+    #[test]
+    fn telemetry_init_respects_disable_environment() {
+        std::env::set_var(DO_NOT_TRACK_ENV, "1");
+        let guard = init_telemetry();
+        std::env::remove_var(DO_NOT_TRACK_ENV);
+        assert!(guard.is_none());
+    }
+}
