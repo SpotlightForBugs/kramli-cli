@@ -35,6 +35,16 @@ fn metric_i64(value: impl TryInto<i64>) -> i64 {
 static LAST_REQUEST_AT: OnceLock<tokio::sync::Mutex<Option<Instant>>> = OnceLock::new();
 
 impl ApiClient {
+    #[cfg(test)]
+    pub(crate) fn for_tests(base_url: &str) -> Self {
+        Self {
+            client: Client::new(),
+            base_url: base_url.to_string(),
+            api_key: "kramli_test".to_string(),
+            min_request_interval: Duration::from_millis(0),
+        }
+    }
+
     /// Build an API client from persisted configuration and keychain credentials.
     pub(crate) fn new(config: &Config) -> Result<Self, String> {
         let api_key = config.require_api_key()?;

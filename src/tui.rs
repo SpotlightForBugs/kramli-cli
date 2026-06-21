@@ -7674,6 +7674,7 @@ async fn open_path(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::ApiClient;
 
     fn sample_item(id: i64, text: &str) -> ListItem {
         ListItem {
@@ -7712,6 +7713,23 @@ mod tests {
             image_filename: None,
             attachments: None,
         }
+    }
+
+    fn test_app() -> App {
+        App::new(ApiClient::for_tests("https://kramli.test"), true)
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    fn test_list() -> ShoppingList {
+        test_shopping_list(1, "Groceries", None, None, None, false)
     }
 
     #[test]
@@ -7921,6 +7939,371 @@ mod tests {
             visible_item_at_wrapped_row(&items, &visible, 0, 3, 8),
             Some(1)
         );
+    }
+
+    #[test]
+    fn mouse_buttons_track_left_button_only() {
+        assert_eq!(
+            MouseButtons::from_kind(MouseEventKind::Down(MouseButton::Left)),
+            Some(MouseButtons {
+                left_down: true,
+                left_drag: false,
+                left_up: false,
+            })
+        );
+        assert_eq!(
+            MouseButtons::from_kind(MouseEventKind::Drag(MouseButton::Left)),
+            Some(MouseButtons {
+                left_down: false,
+                left_drag: true,
+                left_up: false,
+            })
+        );
+        assert_eq!(
+            MouseButtons::from_kind(MouseEventKind::Up(MouseButton::Left)),
+            Some(MouseButtons {
+                left_down: false,
+                left_drag: false,
+                left_up: true,
+            })
+        );
+        assert_eq!(
+            MouseButtons::from_kind(MouseEventKind::Down(MouseButton::Right)),
+            None
+        );
+    }
+
+    #[test]
+    fn navigation_action_maps_all_global_keys() {
+        assert_eq!(
+            navigation_action_for_key(KeyCode::Tab),
+            NavigationAction::NextMode
+        );
+        assert_eq!(
+            navigation_action_for_key(KeyCode::BackTab),
+            NavigationAction::PreviousMode
+        );
+        assert_eq!(
+            navigation_action_for_key(KeyCode::Char('1')),
+            NavigationAction::SwitchMode(ViewMode::List)
+        );
+        assert_eq!(
+            navigation_action_for_key(KeyCode::Char('2')),
+            NavigationAction::SwitchMode(ViewMode::Kanban)
+        );
+        assert_eq!(
+            navigation_action_for_key(KeyCode::Char('3')),
+            NavigationAction::SwitchMode(ViewMode::Calendar)
+        );
+        assert_eq!(
+            navigation_action_for_key(KeyCode::PageUp),
+            NavigationAction::MoveMonth(-1)
+        );
+        assert_eq!(
+            navigation_action_for_key(KeyCode::Char(']')),
+            NavigationAction::MoveMonth(1)
+        );
+        assert_eq!(
+            navigation_action_for_key(KeyCode::Left),
+            NavigationAction::MoveHorizontal {
+                delta: -1,
+                fallback: FocusPane::Lists,
+            }
+        );
+        assert_eq!(
+            navigation_action_for_key(KeyCode::Right),
+            NavigationAction::MoveHorizontal {
+                delta: 1,
+                fallback: FocusPane::Items,
+            }
+        );
+        assert_eq!(
+            navigation_action_for_key(KeyCode::Up),
+            NavigationAction::MoveSelection(-1)
+        );
+        assert_eq!(
+            navigation_action_for_key(KeyCode::Down),
+            NavigationAction::MoveSelection(1)
+        );
+        assert_eq!(
+            navigation_action_for_key(KeyCode::Enter),
+            NavigationAction::Enter
+        );
+        assert_eq!(
+            navigation_action_for_key(KeyCode::Esc),
+            NavigationAction::Escape
+        );
+        assert_eq!(
+            navigation_action_for_key(KeyCode::F(1)),
+            NavigationAction::Help
+        );
+        assert_eq!(
+            navigation_action_for_key(KeyCode::Home),
+            NavigationAction::EdgeItem(true)
+        );
+        assert_eq!(
+            navigation_action_for_key(KeyCode::End),
+            NavigationAction::EdgeItem(false)
+        );
+        assert_eq!(
+            navigation_action_for_key(KeyCode::Char('x')),
+            NavigationAction::Ignore
+        );
+    }
+
+    #[tokio::test]
+    async fn app_navigation_helpers_update_mode_focus_and_selection() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "One"), sample_item(2, "Two")];
+        app.focus = FocusPane::Items;
+
+        let (list_changed, item_changed) = app
+            .handle_navigation_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(!list_changed);
+        assert!(item_changed);
+        assert_eq!(app.selected_item, 1);
+
+        app.handle_navigation_key(KeyEvent::new(KeyCode::Home, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.selected_item, 0);
+
+        app.handle_navigation_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.mode, ViewMode::Kanban);
+
+        app.handle_navigation_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.mode, ViewMode::Calendar);
+        app.calendar_selected_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 20,
+        });
+        app.handle_navigation_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        app.handle_navigation_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(app.calendar_selected_date.is_some());
+
+        app.handle_navigation_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(app.calendar_selected_date.is_none());
+
+        app.focus = FocusPane::Lists;
+        let (list_changed, _) = app
+            .handle_navigation_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(list_changed);
+        assert_eq!(app.focus, FocusPane::Items);
+    }
+
+    #[tokio::test]
+    async fn app_mouse_helpers_cover_tabs_footer_lists_and_modes() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "One"), sample_item(2, "Two")];
+        app.items_cache.insert(1, app.items.clone());
+        let area = Rect::new(0, 0, 120, 40);
+        let layout = ui_layout(area);
+
+        app.show_help = true;
+        assert!(app.handle_help_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1)));
+        assert!(!app.show_help);
+
+        app.focus = FocusPane::Items;
+        app.mode = ViewMode::List;
+        assert!(app.handle_mouse_scroll(MouseEvent {
+            modifiers: KeyModifiers::empty(),
+            ..mouse(MouseEventKind::ScrollDown, 1, 1)
+        }));
+
+        let tab = layout.tab_chunks[1];
+        assert!(app.handle_tab_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                tab.x + 1,
+                tab.y + 1
+            ),
+            &layout,
+            true,
+        ));
+        assert_eq!(app.mode, ViewMode::Kanban);
+
+        let help_button = footer_buttons(layout.footer, &app.key_bindings)
+            .into_iter()
+            .find(|(action, _)| *action == FooterAction::Help)
+            .unwrap()
+            .1;
+        assert!(app
+            .handle_footer_mouse(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    help_button.x,
+                    help_button.y
+                ),
+                layout.footer,
+                true,
+            )
+            .await
+            .unwrap());
+        assert!(app.show_help);
+        app.show_help = false;
+
+        let list_rows = item_rows_area(list_panel_rows_area(layout.lists));
+        assert!(app.handle_list_panel_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                list_rows.x,
+                list_rows.y + 1,
+            ),
+            layout.lists,
+            true,
+        ));
+        assert_eq!(app.selected_list, 0);
+
+        assert!(app.handle_non_content_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                layout.footer.x,
+                layout.footer.y
+            ),
+            &layout,
+            true,
+        ));
+
+        let mut empty_app = test_app();
+        assert!(empty_app.handle_empty_items_mouse(true));
+        assert!(empty_app.status.is_some());
+
+        app.mode = ViewMode::List;
+        let (list_rect, _) = list_mode_layout(layout.content);
+        let list_items_area = item_rows_area(list_rect);
+        app.handle_mode_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                list_items_area.x,
+                list_items_area.y,
+            ),
+            layout.content,
+            MouseButtons {
+                left_down: true,
+                left_drag: false,
+                left_up: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        app.mode = ViewMode::Kanban;
+        app.items[0].progress = Some(tr("tui-kanban-open"));
+        let (columns, buckets) = app.kanban_buckets();
+        let chunks = kanban_chunks(layout.content, columns.len().min(3));
+        let column_area = item_rows_area(chunks[0]);
+        assert!(!buckets[0].is_empty());
+        app.handle_kanban_mode_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                column_area.x,
+                column_area.y,
+            ),
+            layout.content,
+            true,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(app.kanban_drag_item.is_some());
+        app.handle_kanban_mode_mouse(
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                column_area.x,
+                column_area.y,
+            ),
+            layout.content,
+            false,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        app.handle_kanban_mode_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                column_area.x,
+                column_area.y,
+            ),
+            layout.content,
+            false,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        app.mode = ViewMode::Calendar;
+        app.items[0].due_date = Some("2026-07-20".to_string());
+        app.calendar_selected_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 20,
+        });
+        app.calendar_visible_month = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 1,
+        });
+        let calendar = app.calendar_layout(layout.content);
+        let item_hit = calendar.item_hits[0].rect;
+        app.handle_calendar_mode_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                item_hit.x,
+                item_hit.y,
+            ),
+            layout.content,
+            true,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        app.handle_calendar_mode_mouse(
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                item_hit.x,
+                item_hit.y,
+            ),
+            layout.content,
+            false,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        app.handle_calendar_mode_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                item_hit.x,
+                item_hit.y,
+            ),
+            layout.content,
+            false,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
     }
 
     #[test]

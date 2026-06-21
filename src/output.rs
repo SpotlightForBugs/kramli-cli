@@ -1154,10 +1154,10 @@ pub(crate) fn print_activity(entries: &[ActivityEntry]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        activity_detail_text, date_with_time, human_size, parse_hex_color, reminder_offsets_label,
-        schedule_lines, strip_html,
+        activity_detail_text, date_with_time, human_size, item_status_parts, parse_hex_color,
+        print_item_detail, reminder_offsets_label, schedule_lines, strip_html, ItemComments,
     };
-    use crate::models::ListItem;
+    use crate::models::{Attachment, ItemComment, ListItem};
     use serde_json::json;
 
     fn minimal_item() -> ListItem {
@@ -1301,5 +1301,56 @@ mod tests {
         let pairs_rendered = activity_detail_text(Some(&with_pairs));
         assert!(pairs_rendered.contains("alpha=1"));
         assert!(pairs_rendered.contains("beta=x"));
+    }
+
+    #[test]
+    fn item_detail_helpers_render_all_optional_sections() {
+        let mut item = minimal_item();
+        item.text = "Buy milk".to_string();
+        item.is_done = Some(true);
+        item.quantity = Some("2 bottles".to_string());
+        item.notes = Some("<p>Keep cold</p>".to_string());
+        item.tldr = Some("Dairy".to_string());
+        item.due_date = Some("2026-07-20".to_string());
+        item.due_time = Some("09:30".to_string());
+        item.planned_date = Some("2026-07-19".to_string());
+        item.planned_time = Some("08:00".to_string());
+        item.repeat_label = Some("Weekly".to_string());
+        item.reminder = Some(true);
+        item.reminder_time = Some("09:00".to_string());
+        item.reminder_offsets = Some(vec![60, 1440]);
+        item.travel_time_minutes = Some(15);
+        item.priority = Some("high".to_string());
+        item.progress = Some("Doing".to_string());
+        item.tags = Some(vec!["grocery".to_string(), "fresh".to_string()]);
+        item.assigned_to = Some(vec![7, 9]);
+        item.color = Some("#00aa44".to_string());
+        item.image_url = Some("https://example.test/milk.png".to_string());
+        item.created_at = Some("2026-07-18T10:20:30Z".to_string());
+        item.updated_at = Some("2026-07-19T11:22:33Z".to_string());
+        item.attachments = Some(vec![Attachment {
+            id: 1,
+            filename: Some("receipt.pdf".to_string()),
+            original_filename: Some("Receipt.pdf".to_string()),
+            mime_type: Some("application/pdf".to_string()),
+            file_size: Some(2048),
+            url: Some("https://example.test/receipt.pdf".to_string()),
+        }]);
+        let comments = vec![ItemComment {
+            id: 1,
+            text: Some("Remember lactose-free".to_string()),
+            user_id: Some(2),
+            user_name: Some("Ada".to_string()),
+            user_email: Some("ada@example.test".to_string()),
+            created_at: Some("2026-07-19T12:00:00Z".to_string()),
+        }];
+
+        let status = item_status_parts(&item);
+        assert!(status.check.contains('✓'));
+        assert!(status.priority.contains("!!!"));
+        print_item_detail(&item, &comments);
+
+        let empty = ItemComments { comments: &[] };
+        empty.print();
     }
 }
