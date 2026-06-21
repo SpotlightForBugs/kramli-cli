@@ -191,11 +191,14 @@ impl Config {
 
     #[cfg(test)]
     fn keychain_api_key() -> Result<Option<String>, String> {
-        TEST_KEYCHAIN_API_KEY
+        match TEST_KEYCHAIN_API_KEY
             .lock()
             .expect("keychain test lock poisoned")
             .clone()
-            .unwrap_or(Ok(None))
+        {
+            Some(result) => result,
+            None => Ok(None),
+        }
     }
 
     #[cfg(not(test))]
@@ -391,6 +394,7 @@ mod tests {
     }
 
     fn with_test_keychain<T>(value: Result<Option<String>, String>, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
         {
             let mut keychain = TEST_KEYCHAIN_API_KEY
                 .lock()
@@ -496,6 +500,13 @@ mod tests {
 
     #[test]
     fn keychain_fallback_branches_are_testable_without_system_keychain() {
+        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        *TEST_KEYCHAIN_API_KEY
+            .lock()
+            .expect("keychain test lock poisoned") = None;
+        assert_eq!(Config::keychain_api_key(), Ok(None));
+        drop(_guard);
+
         with_test_keychain(Ok(Some("stored-key".to_string())), || {
             let cfg = config_file(None, None);
             assert_eq!(cfg.api_key().as_deref(), Some("stored-key"));
