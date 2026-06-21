@@ -4,6 +4,11 @@
 
 <h1 align="center">kramli-cli</h1>
 
+  [![DeepSource](https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli.svg/?label=code+coverage&show_trend=true&token=R3u8WNRSja7eRF8JiJrmNkUZ)](https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli/) 
+  [![DeepSource](https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli.svg/?label=active+issues&show_trend=true&token=R3u8WNRSja7eRF8JiJrmNkUZ)](https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli/) 
+  [![DeepSource](https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli.svg/?label=resolved+issues&show_trend=true&token=R3u8WNRSja7eRF8JiJrmNkUZ)](https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli/)</p>
+
+
 <p align="center">
   Command-line client for <a href="https://kramli.de">Kramli</a> — shopping lists, todos, and shared lists from your terminal.
 </p>
