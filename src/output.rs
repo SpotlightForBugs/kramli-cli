@@ -1373,9 +1373,11 @@ mod tests {
         );
         assert_eq!(bootstrap_icon_asset_name("../cart-fill"), None);
 
-        assert_eq!(display_icon(None, "folder"), "[folder]");
-        assert_eq!(display_icon(Some("bi-cart-fill"), "list"), "[cart]");
-        assert_eq!(display_icon(Some("custom"), "list"), "[custom]");
+        with_icon_style("label", || {
+            assert_eq!(display_icon(None, "folder"), "[folder]");
+            assert_eq!(display_icon(Some("bi-cart-fill"), "list"), "[cart]");
+            assert_eq!(display_icon(Some("custom"), "list"), "[custom]");
+        });
 
         assert_eq!(char_display_width('\t'), 4);
         assert_eq!(char_display_width('\n'), 0);

@@ -685,8 +685,11 @@ fn tools() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        content_length, insert_reminder_fields, mcp_method_trace_name, mcp_tool_trace_name, tools,
-        try_parse_message, write_message, MessageFraming,
+        content_length, error_response, handle_message, insert_optional_string,
+        insert_reminder_fields, mcp_method_trace_name, mcp_tool_trace_name, optional_bool,
+        optional_i64, optional_i64_array, optional_string, optional_string_array, read_message,
+        required_i64, required_string, tool_result, tool_text_result, tools, try_parse_message,
+        write_message, MessageFraming,
     };
     use serde_json::{json, Map, Value};
 
@@ -735,9 +738,52 @@ mod tests {
     #[test]
     fn trace_names_are_low_cardinality() {
         assert_eq!(mcp_method_trace_name("tools/call"), "tools_call");
+        assert_eq!(mcp_method_trace_name("initialize"), "initialize");
+        assert_eq!(mcp_method_trace_name("ping"), "ping");
+        assert_eq!(mcp_method_trace_name("tools/list"), "tools_list");
         assert_eq!(mcp_method_trace_name("notifications/changed"), "unknown");
+        assert_eq!(mcp_tool_trace_name("list_lists"), "list_lists");
+        assert_eq!(mcp_tool_trace_name("list_items"), "list_items");
         assert_eq!(mcp_tool_trace_name("create_item"), "create_item");
+        assert_eq!(mcp_tool_trace_name("update_item"), "update_item");
+        assert_eq!(mcp_tool_trace_name("toggle_item_done"), "toggle_item_done");
+        assert_eq!(mcp_tool_trace_name("delete_item"), "delete_item");
         assert_eq!(mcp_tool_trace_name("custom_user_input"), "unknown");
+    }
+
+    #[tokio::test]
+    async fn handles_protocol_messages_without_tool_api() {
+        assert!(handle_message(json!({"jsonrpc": "2.0", "method": "ping"}))
+            .await
+            .is_none());
+        assert!(handle_message(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "notifications/changed"})
+        )
+        .await
+        .is_none());
+
+        let initialized =
+            handle_message(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
+                .await
+                .expect("initialize response");
+        assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+
+        let ping = handle_message(json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}))
+            .await
+            .expect("ping response");
+        assert_eq!(ping["result"], json!({}));
+
+        let listed = handle_message(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}))
+            .await
+            .expect("tools/list response");
+        assert!(listed["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.len() >= 6));
+
+        let unknown = handle_message(json!({"jsonrpc": "2.0", "id": 4, "method": "custom"}))
+            .await
+            .expect("unknown response");
+        assert_eq!(unknown["error"]["code"], -32601);
     }
 
     #[test]
@@ -915,6 +961,113 @@ mod tests {
     }
 
     #[test]
+    fn argument_parsers_cover_valid_null_and_error_paths() {
+        let args = json!({
+            "int": "42",
+            "bad_int": "x",
+            "bool": true,
+            "text": "  hello  ",
+            "blank": "   ",
+            "strings": [" one ", "", "two"],
+            "ints": [1, 2],
+            "null": null
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+
+        assert_eq!(required_i64(&args, "int").unwrap(), 42);
+        assert_eq!(optional_i64(&args, "missing").unwrap(), None);
+        assert_eq!(optional_i64(&args, "null").unwrap(), None);
+        assert!(optional_i64(&args, "bad_int").is_err());
+        assert!(optional_i64(&json!({"int": true}).as_object().unwrap().clone(), "int").is_err());
+        assert!(required_i64(&args, "missing").is_err());
+
+        assert_eq!(required_string(&args, "text").unwrap(), "hello");
+        assert_eq!(optional_string(&args, "blank").unwrap(), None);
+        assert_eq!(optional_string(&args, "null").unwrap(), None);
+        assert!(optional_string(&json!({"text": 1}).as_object().unwrap().clone(), "text").is_err());
+        assert!(required_string(&args, "missing").is_err());
+
+        assert_eq!(optional_bool(&args, "bool").unwrap(), Some(true));
+        assert_eq!(optional_bool(&args, "missing").unwrap(), None);
+        assert!(
+            optional_bool(&json!({"bool": "yes"}).as_object().unwrap().clone(), "bool").is_err()
+        );
+
+        assert_eq!(
+            optional_string_array(&args, "strings").unwrap(),
+            Some(vec![
+                Value::String("one".into()),
+                Value::String("two".into())
+            ])
+        );
+        assert_eq!(optional_string_array(&args, "missing").unwrap(), None);
+        assert_eq!(optional_string_array(&args, "null").unwrap(), None);
+        assert!(optional_string_array(
+            &json!({"strings": "one"}).as_object().unwrap().clone(),
+            "strings"
+        )
+        .is_err());
+        assert!(optional_string_array(
+            &json!({"strings": [1]}).as_object().unwrap().clone(),
+            "strings"
+        )
+        .is_err());
+
+        assert_eq!(
+            optional_i64_array(&args, "ints").unwrap(),
+            Some(vec![Value::from(1), Value::from(2)])
+        );
+        assert_eq!(optional_i64_array(&args, "missing").unwrap(), None);
+        assert_eq!(optional_i64_array(&args, "null").unwrap(), None);
+        assert!(
+            optional_i64_array(&json!({"ints": 1}).as_object().unwrap().clone(), "ints").is_err()
+        );
+        assert!(
+            optional_i64_array(&json!({"ints": ["x"]}).as_object().unwrap().clone(), "ints")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn optional_body_helpers_cover_insert_and_reminder_errors() {
+        let args = json!({"name": " Kramli ", "bad_reminder": "yes"})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let mut body = Map::new();
+
+        insert_optional_string(&args, &mut body, "name", "title").unwrap();
+        insert_optional_string(&args, &mut body, "missing", "missing").unwrap();
+
+        assert_eq!(body.get("title"), Some(&Value::String("Kramli".into())));
+        assert!(!body.contains_key("missing"));
+
+        let bad = json!({"reminder": "yes"}).as_object().cloned().unwrap();
+        assert!(insert_reminder_fields(&bad, &mut Map::new()).is_err());
+    }
+
+    #[test]
+    fn response_helpers_shape_json_rpc_and_tool_results() {
+        let tool = tool_result(json!({"ok": true}), false);
+        assert_eq!(tool["isError"], false);
+        assert!(tool["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("ok")));
+
+        let text = tool_text_result("failed".to_string(), true);
+        assert_eq!(text["isError"], true);
+        assert_eq!(text["content"][0]["text"], "failed");
+
+        let err = error_response(Value::from(9), -1, "nope");
+        assert_eq!(err["jsonrpc"], "2.0");
+        assert_eq!(err["id"], 9);
+        assert_eq!(err["error"]["code"], -1);
+        assert_eq!(err["error"]["message"], "nope");
+    }
+
+    #[test]
     fn create_item_schema_required_fields_are_stable() {
         let tool = tools()
             .into_iter()
@@ -969,5 +1122,77 @@ mod tests {
 
         assert!(output.ends_with(b"\n"));
         assert!(!output.starts_with(b"Content-Length:"));
+    }
+
+    #[tokio::test]
+    async fn reads_messages_until_complete_or_eof() {
+        let mut reader = b"  \n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n".as_slice();
+        let mut buffer = Vec::new();
+        let message = read_message(&mut reader, &mut buffer)
+            .await
+            .expect("read should succeed")
+            .expect("message expected");
+
+        assert_eq!(message.value["method"], "ping");
+        assert!(matches!(message.framing, MessageFraming::JsonLine));
+
+        let mut empty_reader = b" \n\t".as_slice();
+        let mut empty_buffer = Vec::new();
+        assert!(read_message(&mut empty_reader, &mut empty_buffer)
+            .await
+            .expect("whitespace eof")
+            .is_none());
+
+        let mut incomplete_reader = b"{\"jsonrpc\":".as_slice();
+        let mut incomplete_buffer = Vec::new();
+        assert!(read_message(&mut incomplete_reader, &mut incomplete_buffer)
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn parser_reports_header_and_json_errors() {
+        let body = b"not-json";
+        let mut invalid_body = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        invalid_body.extend_from_slice(body);
+        assert!(try_parse_message(&mut invalid_body).is_err());
+
+        let mut invalid_line = b"{invalid}\n".to_vec();
+        assert!(try_parse_message(&mut invalid_line).is_err());
+
+        let mut empty_line = b"\n".to_vec();
+        assert!(try_parse_message(&mut empty_line)
+            .expect("empty line parses as no message")
+            .is_none());
+
+        let mut partial_header = b"Content-Length: 5\r\n".to_vec();
+        assert!(try_parse_message(&mut partial_header)
+            .expect("partial header waits")
+            .is_none());
+
+        let mut invalid_header = vec![0xff, b':', b' ', b'1', b'\r', b'\n', b'\r', b'\n'];
+        invalid_header.extend_from_slice(b"{}");
+        assert!(try_parse_message(&mut invalid_header).is_err());
+
+        assert!(content_length("Content-Type: application/json").is_err());
+        assert!(content_length("Content-Length: nope").is_err());
+    }
+
+    #[tokio::test]
+    async fn writes_content_length_response_for_header_framing() {
+        let mut output = Vec::new();
+
+        write_message(
+            &mut output,
+            &json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}),
+            MessageFraming::ContentLength,
+        )
+        .await
+        .expect("write should not fail");
+
+        let text = String::from_utf8(output).expect("utf8 output");
+        assert!(text.starts_with("Content-Length: "));
+        assert!(text.contains("\r\n\r\n"));
+        assert!(text.contains("\"ok\":true"));
     }
 }
