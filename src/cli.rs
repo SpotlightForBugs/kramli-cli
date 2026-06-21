@@ -525,6 +525,291 @@ mod tests {
             &None
         ));
     }
+
+    fn list_response(id: i64, name: &str) -> String {
+        json!({"id": id, "name": name}).to_string()
+    }
+
+    async fn api_with_responses(
+        responses: Vec<String>,
+    ) -> (ApiClient, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener.local_addr().expect("test server should have addr");
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for body in responses {
+                let (mut stream, _) = listener.accept().await.expect("request should connect");
+                let mut buffer = [0_u8; 4096];
+                let read = stream.read(&mut buffer).await.expect("request should read");
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                requests.push(request.lines().next().unwrap_or_default().to_string());
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(header.as_bytes())
+                    .await
+                    .expect("response header should write");
+                stream
+                    .write_all(body.as_bytes())
+                    .await
+                    .expect("response body should write");
+            }
+            requests
+        });
+
+        (ApiClient::for_tests(&format!("http://{addr}")), handle)
+    }
+
+    async fn server_with_base_url(
+        responses: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let (api, handle) = api_with_responses(responses).await;
+        (api.base_url_for_tests().to_string(), handle)
+    }
+
+    async fn with_env_vars_async<T, Fut>(vars: &[(&str, &str)], f: impl FnOnce() -> Fut) -> T
+    where
+        Fut: std::future::Future<Output = T>,
+    {
+        let previous = vars
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
+            .collect::<Vec<_>>();
+        for (key, value) in vars {
+            std::env::set_var(key, value);
+        }
+
+        let result = f().await;
+
+        for (key, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+
+        result
+    }
+
+    fn temp_batch_file(name: &str, content: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "kramli-cli-{name}-{}-{}.txt",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::write(&path, content).expect("batch file should write");
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn list_update_and_batch_helpers_cover_branch_variants() {
+        let body = update_list_body(
+            Some("Groceries".to_string()),
+            Some("cart".to_string()),
+            Some("#ffffff".to_string()),
+            Some("Open:#336699,Done".to_string()),
+        )
+        .expect("list body should build");
+        assert_eq!(
+            body.get("name"),
+            Some(&Value::String("Groceries".to_string()))
+        );
+        assert_eq!(body.get("icon"), Some(&Value::String("cart".to_string())));
+        assert_eq!(
+            body.get("color"),
+            Some(&Value::String("#ffffff".to_string()))
+        );
+        assert!(body.get("states").is_some_and(Value::is_array));
+        assert!(update_list_body(None, None, None, None).is_err());
+
+        let mut failed = 0;
+        let mut first_error = None;
+        assert!(!record_batch_failure(
+            &mut failed,
+            &mut first_error,
+            "line 1: bad".to_string(),
+            false,
+        ));
+        assert_eq!(failed, 1);
+        assert_eq!(first_error.as_deref(), Some("line 1: bad"));
+        assert!(record_batch_failure(
+            &mut failed,
+            &mut first_error,
+            "line 2: worse".to_string(),
+            true,
+        ));
+        assert_eq!(failed, 2);
+        assert_eq!(first_error.as_deref(), Some("line 1: bad"));
+    }
+
+    #[tokio::test]
+    async fn list_mutation_helpers_cover_json_and_human_paths() {
+        let responses = vec![
+            list_response(7, "Created"),
+            list_response(8, "Created JSON"),
+            list_response(7, "Updated"),
+            list_response(7, "Updated JSON"),
+            json!({"ok": true, "undo_token": "undo-1"}).to_string(),
+            json!({"ok": true}).to_string(),
+            list_response(7, "Moved"),
+            list_response(7, "Moved Home"),
+            list_response(7, "Moved JSON"),
+        ];
+        let (api, requests) = api_with_responses(responses).await;
+
+        run_lists_create(
+            &api,
+            false,
+            "Created".to_string(),
+            Some("cart".to_string()),
+            Some("#ffffff".to_string()),
+            Some(3),
+            Some("Open:#336699,Done".to_string()),
+        )
+        .await
+        .expect("create human should succeed");
+        run_lists_create(
+            &api,
+            true,
+            "Created JSON".to_string(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("create json should succeed");
+        run_lists_update(
+            &api,
+            false,
+            7,
+            Some("Updated".to_string()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("update human should succeed");
+        run_lists_update(&api, true, 7, None, Some("list".to_string()), None, None)
+            .await
+            .expect("update json should succeed");
+        run_lists_delete(&api, false, 7)
+            .await
+            .expect("delete human should succeed");
+        run_lists_delete(&api, true, 7)
+            .await
+            .expect("delete json should succeed");
+        run_lists_move(&api, false, 7, Some(3))
+            .await
+            .expect("move to folder should succeed");
+        run_lists_move(&api, false, 7, None)
+            .await
+            .expect("move out of folder should succeed");
+        run_lists_move(&api, true, 7, Some(4))
+            .await
+            .expect("move json should succeed");
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests[0], "POST /api/lists HTTP/1.1");
+        assert_eq!(requests[1], "POST /api/lists HTTP/1.1");
+        assert_eq!(requests[2], "PUT /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[3], "PUT /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[4], "DELETE /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[5], "DELETE /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[6], "PUT /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[7], "PUT /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[8], "PUT /api/lists/7 HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn env_var_helper_restores_existing_values() {
+        std::env::set_var("KRAMLI_API_KEY", "before");
+        with_env_vars_async(&[("KRAMLI_API_KEY", "during")], || async {
+            assert_eq!(std::env::var("KRAMLI_API_KEY").as_deref(), Ok("during"));
+        })
+        .await;
+        assert_eq!(std::env::var("KRAMLI_API_KEY").as_deref(), Ok("before"));
+        std::env::remove_var("KRAMLI_API_KEY");
+    }
+
+    #[tokio::test]
+    async fn run_lists_dispatches_mutation_subcommands() {
+        let responses = vec![
+            list_response(7, "Created"),
+            list_response(7, "Updated"),
+            json!({"ok": true}).to_string(),
+            list_response(7, "Moved"),
+        ];
+        let (base_url, requests) = server_with_base_url(responses).await;
+
+        with_env_vars_async(
+            &[("KRAMLI_URL", &base_url), ("KRAMLI_API_KEY", "test")],
+            || async {
+                run_lists(
+                    ListCmd::Create {
+                        name: "Created".to_string(),
+                        icon: None,
+                        color: None,
+                        folder: None,
+                        states: None,
+                    },
+                    true,
+                )
+                .await
+                .expect("create should dispatch");
+                run_lists(
+                    ListCmd::Update {
+                        id: 7,
+                        name: Some("Updated".to_string()),
+                        icon: None,
+                        color: None,
+                        states: None,
+                    },
+                    true,
+                )
+                .await
+                .expect("update should dispatch");
+                run_lists(ListCmd::Delete { id: 7 }, true)
+                    .await
+                    .expect("delete should dispatch");
+                run_lists(
+                    ListCmd::Move {
+                        id: 7,
+                        folder_id: Some(3),
+                    },
+                    true,
+                )
+                .await
+                .expect("move should dispatch");
+            },
+        )
+        .await;
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests[0], "POST /api/lists HTTP/1.1");
+        assert_eq!(requests[1], "PUT /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[2], "DELETE /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[3], "PUT /api/lists/7 HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn run_batch_reports_parse_and_nested_command_errors() {
+        let shell_error = temp_batch_file("shell-error", "\"unterminated\n");
+        assert!(run_batch(&shell_error, false, false).await.is_err());
+
+        let cli_error = temp_batch_file("cli-error", "not-a-command\n");
+        assert!(run_batch(&cli_error, false, false).await.is_err());
+
+        let nested_error = temp_batch_file("nested-error", "batch -\n");
+        assert!(run_batch(&nested_error, false, false).await.is_err());
+    }
 }
 
 #[derive(Subcommand)]
@@ -1582,103 +1867,144 @@ async fn run_lists(cmd: ListCmd, as_json: bool) -> Result<(), String> {
             color,
             folder,
             states,
-        } => {
-            let body = CreateList {
-                name,
-                icon,
-                color,
-                folder_id: folder,
-            };
-            let mut payload = serde_json::to_value(&body).map_err(|e| e.to_string())?;
-            if let Some(states_raw) = states {
-                payload["states"] = parse_states_arg(&states_raw)?;
-            }
-            let list: ShoppingList = api.post("/lists", &payload).await?;
-            if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&list).unwrap_or_default()
-                );
-            } else {
-                println!(
-                    "{} {}",
-                    "✓".green(),
-                    tr_args("cli-list-created", &[("id", list.id.to_string())])
-                );
-                output::print_list_detail(&list);
-            }
-        }
+        } => run_lists_create(&api, as_json, name, icon, color, folder, states).await?,
         ListCmd::Update {
             id,
             name,
             icon,
             color,
             states,
-        } => {
-            let mut body = serde_json::Map::new();
-            if let Some(n) = name {
-                body.insert("name".into(), Value::String(n));
-            }
-            if let Some(i) = icon {
-                body.insert("icon".into(), Value::String(i));
-            }
-            if let Some(c) = color {
-                body.insert("color".into(), Value::String(c));
-            }
-            if let Some(states_raw) = states {
-                body.insert("states".into(), parse_states_arg(&states_raw)?);
-            }
-            if body.is_empty() {
-                return Err(tr("cli-no-changes"));
-            }
-            let list: ShoppingList = api.put(&format!("/lists/{id}"), &body).await?;
-            json_or!(as_json, list, {
-                println!("{} {}", "✓".green(), tr("cli-list-updated"));
-                output::print_list_detail(&list);
-            });
-        }
-        ListCmd::Delete { id } => {
-            let resp: OkResponse = api.delete(&format!("/lists/{id}")).await?;
-            if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&resp).unwrap_or_default()
-                );
-            } else {
-                println!("{} {}", "✓".green(), tr("cli-list-deleted"));
-                if let Some(t) = resp.undo_token {
-                    println!("  {}: {t}", tr("label-undo-token"));
-                }
-            }
-        }
-        ListCmd::Move { id, folder_id } => {
-            let body = json!({"folder_id": folder_id});
-            let list: ShoppingList = api.put(&format!("/lists/{id}"), &body).await?;
-            if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&list).unwrap_or_default()
-                );
-            } else {
-                match folder_id {
-                    Some(fid) => println!(
-                        "{} {}",
-                        "✓".green(),
-                        tr_args(
-                            "cli-list-moved-folder",
-                            &[("id", id.to_string()), ("folder_id", fid.to_string())],
-                        )
-                    ),
-                    None => println!(
-                        "{} {}",
-                        "✓".green(),
-                        tr_args("cli-list-removed-folder", &[("id", id.to_string())])
-                    ),
-                }
-            }
+        } => run_lists_update(&api, as_json, id, name, icon, color, states).await?,
+        ListCmd::Delete { id } => run_lists_delete(&api, as_json, id).await?,
+        ListCmd::Move { id, folder_id } => run_lists_move(&api, as_json, id, folder_id).await?,
+    }
+    Ok(())
+}
+
+async fn run_lists_create(
+    api: &ApiClient,
+    as_json: bool,
+    name: String,
+    icon: Option<String>,
+    color: Option<String>,
+    folder: Option<i64>,
+    states: Option<String>,
+) -> Result<(), String> {
+    let body = CreateList {
+        name,
+        icon,
+        color,
+        folder_id: folder,
+    };
+    let mut payload = serde_json::to_value(&body).map_err(|e| e.to_string())?;
+    if let Some(states_raw) = states {
+        payload["states"] = parse_states_arg(&states_raw)?;
+    }
+    let list: ShoppingList = api.post("/lists", &payload).await?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&list).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "{} {}",
+            "✓".green(),
+            tr_args("cli-list-created", &[("id", list.id.to_string())])
+        );
+        output::print_list_detail(&list);
+    }
+    Ok(())
+}
+
+async fn run_lists_update(
+    api: &ApiClient,
+    as_json: bool,
+    id: i64,
+    name: Option<String>,
+    icon: Option<String>,
+    color: Option<String>,
+    states: Option<String>,
+) -> Result<(), String> {
+    let body = update_list_body(name, icon, color, states)?;
+    let list: ShoppingList = api.put(&format!("/lists/{id}"), &body).await?;
+    json_or!(as_json, list, {
+        println!("{} {}", "✓".green(), tr("cli-list-updated"));
+        output::print_list_detail(&list);
+    });
+    Ok(())
+}
+
+fn update_list_body(
+    name: Option<String>,
+    icon: Option<String>,
+    color: Option<String>,
+    states: Option<String>,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let mut body = serde_json::Map::new();
+    insert_string(&mut body, "name", name);
+    insert_string(&mut body, "icon", icon);
+    insert_string(&mut body, "color", color);
+    if let Some(states_raw) = states {
+        body.insert("states".into(), parse_states_arg(&states_raw)?);
+    }
+    if body.is_empty() {
+        return Err(tr("cli-no-changes"));
+    }
+    Ok(body)
+}
+
+async fn run_lists_delete(api: &ApiClient, as_json: bool, id: i64) -> Result<(), String> {
+    let resp: OkResponse = api.delete(&format!("/lists/{id}")).await?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&resp).unwrap_or_default()
+        );
+    } else {
+        println!("{} {}", "✓".green(), tr("cli-list-deleted"));
+        if let Some(t) = resp.undo_token {
+            println!("  {}: {t}", tr("label-undo-token"));
         }
     }
     Ok(())
+}
+
+async fn run_lists_move(
+    api: &ApiClient,
+    as_json: bool,
+    id: i64,
+    folder_id: Option<i64>,
+) -> Result<(), String> {
+    let body = json!({"folder_id": folder_id});
+    let list: ShoppingList = api.put(&format!("/lists/{id}"), &body).await?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&list).unwrap_or_default()
+        );
+    } else {
+        print_list_move_result(id, folder_id);
+    }
+    Ok(())
+}
+
+fn print_list_move_result(id: i64, folder_id: Option<i64>) {
+    match folder_id {
+        Some(fid) => println!(
+            "{} {}",
+            "✓".green(),
+            tr_args(
+                "cli-list-moved-folder",
+                &[("id", id.to_string()), ("folder_id", fid.to_string())],
+            )
+        ),
+        None => println!(
+            "{} {}",
+            "✓".green(),
+            tr_args("cli-list-removed-folder", &[("id", id.to_string())])
+        ),
+    }
 }
 
 // ─── Items ───
@@ -2730,11 +3056,7 @@ async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), St
         return run_batch_json(file, keep_going).await;
     }
 
-    let source = if file == "-" {
-        "stdin".to_string()
-    } else {
-        file.to_string()
-    };
+    let source = if file == "-" { "stdin" } else { file }.to_string();
 
     let content = if file == "-" {
         use tokio::io::AsyncReadExt;
@@ -2777,12 +3099,7 @@ async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), St
                         ("error", e.to_string()),
                     ],
                 );
-                failed += 1;
-                if first_error.is_none() {
-                    first_error = Some(err.clone());
-                }
-                eprintln!("{} {err}", "✗".red());
-                if !keep_going {
+                if !record_batch_failure(&mut failed, &mut first_error, err, keep_going) {
                     break;
                 }
                 continue;
@@ -2811,12 +3128,7 @@ async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), St
                         ("error", e.to_string()),
                     ],
                 );
-                failed += 1;
-                if first_error.is_none() {
-                    first_error = Some(err.clone());
-                }
-                eprintln!("{} {err}", "✗".red());
-                if !keep_going {
+                if !record_batch_failure(&mut failed, &mut first_error, err, keep_going) {
                     break;
                 }
                 continue;
@@ -2828,12 +3140,7 @@ async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), St
                 "cli-batch-nested-not-supported",
                 &[("source", source.clone()), ("line", line_no.to_string())],
             );
-            failed += 1;
-            if first_error.is_none() {
-                first_error = Some(err.clone());
-            }
-            eprintln!("{} {err}", "✗".red());
-            if !keep_going {
+            if !record_batch_failure(&mut failed, &mut first_error, err, keep_going) {
                 break;
             }
             continue;
@@ -2880,6 +3187,20 @@ async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), St
     );
 
     Err(first_error.unwrap_or_else(|| tr("cli-batch-failed")))
+}
+
+fn record_batch_failure(
+    failed: &mut usize,
+    first_error: &mut Option<String>,
+    err: String,
+    keep_going: bool,
+) -> bool {
+    *failed += 1;
+    if first_error.is_none() {
+        *first_error = Some(err.clone());
+    }
+    eprintln!("{} {err}", "✗".red());
+    keep_going
 }
 
 async fn run_batch_json(file: &str, keep_going: bool) -> Result<(), String> {

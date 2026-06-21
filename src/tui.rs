@@ -345,6 +345,24 @@ fn parse_key_binding(raw: &str) -> Option<KeyBinding> {
         return None;
     }
 
+    let (mut modifiers, key) = parse_key_binding_parts(trimmed)?;
+    let (mut code, mut label) = key_code_label(&key)?;
+
+    if code == KeyCode::Tab && modifiers.contains(KeyModifiers::SHIFT) {
+        code = KeyCode::BackTab;
+        modifiers.remove(KeyModifiers::SHIFT);
+        label = "S+Tab".to_string();
+    }
+
+    let prefix = key_binding_modifier_label(modifiers);
+    Some(KeyBinding::new(
+        code,
+        modifiers,
+        &format!("{prefix}{label}"),
+    ))
+}
+
+fn parse_key_binding_parts(trimmed: &str) -> Option<(KeyModifiers, String)> {
     let normalized = trimmed.to_ascii_lowercase().replace('-', "+");
     let mut modifiers = KeyModifiers::empty();
     let mut key_part: Option<&str> = None;
@@ -361,47 +379,48 @@ fn parse_key_binding(raw: &str) -> Option<KeyBinding> {
         }
     }
 
-    let key = key_part?;
-    let (mut code, mut label) = match key {
-        "space" | "spc" => (KeyCode::Char(' '), "SPC".to_string()),
-        "esc" | "escape" => (KeyCode::Esc, "Esc".to_string()),
-        "enter" | "return" => (KeyCode::Enter, "Enter".to_string()),
-        "tab" => (KeyCode::Tab, "Tab".to_string()),
-        "backtab" | "shift+tab" => (KeyCode::BackTab, "S-Tab".to_string()),
-        "f1" => (KeyCode::F(1), "F1".to_string()),
-        "f2" => (KeyCode::F(2), "F2".to_string()),
-        "f3" => (KeyCode::F(3), "F3".to_string()),
-        "f4" => (KeyCode::F(4), "F4".to_string()),
-        "f5" => (KeyCode::F(5), "F5".to_string()),
-        "f6" => (KeyCode::F(6), "F6".to_string()),
-        "f7" => (KeyCode::F(7), "F7".to_string()),
-        "f8" => (KeyCode::F(8), "F8".to_string()),
-        "f9" => (KeyCode::F(9), "F9".to_string()),
-        "f10" => (KeyCode::F(10), "F10".to_string()),
-        "f11" => (KeyCode::F(11), "F11".to_string()),
-        "f12" => (KeyCode::F(12), "F12".to_string()),
-        value => {
-            let mut chars = value.chars();
-            let ch = chars.next()?;
-            if chars.next().is_some() {
-                return None;
-            }
-            (KeyCode::Char(ch), ch.to_ascii_uppercase().to_string())
-        }
-    };
+    Some((modifiers, key_part?.to_string()))
+}
 
-    if code == KeyCode::Tab && modifiers.contains(KeyModifiers::SHIFT) {
-        code = KeyCode::BackTab;
-        modifiers.remove(KeyModifiers::SHIFT);
-        label = "S+Tab".to_string();
-    }
+fn key_code_label(key: &str) -> Option<(KeyCode, String)> {
+    key_alias_code_label(key)
+        .or_else(|| function_key_code_label(key))
+        .or_else(|| single_char_key_code_label(key))
+}
 
-    let prefix = key_binding_modifier_label(modifiers);
-    Some(KeyBinding::new(
-        code,
-        modifiers,
-        &format!("{prefix}{label}"),
-    ))
+fn key_alias_code_label(key: &str) -> Option<(KeyCode, String)> {
+    let aliases = [
+        ("space", KeyCode::Char(' '), "SPC"),
+        ("spc", KeyCode::Char(' '), "SPC"),
+        ("esc", KeyCode::Esc, "Esc"),
+        ("escape", KeyCode::Esc, "Esc"),
+        ("enter", KeyCode::Enter, "Enter"),
+        ("return", KeyCode::Enter, "Enter"),
+        ("tab", KeyCode::Tab, "Tab"),
+        ("backtab", KeyCode::BackTab, "S-Tab"),
+        ("shift+tab", KeyCode::BackTab, "S-Tab"),
+    ];
+
+    aliases
+        .iter()
+        .find(|(name, _, _)| *name == key)
+        .map(|(_, code, label)| (*code, (*label).to_string()))
+}
+
+fn function_key_code_label(key: &str) -> Option<(KeyCode, String)> {
+    let number = key.strip_prefix('f')?.parse::<u8>().ok()?;
+    (1..=12)
+        .contains(&number)
+        .then(|| (KeyCode::F(number), format!("F{number}")))
+}
+
+fn single_char_key_code_label(key: &str) -> Option<(KeyCode, String)> {
+    let mut chars = key.chars();
+    let ch = chars.next()?;
+    chars
+        .next()
+        .is_none()
+        .then(|| (KeyCode::Char(ch), ch.to_ascii_uppercase().to_string()))
 }
 
 fn key_binding_modifier_label(modifiers: KeyModifiers) -> String {
@@ -2024,24 +2043,7 @@ impl App {
         };
 
         if editor.mode == EditorMode::Filter {
-            self.item_filter = editor.text.trim().to_string();
-            self.selected_item = 0;
-            self.item_scroll = 0;
-            self.editor = None;
-            if let Some(first) = self.visible_item_indices().first().copied() {
-                self.selected_item = first;
-            }
-            self.status = if self.item_filter.is_empty() {
-                Some(tr("label-items"))
-            } else {
-                Some(tr_args(
-                    "tui-filter-status",
-                    &[("query", self.item_filter.clone())],
-                ))
-            };
-            self.refresh_selected_image_background();
-            self.load_comments_for_selected_item();
-            return Ok(());
+            return self.save_filter_editor(&editor);
         }
 
         let text = editor.text.trim().to_string();
@@ -2051,23 +2053,7 @@ impl App {
         }
 
         if editor.mode == EditorMode::Comment {
-            let Some(item_id) = editor.item_id else {
-                return Ok(());
-            };
-            let comment: ItemComment = self
-                .api
-                .post(
-                    &format!("/items/{item_id}/comments"),
-                    &serde_json::json!({ "text": text }),
-                )
-                .await?;
-            self.comments_cache
-                .entry(item_id)
-                .or_default()
-                .push(comment);
-            self.editor = None;
-            self.status = Some(tr("label-comments"));
-            return Ok(());
+            return self.save_comment_editor(&editor, &text).await;
         }
 
         let due_date = editor.due_date.trim().to_string();
@@ -2195,6 +2181,51 @@ impl App {
         });
         self.refresh_selected_image_background();
         self.load_comments_for_selected_item();
+        Ok(())
+    }
+
+    fn save_filter_editor(&mut self, editor: &EditorState) -> Result<(), String> {
+        self.item_filter = editor.text.trim().to_string();
+        self.selected_item = 0;
+        self.item_scroll = 0;
+        self.editor = None;
+        if let Some(first) = self.visible_item_indices().first().copied() {
+            self.selected_item = first;
+        }
+        self.status = if self.item_filter.is_empty() {
+            Some(tr("label-items"))
+        } else {
+            Some(tr_args(
+                "tui-filter-status",
+                &[("query", self.item_filter.clone())],
+            ))
+        };
+        self.refresh_selected_image_background();
+        self.load_comments_for_selected_item();
+        Ok(())
+    }
+
+    async fn save_comment_editor(
+        &mut self,
+        editor: &EditorState,
+        text: &str,
+    ) -> Result<(), String> {
+        let Some(item_id) = editor.item_id else {
+            return Ok(());
+        };
+        let comment: ItemComment = self
+            .api
+            .post(
+                &format!("/items/{item_id}/comments"),
+                &serde_json::json!({ "text": text }),
+            )
+            .await?;
+        self.comments_cache
+            .entry(item_id)
+            .or_default()
+            .push(comment);
+        self.editor = None;
+        self.status = Some(tr("label-comments"));
         Ok(())
     }
 
@@ -2582,72 +2613,17 @@ impl App {
             KeyCode::Esc => {
                 self.editor = None;
             }
-            KeyCode::Tab => {
-                if !simple_text_dialog {
-                    if let Some(editor) = self.editor.as_mut() {
-                        editor_move_next(editor);
-                    }
-                }
-            }
-            KeyCode::BackTab => {
-                if !simple_text_dialog {
-                    if let Some(editor) = self.editor.as_mut() {
-                        editor_move_prev(editor);
-                    }
-                }
-            }
-            KeyCode::Up => {
-                if !simple_text_dialog && !self.apply_editor_suggestion(-1) {
-                    if let Some(editor) = self.editor.as_mut() {
-                        editor_move_prev(editor);
-                    }
-                }
-            }
-            KeyCode::Down => {
-                if !simple_text_dialog && !self.apply_editor_suggestion(1) {
-                    if let Some(editor) = self.editor.as_mut() {
-                        editor_move_next(editor);
-                    }
-                }
-            }
-            KeyCode::Left => {
-                if !simple_text_dialog {
-                    if let Some(editor) = self.editor.as_mut() {
-                        editor_move_prev(editor);
-                    }
-                }
-            }
-            KeyCode::Right => {
-                if !simple_text_dialog {
-                    if let Some(editor) = self.editor.as_mut() {
-                        editor_move_next(editor);
-                    }
-                }
-            }
+            KeyCode::Tab => self.move_editor_next_if_form(simple_text_dialog),
+            KeyCode::BackTab => self.move_editor_prev_if_form(simple_text_dialog),
+            KeyCode::Up => self.move_editor_with_suggestion(simple_text_dialog, -1),
+            KeyCode::Down => self.move_editor_with_suggestion(simple_text_dialog, 1),
+            KeyCode::Left => self.move_editor_prev_if_form(simple_text_dialog),
+            KeyCode::Right => self.move_editor_next_if_form(simple_text_dialog),
             KeyCode::Enter => {
-                if simple_text_dialog {
-                    return self.save_editor().await;
-                }
-                let should_save = self.editor.as_ref().is_some_and(|editor| {
-                    editor_step_index(editor) + 1 >= editor_fields(editor.mode).len()
-                });
-                if should_save {
-                    return self.save_editor().await;
-                }
-                if let Some(editor) = self.editor.as_mut() {
-                    editor_move_next(editor);
-                }
+                return self.handle_editor_enter(simple_text_dialog).await;
             }
-            KeyCode::Backspace => {
-                if let Some(editor) = self.editor.as_mut() {
-                    active_editor_value_mut(editor).pop();
-                }
-            }
-            KeyCode::Delete => {
-                if let Some(editor) = self.editor.as_mut() {
-                    active_editor_value_mut(editor).clear();
-                }
-            }
+            KeyCode::Backspace => self.pop_editor_value(),
+            KeyCode::Delete => self.clear_editor_value(),
             KeyCode::Char(ch)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
@@ -2658,6 +2634,61 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn move_editor_next_if_form(&mut self, simple_text_dialog: bool) {
+        if simple_text_dialog {
+            return;
+        }
+        if let Some(editor) = self.editor.as_mut() {
+            editor_move_next(editor);
+        }
+    }
+
+    fn move_editor_prev_if_form(&mut self, simple_text_dialog: bool) {
+        if simple_text_dialog {
+            return;
+        }
+        if let Some(editor) = self.editor.as_mut() {
+            editor_move_prev(editor);
+        }
+    }
+
+    fn move_editor_with_suggestion(&mut self, simple_text_dialog: bool, delta: isize) {
+        if simple_text_dialog || self.apply_editor_suggestion(delta) {
+            return;
+        }
+        if delta < 0 {
+            self.move_editor_prev_if_form(false);
+        } else {
+            self.move_editor_next_if_form(false);
+        }
+    }
+
+    async fn handle_editor_enter(&mut self, simple_text_dialog: bool) -> Result<(), String> {
+        if simple_text_dialog || self.editor_at_last_field() {
+            return self.save_editor().await;
+        }
+        self.move_editor_next_if_form(false);
+        Ok(())
+    }
+
+    fn editor_at_last_field(&self) -> bool {
+        self.editor
+            .as_ref()
+            .is_some_and(|editor| editor_step_index(editor) + 1 >= editor_fields(editor.mode).len())
+    }
+
+    fn pop_editor_value(&mut self) {
+        if let Some(editor) = self.editor.as_mut() {
+            active_editor_value_mut(editor).pop();
+        }
+    }
+
+    fn clear_editor_value(&mut self) {
+        if let Some(editor) = self.editor.as_mut() {
+            active_editor_value_mut(editor).clear();
+        }
     }
 
     fn push_editor_char(&mut self, ch: char) {
@@ -6132,48 +6163,53 @@ fn detected_protocol_from_env_values(
     has_iterm_session: bool,
     has_windows_terminal: bool,
 ) -> Option<ProtocolType> {
-    if term.contains("alacritty") || term_program.contains("alacritty") {
+    if terminal_mentions_any(&[term, term_program], &["alacritty"]) {
         return None;
     }
-    if has_kitty_window
-        || term.contains("kitty")
-        || term_program.contains("kitty")
-        || term.contains("ghostty")
-        || term_program.contains("ghostty")
-        || term.contains("konsole")
-        || term_program.contains("konsole")
-    {
+    if detected_kitty_protocol(term, term_program, has_kitty_window) {
         return Some(ProtocolType::Kitty);
     }
-    if term.contains("sixel")
-        || term.contains("foot")
-        || term_program.contains("foot")
-        || term.contains("blackbox")
-        || term_program.contains("blackbox")
-        || term.contains("zellij")
-        || has_windows_terminal
-    {
+    if detected_sixel_protocol(term, term_program, has_windows_terminal) {
         return Some(ProtocolType::Sixel);
     }
-    if has_iterm_session
-        || term_program.contains("iterm")
-        || lc_terminal.contains("iterm")
-        || term_program.contains("wezterm")
-        || term.contains("wezterm")
-        || term_program.contains("warp")
-        || term.contains("warp")
-        || term_program.contains("tabby")
-        || term.contains("tabby")
-        || term_program.contains("vscode")
-        || term.contains("vscode")
-        || term_program.contains("bobcat")
-        || term.contains("bobcat")
-        || term_program.contains("rio")
-        || term.contains("rio")
-    {
+    if detected_iterm_protocol(term, term_program, lc_terminal, has_iterm_session) {
         return Some(ProtocolType::Iterm2);
     }
     None
+}
+
+fn terminal_mentions_any(values: &[&str], needles: &[&str]) -> bool {
+    values
+        .iter()
+        .any(|value| needles.iter().any(|needle| value.contains(needle)))
+}
+
+fn detected_kitty_protocol(term: &str, term_program: &str, has_kitty_window: bool) -> bool {
+    has_kitty_window
+        || terminal_mentions_any(&[term, term_program], &["kitty", "ghostty", "konsole"])
+}
+
+fn detected_sixel_protocol(term: &str, term_program: &str, has_windows_terminal: bool) -> bool {
+    has_windows_terminal
+        || term.contains("sixel")
+        || terminal_mentions_any(&[term, term_program], &["foot", "blackbox"])
+        || term.contains("zellij")
+}
+
+fn detected_iterm_protocol(
+    term: &str,
+    term_program: &str,
+    lc_terminal: &str,
+    has_iterm_session: bool,
+) -> bool {
+    has_iterm_session
+        || lc_terminal.contains("iterm")
+        || terminal_mentions_any(
+            &[term, term_program],
+            &[
+                "iterm", "wezterm", "warp", "tabby", "vscode", "bobcat", "rio",
+            ],
+        )
 }
 
 fn build_image_picker(preference: ImageProtocolPreference) -> (Picker, bool, String, Vec<String>) {
@@ -7724,6 +7760,42 @@ mod tests {
         App::new(ApiClient::for_tests("https://kramli.test"), true)
     }
 
+    async fn api_with_responses(
+        responses: Vec<String>,
+    ) -> (ApiClient, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener.local_addr().expect("test server should have addr");
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for body in responses {
+                let (mut stream, _) = listener.accept().await.expect("request should connect");
+                let mut buffer = [0_u8; 4096];
+                let read = stream.read(&mut buffer).await.expect("request should read");
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                requests.push(request.lines().next().unwrap_or_default().to_string());
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(header.as_bytes())
+                    .await
+                    .expect("response header should write");
+                stream
+                    .write_all(body.as_bytes())
+                    .await
+                    .expect("response body should write");
+            }
+            requests
+        });
+
+        (ApiClient::for_tests(&format!("http://{addr}")), handle)
+    }
+
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
         MouseEvent {
             kind,
@@ -8082,6 +8154,25 @@ mod tests {
     }
 
     #[test]
+    fn key_binding_parser_covers_alias_function_and_invalid_paths() {
+        let shifted_tab = parse_key_binding("shift+tab").expect("shift tab should parse");
+        assert_eq!(shifted_tab.code, KeyCode::BackTab);
+        assert_eq!(shifted_tab.label, "S+Tab");
+
+        let backtab = parse_key_binding("backtab").expect("backtab should parse");
+        assert_eq!(backtab.code, KeyCode::BackTab);
+        assert_eq!(backtab.label, "S-Tab");
+
+        let function = parse_key_binding("alt-f12").expect("function key should parse");
+        assert_eq!(function.code, KeyCode::F(12));
+        assert_eq!(function.label, "A+F12");
+
+        assert!(parse_key_binding("f13").is_none());
+        assert!(parse_key_binding("not-a-key").is_none());
+        assert!(parse_key_binding("   ").is_none());
+    }
+
+    #[test]
     fn layout_and_column_helpers_cover_edge_branches() {
         let state_columns = list_states_to_columns(Some(&[
             ApiListState {
@@ -8282,6 +8373,247 @@ mod tests {
         app.item_filter = "missing".to_string();
         app.scroll_active(1);
         assert_eq!(app.selected_item, 0);
+    }
+
+    #[tokio::test]
+    async fn editor_key_and_save_helpers_cover_refactored_branches() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Alpha"), sample_item(2, "Beta")];
+
+        app.open_add_editor().unwrap();
+        assert_eq!(app.editor.as_ref().unwrap().active_field, EditorField::Text);
+        app.handle_editor_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.editor.as_ref().unwrap().active_field,
+            EditorField::Quantity
+        );
+        app.handle_editor_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.editor.as_ref().unwrap().active_field, EditorField::Text);
+        app.handle_editor_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.editor.as_ref().unwrap().active_field,
+            EditorField::Quantity
+        );
+        app.handle_editor_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.editor.as_ref().unwrap().active_field, EditorField::Text);
+        app.handle_editor_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.editor.as_ref().unwrap().text, "x");
+        app.handle_editor_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.editor.as_ref().unwrap().text, "");
+        app.handle_editor_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        app.handle_editor_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.editor.as_ref().unwrap().text, "");
+        app.handle_editor_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.editor.as_ref().unwrap().active_field,
+            EditorField::Quantity
+        );
+
+        app.open_filter_editor().unwrap();
+        app.handle_editor_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.editor.as_ref().unwrap().active_field, EditorField::Text);
+        app.editor.as_mut().unwrap().text = "beta".to_string();
+        let editor = app.editor.as_ref().unwrap().clone();
+        app.save_filter_editor(&editor).unwrap();
+        assert_eq!(app.item_filter, "beta");
+        assert_eq!(app.selected_item, 1);
+        assert!(app.status.as_deref().unwrap_or_default().contains("beta"));
+
+        app.open_filter_editor().unwrap();
+        app.editor.as_mut().unwrap().text.clear();
+        let editor = app.editor.as_ref().unwrap().clone();
+        app.save_filter_editor(&editor).unwrap();
+        assert!(app.item_filter.is_empty());
+        assert_eq!(app.status, Some(tr("label-items")));
+
+        let editor = EditorState {
+            mode: EditorMode::Comment,
+            item_id: None,
+            text: String::default(),
+            quantity: String::default(),
+            due_date: String::default(),
+            due_time: String::default(),
+            planned_date: String::default(),
+            planned_time: String::default(),
+            reminder: String::default(),
+            reminder_time: String::default(),
+            reminder_offsets: String::default(),
+            travel_time_minutes: String::default(),
+            priority: String::default(),
+            tags: String::default(),
+            progress: String::default(),
+            notes: String::default(),
+            active_field: EditorField::Text,
+        };
+        app.save_comment_editor(&editor, "Hello").await.unwrap();
+        assert!(app.comments_cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn comment_editor_save_posts_and_updates_cache() {
+        let (api, requests) = api_with_responses(vec![
+            serde_json::json!({"id": 9, "text": "Hello"}).to_string(),
+        ])
+        .await;
+        let mut app = App::new(api, true);
+        let editor = EditorState {
+            mode: EditorMode::Comment,
+            item_id: Some(7),
+            text: String::default(),
+            quantity: String::default(),
+            due_date: String::default(),
+            due_time: String::default(),
+            planned_date: String::default(),
+            planned_time: String::default(),
+            reminder: String::default(),
+            reminder_time: String::default(),
+            reminder_offsets: String::default(),
+            travel_time_minutes: String::default(),
+            priority: String::default(),
+            tags: String::default(),
+            progress: String::default(),
+            notes: String::default(),
+            active_field: EditorField::Text,
+        };
+
+        app.save_comment_editor(&editor, "Hello").await.unwrap();
+
+        assert_eq!(app.comments_cache.get(&7).map(Vec::len), Some(1));
+        assert!(app.editor.is_none());
+        assert_eq!(app.status, Some(tr("label-comments")));
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["POST /api/items/7/comments HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn save_editor_delegates_filter_and_comment_modes() {
+        let (api, requests) = api_with_responses(vec![
+            serde_json::json!({"id": 11, "text": "Posted"}).to_string(),
+        ])
+        .await;
+        let mut app = App::new(api, true);
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(7, "Alpha"), sample_item(8, "Beta")];
+
+        app.editor = Some(EditorState {
+            mode: EditorMode::Filter,
+            item_id: None,
+            text: "beta".to_string(),
+            quantity: String::default(),
+            due_date: String::default(),
+            due_time: String::default(),
+            planned_date: String::default(),
+            planned_time: String::default(),
+            reminder: String::default(),
+            reminder_time: String::default(),
+            reminder_offsets: String::default(),
+            travel_time_minutes: String::default(),
+            priority: String::default(),
+            tags: String::default(),
+            progress: String::default(),
+            notes: String::default(),
+            active_field: EditorField::Text,
+        });
+        app.save_editor().await.unwrap();
+        assert_eq!(app.item_filter, "beta");
+        assert_eq!(app.selected_item, 1);
+
+        app.editor = Some(EditorState {
+            mode: EditorMode::Comment,
+            item_id: Some(7),
+            text: "Posted".to_string(),
+            quantity: String::default(),
+            due_date: String::default(),
+            due_time: String::default(),
+            planned_date: String::default(),
+            planned_time: String::default(),
+            reminder: String::default(),
+            reminder_time: String::default(),
+            reminder_offsets: String::default(),
+            travel_time_minutes: String::default(),
+            priority: String::default(),
+            tags: String::default(),
+            progress: String::default(),
+            notes: String::default(),
+            active_field: EditorField::Text,
+        });
+        app.save_editor().await.unwrap();
+        assert_eq!(app.comments_cache.get(&7).map(Vec::len), Some(1));
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["POST /api/items/7/comments HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn editor_key_helpers_cover_remaining_motion_paths() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Alpha")];
+
+        app.open_filter_editor().unwrap();
+        app.handle_editor_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        app.handle_editor_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.editor.as_ref().unwrap().active_field, EditorField::Text);
+
+        app.open_add_editor().unwrap();
+        app.editor.as_mut().unwrap().active_field = EditorField::Text;
+        app.handle_editor_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.editor.as_ref().unwrap().active_field,
+            EditorField::Quantity
+        );
+
+        app.editor.as_mut().unwrap().active_field = EditorField::DueDate;
+        app.handle_editor_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.editor.as_ref().unwrap().active_field,
+            EditorField::Quantity
+        );
+
+        app.editor.as_mut().unwrap().active_field = EditorField::Progress;
+        app.editor.as_mut().unwrap().progress = "O".to_string();
+        app.handle_editor_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.editor.as_ref().unwrap().active_field,
+            EditorField::Progress
+        );
+
+        app.open_filter_editor().unwrap();
+        app.editor.as_mut().unwrap().text = "Alpha".to_string();
+        app.handle_editor_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(app.editor.is_none());
     }
 
     #[test]

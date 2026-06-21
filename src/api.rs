@@ -45,6 +45,11 @@ impl ApiClient {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn base_url_for_tests(&self) -> &str {
+        &self.base_url
+    }
+
     /// Build an API client from persisted configuration and keychain credentials.
     pub(crate) fn new(config: &Config) -> Result<Self, String> {
         let api_key = config.require_api_key()?;
