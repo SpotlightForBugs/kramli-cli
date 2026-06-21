@@ -1155,18 +1155,37 @@ pub(crate) fn print_activity(entries: &[ActivityEntry]) {
 mod tests {
     use super::{
         activity_action_label, activity_detail_text, bootstrap_icon_asset_name, char_display_width,
-        color_dot, colorize_bold_text, colorize_text, date_with_time, display_icon,
+        color_dot, colorize_bold_text, colorize_text, date_with_time, display_icon, fallback_icon,
         folder_path_parts, human_size, item_status_parts, list_display_name_with_folder,
-        list_folder_parts, member_type_label, parse_hex_color, print_activity, print_folders,
-        print_item_detail, print_items, print_items_for_list, print_list_detail, print_lists,
-        print_members, print_search, reminder_offsets_label, role_label, schedule_lines,
-        strip_html, view_mode_label, visible_width_ansi, wrap_ansi_with_prefix, ItemComments,
+        list_folder_parts, map_bootstrap_icon_emoji, map_bootstrap_icon_label, member_type_label,
+        parse_hex_color, print_activity, print_folders, print_item_detail, print_items,
+        print_items_for_list, print_list_detail, print_lists, print_members, print_search,
+        print_wrapped_item_line, reminder_offsets_label, role_label, schedule_lines, strip_html,
+        view_mode_label, visible_width_ansi, wrap_ansi_with_prefix, IconStyle, ItemComments,
     };
     use crate::models::{
         ActivityEntry, Attachment, Folder, ItemComment, ListItem, ListState, Member, SearchItemHit,
         SearchListHit, SearchResults, ShoppingList,
     };
     use serde_json::json;
+
+    const TEST_ICON_STYLE_ENV: &str = "KRAMLI_ICON_STYLE";
+
+    fn with_icon_style<T>(value: &str, f: impl FnOnce() -> T) -> T {
+        let previous = std::env::var(TEST_ICON_STYLE_ENV).ok();
+        std::env::set_var(TEST_ICON_STYLE_ENV, value);
+        let output = f();
+        match previous {
+            Some(previous) => std::env::set_var(TEST_ICON_STYLE_ENV, previous),
+            None => std::env::remove_var(TEST_ICON_STYLE_ENV),
+        }
+        output
+    }
+
+    fn with_existing_icon_style<T>(value: &str, f: impl FnOnce() -> T) -> T {
+        std::env::set_var(TEST_ICON_STYLE_ENV, "label");
+        with_icon_style(value, f)
+    }
 
     fn minimal_item() -> ListItem {
         ListItem {
@@ -1384,6 +1403,203 @@ mod tests {
             crate::i18n::tr("activity-item-created")
         );
         assert_eq!(activity_action_label("custom"), "custom");
+    }
+
+    #[test]
+    fn icon_style_helpers_cover_raw_emoji_and_fallback_branches() {
+        assert_eq!(fallback_icon(IconStyle::Emoji, "folder"), "📁");
+        assert_eq!(fallback_icon(IconStyle::Emoji, "list"), "📋");
+        assert_eq!(fallback_icon(IconStyle::Raw, "list"), "[list]");
+        assert_eq!(map_bootstrap_icon_label("", "list"), "[list]");
+
+        for (icon, emoji) in [
+            ("cart-fill", "🛒"),
+            ("egg-fried", "🍳"),
+            ("people-fill", "👥"),
+            ("tag", "🏷️"),
+            ("tools", "🛠️"),
+            ("paperclip", "📎"),
+            ("book-fill", "📚"),
+            ("check-circle-fill", "✅"),
+            ("fire", "🔥"),
+            ("cup-hot", "☕"),
+            ("folder2", "📁"),
+        ] {
+            assert_eq!(map_bootstrap_icon_emoji(icon, "fallback"), emoji);
+        }
+        assert_eq!(map_bootstrap_icon_emoji("unknown", "fallback"), "fallback");
+
+        with_icon_style("raw", || {
+            assert_eq!(display_icon(Some("bi-cart-fill"), "list"), "bi-cart-fill");
+        });
+        with_existing_icon_style("raw", || {
+            assert_eq!(display_icon(Some("bi-fire"), "list"), "bi-fire");
+        });
+        with_icon_style("emoji", || {
+            assert_eq!(display_icon(Some("bi-cart-fill"), "list"), "🛒");
+            assert_eq!(display_icon(Some("bi-unknown-icon"), "list"), "📋");
+            assert_eq!(display_icon(Some("bi-unknown-icon"), "folder"), "📁");
+            assert_eq!(display_icon(None, "list"), "📋");
+        });
+        assert_eq!(display_icon(Some("Raw icon!"), "list"), "Raw icon!");
+    }
+
+    #[test]
+    fn wrapping_helpers_cover_narrow_escape_and_newline_branches() {
+        assert_eq!(visible_width_ansi("abc\u{1b}"), 3);
+        assert_eq!(visible_width_ansi("abc\u{1b}["), 3);
+        assert_eq!(visible_width_ansi("abc\u{1b}[31"), 3);
+        assert_eq!(wrap_ansi_with_prefix("abc", "> ", "    ", 7), "> abc");
+        assert_eq!(wrap_ansi_with_prefix("abc", "> ", "", 1), "> abc");
+        assert_eq!(wrap_ansi_with_prefix("abcde f", "", "", 5), "abcde\nf");
+        assert_eq!(wrap_ansi_with_prefix("abcde ", "", "", 5), "abcde\n");
+        assert_eq!(wrap_ansi_with_prefix("a\n b", "> ", "  ", 8), "> a\n   b");
+        assert_eq!(wrap_ansi_with_prefix("\u{1b}", "", "", 8), "\u{1b}");
+        assert_eq!(wrap_ansi_with_prefix("\u{1b}[31", "", "", 8), "\u{1b}[31");
+        print_wrapped_item_line("  ", "    ", "wrapped");
+    }
+
+    #[test]
+    fn remaining_output_helpers_cover_sort_and_fallback_branches() {
+        let icon_from_markup = "<svg><use href=\"#bi-cart-fill\"/></svg>";
+        assert_eq!(
+            bootstrap_icon_asset_name(icon_from_markup),
+            Some("cart-fill".to_string())
+        );
+
+        let mut folder_named = sample_list(20, "");
+        folder_named.folder_name = Some("Folder Only".to_string());
+        assert_eq!(list_display_name_with_folder(&folder_named), "Folder Only");
+
+        let owner = ShoppingList {
+            role: Some("owner".to_string()),
+            folder_name: None,
+            folder_id: None,
+            ..sample_list(30, "Owner")
+        };
+        let alpha = ShoppingList {
+            role: Some("viewer".to_string()),
+            folder_name: None,
+            folder_id: None,
+            ..sample_list(31, "Alpha")
+        };
+        let beta = ShoppingList {
+            role: Some("editor".to_string()),
+            folder_name: None,
+            folder_id: None,
+            ..sample_list(32, "Beta")
+        };
+        print_lists(&[beta, owner, alpha]);
+
+        let list_with_blank_state = ShoppingList {
+            states: Some(vec![ListState {
+                name: Some("  ".to_string()),
+                color: None,
+                is_done: Some(false),
+            }]),
+            ..sample_list(33, "Blank state")
+        };
+        print_list_detail(&list_with_blank_state);
+
+        assert_eq!(human_size(1024_i64.pow(4)), "1024.0 TB");
+
+        let mut reminder = minimal_item();
+        reminder.reminder = Some(true);
+        reminder.reminder_time = Some("  ".to_string());
+        reminder.reminder_offsets = Some(Vec::new());
+        assert_eq!(
+            schedule_lines(&reminder)
+                .into_iter()
+                .map(|line| line.label_key)
+                .collect::<Vec<_>>(),
+            vec!["label-reminder"]
+        );
+
+        let mut reminder_without_details = minimal_item();
+        reminder_without_details.reminder = Some(true);
+        assert_eq!(
+            schedule_lines(&reminder_without_details)
+                .into_iter()
+                .map(|line| line.label_key)
+                .collect::<Vec<_>>(),
+            vec!["label-reminder"]
+        );
+
+        let mut item = minimal_item();
+        item.priority = Some("other".to_string());
+        item.parent_item_id = Some(999);
+        item.depth = None;
+        print_items(&[item]);
+
+        let cycle_a = ListItem {
+            id: 40,
+            parent_item_id: Some(41),
+            ..minimal_item()
+        };
+        let cycle_b = ListItem {
+            id: 41,
+            parent_item_id: Some(40),
+            ..minimal_item()
+        };
+        print_items(&[cycle_a, cycle_b]);
+
+        let folder_a = Folder {
+            id: 5,
+            name: "Beta".to_string(),
+            icon: None,
+            color: None,
+            parent_folder_id: None,
+            parent_folder_name: Some("Root".to_string()),
+            position: None,
+            created_at: None,
+        };
+        let folder_b = Folder {
+            id: 4,
+            name: "Alpha".to_string(),
+            icon: None,
+            color: None,
+            parent_folder_id: None,
+            parent_folder_name: Some("Root".to_string()),
+            position: None,
+            created_at: None,
+        };
+        print_folders(&[folder_a, folder_b]);
+
+        let empty_object = json!({});
+        assert_eq!(activity_detail_text(Some(&empty_object)), "");
+        assert_eq!(
+            activity_detail_text(Some(&json!({"changes": [1, 2]}))),
+            "changes=[1,2]"
+        );
+        let activity_without_user = ActivityEntry {
+            id: Some(2),
+            list_id: None,
+            user_id: None,
+            action: None,
+            detail: Some(empty_object),
+            display_name: None,
+            user_name: None,
+            nickname: None,
+            photo_url: None,
+            item_id: None,
+            created_at: None,
+        };
+        print_activity(&[activity_without_user]);
+
+        print_search(&SearchResults {
+            lists: Some(Vec::new()),
+            items: Some(Vec::new()),
+        });
+        print_search(&SearchResults {
+            lists: None,
+            items: Some(vec![SearchItemHit {
+                id: 9,
+                text: "No list name".to_string(),
+                list_id: None,
+                list_name: None,
+                is_done: Some(false),
+            }]),
+        });
     }
 
     #[test]
