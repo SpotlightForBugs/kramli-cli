@@ -662,6 +662,41 @@ mod tests {
         assert!(command_supports_auto_update_check(&Commands::Status));
     }
 
+    #[tokio::test]
+    async fn run_entrypoint_covers_help_and_conflict_paths() {
+        run_inner(Cli {
+            json: false,
+            interactive: false,
+            command: None,
+        })
+        .await
+        .expect("missing command should print help");
+
+        assert!(run_inner(Cli {
+            json: true,
+            interactive: true,
+            command: None,
+        })
+        .await
+        .is_err());
+
+        assert!(run_inner(Cli {
+            json: false,
+            interactive: true,
+            command: Some(Commands::Status),
+        })
+        .await
+        .is_err());
+
+        run(Cli {
+            json: true,
+            interactive: false,
+            command: Some(Commands::Config),
+        })
+        .await
+        .expect("config command should run through traced entrypoint");
+    }
+
     #[test]
     fn profile_locale_helpers_cover_env_profile_and_resolved_sources() {
         crate::i18n::set_locale("en");
