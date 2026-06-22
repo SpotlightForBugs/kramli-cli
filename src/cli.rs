@@ -293,6 +293,7 @@ mod tests {
     use super::*;
 
     const TEST_KRAMLI_LANG_ENV: &str = "KRAMLI_LANG";
+    const TEST_ENV_FLAG_ENV: &str = "KRAMLI_TEST_FLAG";
 
     fn encode_list_slug(id: i64) -> String {
         let mut n = id ^ LIST_ID_XOR_KEY;
@@ -693,6 +694,85 @@ mod tests {
             json.get("lang_source").and_then(Value::as_str),
             Some("profile")
         );
+    }
+
+    #[test]
+    fn list_reference_and_state_parsers_cover_edge_branches() {
+        assert_eq!(extract_slug_from_reference("  "), None);
+        assert_eq!(
+            extract_slug_from_reference("https://kramli.de/lists/l/###"),
+            None
+        );
+        assert_eq!(extract_slug_from_reference("not/a/slug"), None);
+        assert_eq!(
+            extract_slug_from_reference("abc123"),
+            Some("abc123".to_string())
+        );
+        assert!(resolve_list_reference("invalid!").is_err());
+
+        assert_eq!(parse_states_arg("  ").unwrap(), Value::Array(Vec::new()));
+        assert!(parse_states_arg("[invalid").is_err());
+        assert!(parse_states_arg(" , , ").is_err());
+        let csv_states = parse_states_arg(" Open : #fff , Review , Done ").unwrap();
+        let csv_array = csv_states.as_array().expect("csv states should be array");
+        assert_eq!(csv_array.len(), 3);
+        assert_eq!(
+            csv_array[0].get("name").and_then(Value::as_str),
+            Some("Open")
+        );
+        assert_eq!(
+            csv_array[0].get("color").and_then(Value::as_str),
+            Some("#fff")
+        );
+        assert_eq!(
+            csv_array[1].get("name").and_then(Value::as_str),
+            Some("Review")
+        );
+        let json_states = parse_states_arg(r#"[{"name":"Doing"}]"#).unwrap();
+        assert!(json_states.is_array());
+    }
+
+    #[test]
+    fn item_value_helpers_cover_blank_invalid_and_valid_inputs() {
+        assert_eq!(normalize_progress_value(None), None);
+        assert_eq!(
+            normalize_progress_value(Some("  ".to_string())),
+            Some(Value::Null)
+        );
+        assert_eq!(
+            normalize_progress_value(Some("Review".to_string())),
+            Some(Value::String("Review".to_string()))
+        );
+
+        assert_eq!(parse_search_item_id(""), None);
+        assert_eq!(parse_search_item_id("#"), None);
+        assert_eq!(parse_search_item_id("#abc"), None);
+        assert_eq!(parse_search_item_id("0"), None);
+        assert_eq!(parse_search_item_id("#42"), Some(42));
+        assert_eq!(parse_search_item_id(" 77 "), Some(77));
+    }
+
+    #[test]
+    fn env_flags_cover_defaults_truthy_falsey_and_invalid_values() {
+        std::env::remove_var(TEST_ENV_FLAG_ENV);
+        assert!(env_flag_enabled(TEST_ENV_FLAG_ENV, true));
+        assert!(!env_flag_enabled(TEST_ENV_FLAG_ENV, false));
+
+        for value in ["0", "false", "off", "no"] {
+            std::env::set_var(TEST_ENV_FLAG_ENV, value);
+            assert!(!env_flag_enabled(TEST_ENV_FLAG_ENV, true));
+        }
+
+        for value in ["1", "true", "on", "yes"] {
+            std::env::set_var(TEST_ENV_FLAG_ENV, value);
+            assert!(env_flag_enabled(TEST_ENV_FLAG_ENV, false));
+        }
+
+        std::env::set_var(TEST_ENV_FLAG_ENV, "  ");
+        assert!(env_flag_enabled(TEST_ENV_FLAG_ENV, true));
+        std::env::set_var(TEST_ENV_FLAG_ENV, "maybe");
+        assert!(!env_flag_enabled(TEST_ENV_FLAG_ENV, false));
+        std::env::remove_var(TEST_ENV_FLAG_ENV);
     }
 
     fn list_response(id: i64, name: &str) -> String {
