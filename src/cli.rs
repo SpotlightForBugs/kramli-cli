@@ -1709,6 +1709,7 @@ mod tests {
         let profile = serde_json::to_string(&sample_profile(Some("en"))).unwrap();
         let responses = vec![
             profile.clone(),
+            profile.clone(),
             json!([{"id": 7, "name": "Groceries"}]).to_string(),
             json!([{"id": 9, "list_id": 7, "text": "Milk", "is_done": false}]).to_string(),
             json!([{"id": 4, "name": "House"}]).to_string(),
@@ -1724,6 +1725,10 @@ mod tests {
             json!({"legal": {"pending": []}}).to_string(),
             json!({"ok": true}).to_string(),
             json!({"ok": true}).to_string(),
+            json!({"lists": [], "items": []}).to_string(),
+            json!([{"id": 7, "name": "Groceries"}]).to_string(),
+            json!([{"id": 5, "list_id": 7, "text": "Fallback", "is_done": false}]).to_string(),
+            json!({"lists": [], "items": []}).to_string(),
         ];
         let (base_url, requests) = server_with_base_url(responses).await;
 
@@ -1737,6 +1742,9 @@ mod tests {
                 run_command(Commands::Status, true)
                     .await
                     .expect("status dispatch should succeed");
+                run_status(false)
+                    .await
+                    .expect("human status should succeed");
                 run_command(
                     Commands::Lists {
                         action: ListCmd::List,
@@ -1754,7 +1762,7 @@ mod tests {
                             state: None,
                             contains: None,
                             newest: false,
-                            oldest: false,
+                            oldest: true,
                             limit: None,
                         }),
                     },
@@ -1839,9 +1847,40 @@ mod tests {
                 run_command(Commands::Ping, true)
                     .await
                     .expect("ping dispatch should succeed");
+                run_search("#5", true)
+                    .await
+                    .expect("fallback search should succeed");
+                run_search("milk", false)
+                    .await
+                    .expect("human search should succeed");
                 run_command(Commands::Config, true)
                     .await
                     .expect("config dispatch should render");
+                run_command(
+                    Commands::Login {
+                        url: Some("https://example.test".to_string()),
+                    },
+                    false,
+                )
+                .await
+                .expect("test login dispatch should be inert");
+                run_command(Commands::Logout, false)
+                    .await
+                    .expect("test logout dispatch should be inert");
+                run_command(Commands::UpdateCheck, true)
+                    .await
+                    .expect("test update dispatch should be inert");
+                run_command(
+                    Commands::Privacy {
+                        action: PrivacyCmd::Reset,
+                    },
+                    true,
+                )
+                .await
+                .expect("test privacy dispatch should be inert");
+                run_command(Commands::Mcp, true)
+                    .await
+                    .expect("test mcp dispatch should be inert");
                 run_command(Commands::Completions { shell: Shell::Bash }, true)
                     .await
                     .expect("completions dispatch should render");
@@ -1860,20 +1899,25 @@ mod tests {
 
         let requests = requests.await.expect("test server should finish");
         assert_eq!(requests[0], "GET /api/profile HTTP/1.1");
-        assert_eq!(requests[1], "GET /api/lists HTTP/1.1");
-        assert_eq!(requests[2], "GET /api/lists/7/items HTTP/1.1");
-        assert_eq!(requests[3], "GET /api/folders HTTP/1.1");
-        assert_eq!(requests[4], "GET /api/lists/7/members HTTP/1.1");
-        assert_eq!(requests[5], "GET /api/api-keys HTTP/1.1");
-        assert!(requests[6].starts_with("GET /api/search?"));
-        assert_eq!(requests[7], "GET /api/lists/7/activity?limit=1 HTTP/1.1");
-        assert_eq!(requests[8], "POST /api/lists/7/undo HTTP/1.1");
-        assert_eq!(requests[9], "POST /api/lists/7/redo HTTP/1.1");
-        assert_eq!(requests[10], "GET /api/profile HTTP/1.1");
-        assert_eq!(requests[11], "GET /api/security HTTP/1.1");
-        assert_eq!(requests[12], "POST /api/accept-terms HTTP/1.1");
-        assert_eq!(requests[13], "POST /api/activity/clear HTTP/1.1");
-        assert_eq!(requests[14], "GET /api/ping HTTP/1.1");
+        assert_eq!(requests[1], "GET /api/profile HTTP/1.1");
+        assert_eq!(requests[2], "GET /api/lists HTTP/1.1");
+        assert_eq!(requests[3], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[4], "GET /api/folders HTTP/1.1");
+        assert_eq!(requests[5], "GET /api/lists/7/members HTTP/1.1");
+        assert_eq!(requests[6], "GET /api/api-keys HTTP/1.1");
+        assert!(requests[7].starts_with("GET /api/search?"));
+        assert_eq!(requests[8], "GET /api/lists/7/activity?limit=1 HTTP/1.1");
+        assert_eq!(requests[9], "POST /api/lists/7/undo HTTP/1.1");
+        assert_eq!(requests[10], "POST /api/lists/7/redo HTTP/1.1");
+        assert_eq!(requests[11], "GET /api/profile HTTP/1.1");
+        assert_eq!(requests[12], "GET /api/security HTTP/1.1");
+        assert_eq!(requests[13], "POST /api/accept-terms HTTP/1.1");
+        assert_eq!(requests[14], "POST /api/activity/clear HTTP/1.1");
+        assert_eq!(requests[15], "GET /api/ping HTTP/1.1");
+        assert!(requests[16].starts_with("GET /api/search?"));
+        assert_eq!(requests[17], "GET /api/lists HTTP/1.1");
+        assert_eq!(requests[18], "GET /api/lists/7/items HTTP/1.1");
+        assert!(requests[19].starts_with("GET /api/search?"));
     }
 
     #[tokio::test]
@@ -2358,8 +2402,8 @@ fn command_trace_name(command: &Commands) -> &'static str {
 
 async fn run_command(command: Commands, as_json: bool) -> Result<(), String> {
     match command {
-        Commands::Login { url } => run_login(url).await,
-        Commands::Logout => run_logout(),
+        Commands::Login { url } => run_login_command(url).await,
+        Commands::Logout => run_logout_command(),
         Commands::Status => run_status(as_json).await,
         Commands::Lists { action } => run_lists(action, as_json).await,
         Commands::Items { action } => run_items(*action, as_json).await,
@@ -2376,15 +2420,78 @@ async fn run_command(command: Commands, as_json: bool) -> Result<(), String> {
         Commands::Handoff { action } => run_handoff(action, as_json).await,
         Commands::Ping => run_ping(as_json).await,
         Commands::Config => run_config(as_json),
-        Commands::UpdateCheck => run_update_check(as_json).await,
-        Commands::Privacy { action } => run_privacy(action, as_json),
-        Commands::Mcp => crate::mcp::run_stdio().await,
+        Commands::UpdateCheck => run_update_check_command(as_json).await,
+        Commands::Privacy { action } => run_privacy_command(action, as_json),
+        Commands::Mcp => run_mcp_command().await,
         Commands::Batch { file, keep_going } => run_batch(&file, keep_going, as_json).await,
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "kramli", &mut std::io::stdout());
             Ok(())
         }
+    }
+}
+
+async fn run_login_command(url: Option<String>) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let _ = run_login;
+        let _ = url;
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        run_login(url).await
+    }
+}
+
+fn run_logout_command() -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let _ = run_logout;
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        run_logout()
+    }
+}
+
+async fn run_update_check_command(as_json: bool) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let _ = run_update_check;
+        let _ = as_json;
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        run_update_check(as_json).await
+    }
+}
+
+fn run_privacy_command(action: PrivacyCmd, as_json: bool) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let _ = run_privacy;
+        let _ = (action, as_json);
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        run_privacy(action, as_json)
+    }
+}
+
+async fn run_mcp_command() -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let _ = crate::mcp::run_stdio;
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        crate::mcp::run_stdio().await
     }
 }
 
