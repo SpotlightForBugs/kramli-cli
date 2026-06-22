@@ -17,7 +17,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test
+      - run: cargo test -- --test-threads=1
       - run: cargo clippy -- -D warnings
 
   deepsource-coverage:
@@ -42,7 +42,7 @@ jobs:
       - name: Build LCOV report
         run: |
           mkdir -p target/coverage
-          cargo llvm-cov --workspace --all-features --lcov --output-path target/coverage/lcov.info
+          cargo llvm-cov --workspace --all-features --lcov --output-path target/coverage/lcov.info -- --test-threads=1
       - name: Install DeepSource CLI
         run: curl https://deepsource.io/cli | sh
       - name: Upload coverage to DeepSource
