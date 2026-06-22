@@ -7900,6 +7900,67 @@ mod tests {
     }
 
     #[test]
+    fn render_helpers_cover_list_detail_footer_and_consent_overlays() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.profile_name = Some("Ada Lovelace".to_string());
+        app.image_runtime_info = Some("images: text".to_string());
+        app.image_runtime_debug = vec!["probe: off".to_string()];
+        app.status = Some("ready".to_string());
+        app.focus = FocusPane::Items;
+        app.lists = vec![test_shopping_list(
+            1,
+            "Groceries",
+            Some("bi-cart-fill"),
+            Some(9),
+            Some("Home / Weekly"),
+            true,
+        )];
+        app.selected_list = 0;
+
+        let mut item = sample_item(1, "Buy milk");
+        item.quantity = Some("2 cartons".to_string());
+        item.due_date = Some("2026-01-02".to_string());
+        item.due_time = Some("08:30".to_string());
+        item.planned_date = Some("2026-01-01".to_string());
+        item.planned_time = Some("18:00".to_string());
+        item.repeat_label = Some("weekly".to_string());
+        item.reminder = Some(true);
+        item.reminder_time = Some("07:30".to_string());
+        item.reminder_offsets = Some(vec![30, 60, 1440]);
+        item.travel_time_minutes = Some(15);
+        item.priority = Some("high".to_string());
+        item.tags = Some(vec!["dairy".to_string()]);
+        item.notes = Some("<p>Cold aisle</p>".to_string());
+        item.comment_count = Some(2);
+        item.image_url = Some("https://example.test/milk.jpg".to_string());
+        app.items = vec![item];
+        app.comments_cache.insert(
+            1,
+            vec![ItemComment {
+                id: 1,
+                text: Some("Fresh".to_string()),
+                user_id: Some(2),
+                user_name: Some("Grace".to_string()),
+                user_email: None,
+                created_at: Some("2026-01-01".to_string()),
+            }],
+        );
+        app.detail_image_note = Some("inline images disabled".to_string());
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+
+        app.beta_consent_pending = true;
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+
+        app.beta_consent_pending = false;
+        app.legal_consent_pending = true;
+        app.legal_pending_docs = vec!["agb".to_string(), "privacy".to_string()];
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+    }
+
+    #[test]
     fn empty_selection_helpers_are_inert() {
         assert_eq!(shifted_index(0, 3, 0), 0);
         assert_eq!(shifted_index(99, -3, 0), 0);
