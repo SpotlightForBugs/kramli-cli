@@ -426,6 +426,7 @@ mod tests {
         assert!(SearchResponse::from_value(serde_json::json!(true)).is_err());
         assert!(SearchResponse::from_value(serde_json::json!(7)).is_err());
         assert!(SearchResponse::from_value(serde_json::json!("search")).is_err());
+        assert!(SearchResponse::from_value(serde_json::json!([null])).is_err());
     }
 
     #[test]
