@@ -688,6 +688,30 @@ mod tests {
         .await
         .is_err());
 
+        run_inner(Cli {
+            json: false,
+            interactive: true,
+            command: None,
+        })
+        .await
+        .expect("test TUI wrapper should be inert");
+
+        run_inner(Cli {
+            json: false,
+            interactive: false,
+            command: Some(Commands::Config),
+        })
+        .await
+        .expect("human config should trigger auto-update notice guard");
+
+        assert!(run(Cli {
+            json: true,
+            interactive: true,
+            command: None,
+        })
+        .await
+        .is_err());
+
         run(Cli {
             json: true,
             interactive: false,
@@ -729,6 +753,15 @@ mod tests {
             json.get("lang_source").and_then(Value::as_str),
             Some("profile")
         );
+    }
+
+    #[tokio::test]
+    async fn profile_locale_auto_apply_covers_skip_guards() {
+        std::env::set_var(TEST_KRAMLI_LANG_ENV, "en");
+        maybe_apply_profile_locale(Some(&Commands::Status)).await;
+        std::env::remove_var(TEST_KRAMLI_LANG_ENV);
+
+        maybe_apply_profile_locale(Some(&Commands::Login { url: None })).await;
     }
 
     #[test]
@@ -2567,7 +2600,7 @@ async fn run_inner(cli: Cli) -> Result<(), String> {
         if cli.command.is_some() {
             return Err(tr("cli-interactive-subcommand-conflict"));
         }
-        return crate::tui::run_tui().await;
+        return run_tui_command().await;
     }
 
     let should_auto_update_check = cli
@@ -2712,6 +2745,18 @@ async fn run_mcp_command() -> Result<(), String> {
     #[cfg(not(test))]
     {
         crate::mcp::run_stdio().await
+    }
+}
+
+async fn run_tui_command() -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let _ = crate::tui::run_tui;
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        crate::tui::run_tui().await
     }
 }
 

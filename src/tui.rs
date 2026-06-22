@@ -7838,6 +7838,68 @@ mod tests {
     }
 
     #[test]
+    fn image_source_helpers_cover_scheme_extension_and_temp_paths() {
+        assert_eq!(valid_image_source(" javascript:alert(1) "), None);
+        assert_eq!(valid_image_source("mailto:test@example.com"), None);
+        assert_eq!(valid_image_source("tel:+410000000"), None);
+        assert_eq!(
+            valid_image_source(" 'https://example.test/photo.jpeg?size=large' "),
+            Some("https://example.test/photo.jpeg?size=large".to_string())
+        );
+        assert_eq!(valid_image_source("  "), None);
+
+        assert_eq!(image_extension_from_source("/a/photo.png?x=1"), "png");
+        assert_eq!(image_extension_from_source("/a/photo.jpeg#frag"), "jpeg");
+        assert_eq!(image_extension_from_source("/a/photo.jpg"), "jpg");
+        assert_eq!(image_extension_from_source("/a/photo.webp"), "webp");
+        assert_eq!(image_extension_from_source("/a/photo.gif"), "gif");
+        assert_eq!(image_extension_from_source("/a/photo.bmp"), "bmp");
+        assert_eq!(image_extension_from_source("/a/photo.heic"), "heic");
+        assert_eq!(image_extension_from_source("/a/photo.avif"), "avif");
+        assert_eq!(image_extension_from_source("/a/photo"), "jpg");
+
+        let path = temp_image_path("https://example.test/photo.png?x=1");
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("png")
+        );
+        assert!(path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.starts_with("kramli-cli-image-")));
+    }
+
+    #[test]
+    fn item_display_helpers_cover_dates_reminders_and_filters() {
+        assert_eq!(date_with_time_display(None, Some("08:00")), "-");
+        assert_eq!(
+            date_with_time_display(Some("2026-01-02T09:10:11Z"), None),
+            "2026-01-02"
+        );
+        assert_eq!(
+            date_with_time_display(Some("2026-01-02"), Some(" 08:00 ")),
+            "2026-01-02 08:00"
+        );
+        assert_eq!(
+            reminder_offsets_display(&[30, 60, 120, 1440, 2880]),
+            "30m, 1h, 2h, 1d, 2d"
+        );
+
+        let mut item = sample_item(1, "Buy milk");
+        item.quantity = Some("2 cartons".to_string());
+        item.notes = Some("<p>Remember bread</p>".to_string());
+        item.priority = Some("High".to_string());
+        item.tags = Some(vec!["Dairy".to_string(), "Weekend".to_string()]);
+
+        assert!(item_matches_filter(&item, "milk"));
+        assert!(item_matches_filter(&item, "cartons"));
+        assert!(item_matches_filter(&item, "bread"));
+        assert!(item_matches_filter(&item, "high"));
+        assert!(item_matches_filter(&item, "weekend"));
+        assert!(!item_matches_filter(&item, "hardware"));
+    }
+
+    #[test]
     fn empty_selection_helpers_are_inert() {
         assert_eq!(shifted_index(0, 3, 0), 0);
         assert_eq!(shifted_index(99, -3, 0), 0);
