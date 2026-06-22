@@ -207,7 +207,11 @@ pub(crate) struct TraceTransaction {
 impl TraceTransaction {
     /// Start a transaction and install it as the active span.
     pub(crate) fn start(name: &'static str, op: &'static str) -> Self {
-        if !is_enabled() {
+        Self::start_with_enabled(name, op, is_enabled())
+    }
+
+    fn start_with_enabled(name: &'static str, op: &'static str, enabled: bool) -> Self {
+        if !enabled {
             return Self {
                 inner: None,
                 previous_span: None,
@@ -281,7 +285,11 @@ pub(crate) struct TraceSpan {
 impl TraceSpan {
     /// Start a child span under the active transaction or span.
     pub(crate) fn child(op: &'static str, description: &'static str) -> Self {
-        if !is_enabled() {
+        Self::child_with_enabled(op, description, is_enabled())
+    }
+
+    fn child_with_enabled(op: &'static str, description: &'static str, enabled: bool) -> Self {
+        if !enabled {
             return Self {
                 inner: None,
                 finished: true,
@@ -527,6 +535,7 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const TEST_KRAMLI_TELEMETRY_ENV: &str = "KRAMLI_TELEMETRY";
 
     fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK.lock().expect("telemetry env lock poisoned");
@@ -644,6 +653,17 @@ mod tests {
     fn drops_response_body_with_spaced_marker() {
         let msg = "Failed\n  Body : sensitive@example.com";
         assert_eq!(scrub_message(msg), "Failed");
+        assert_eq!(body_prefix("Failed\nBody: sensitive@example.com"), "Failed");
+    }
+
+    #[test]
+    fn redaction_helpers_cover_empty_tokens_and_jwts() {
+        assert_eq!(redact_token("   "), "   ");
+
+        let jwt = "abcdefgh.ijklmnop.qrstuvwx";
+        assert_eq!(redact_token(jwt), "[REDACTED_TOKEN]");
+        assert!(looks_like_jwt(jwt));
+        assert!(!looks_like_jwt("short.parts.no"));
     }
 
     #[test]
@@ -720,23 +740,52 @@ mod tests {
     #[test]
     fn disabled_trace_wrappers_are_inert() {
         let transaction = TraceTransaction::start("test.transaction", "test");
+        transaction.finish(true);
+
+        let transaction = TraceTransaction::start_with_enabled("test.transaction", "test", false);
         transaction.set_tag("command", "status");
         transaction.set_tag("email", "user@example.com");
         transaction.set_data_i64("items", 3);
         transaction.finish(true);
 
-        let transaction = TraceTransaction::start("test.transaction", "test");
+        let transaction = TraceTransaction::start_with_enabled("test.transaction", "test", false);
         transaction.finish(false);
 
-        let span = TraceSpan::child("test", "child");
+        let span = TraceSpan::child_with_enabled("test", "child", false);
         span.set_tag("operation", "api");
         span.set_tag("email", "user@example.com");
         span.set_data_i64("count", 2);
         span.set_status(true);
         span.finish();
 
-        let span = TraceSpan::child("test", "child");
+        let span = TraceSpan::child_with_enabled("test", "child", false);
         span.set_status(false);
+    }
+
+    #[test]
+    fn enabled_trace_wrappers_cover_active_scope_paths() {
+        with_env_var(TEST_KRAMLI_TELEMETRY_ENV, Some("true"), || {
+            {
+                let transaction =
+                    TraceTransaction::start_with_enabled("test.transaction", "test", true);
+                transaction.set_tag("command", "status");
+                transaction.set_tag("email", "user@example.com");
+                transaction.set_data_i64("items", 3);
+
+                let span = TraceSpan::child_with_enabled("test.child", "child", true);
+                span.set_tag("operation", "api");
+                span.set_tag("email", "user@example.com");
+                span.set_data_i64("count", 2);
+                span.set_status(false);
+                span.finish();
+
+                transaction.finish(false);
+            }
+
+            let _dropped_transaction =
+                TraceTransaction::start_with_enabled("test.transaction", "test", true);
+            let _dropped_span = TraceSpan::child_with_enabled("test.child", "child", true);
+        });
     }
 
     #[test]
