@@ -280,11 +280,12 @@ impl SearchResponse {
             other => Err(format!(
                 "{}: {}",
                 tr("models-search-type-unsupported"),
-                match other {
-                    serde_json::Value::Bool(_) => "bool",
-                    serde_json::Value::Number(_) => "number",
-                    serde_json::Value::String(_) => "string",
-                    _ => "unknown",
+                if other.is_boolean() {
+                    "bool"
+                } else if other.is_number() {
+                    "number"
+                } else {
+                    "string"
                 }
             )),
         }
@@ -422,6 +423,15 @@ mod tests {
         .into_grouped();
         assert_eq!(flat_object.lists.expect("flat list")[0].name, "Flat object");
 
+        let object_hit_without_type = SearchResponse::from_value(serde_json::json!({
+            "id": 10,
+            "unexpected": true
+        }))
+        .expect("object hit without type should still parse")
+        .into_grouped();
+        assert!(object_hit_without_type.lists.is_none());
+        assert!(object_hit_without_type.items.is_none());
+
         assert!(SearchResponse::from_value(serde_json::json!({"unexpected": true})).is_err());
         assert!(SearchResponse::from_value(serde_json::json!(true)).is_err());
         assert!(SearchResponse::from_value(serde_json::json!(7)).is_err());
@@ -534,12 +544,10 @@ mod tests {
         }))
         .expect("api key with array scopes should parse");
 
-        match key.scopes {
-            Some(ApiKeyScopes::Multiple(values)) => {
-                assert_eq!(values, vec!["all", "lists:read"]);
-            }
-            _ => panic!("expected multiple scopes"),
-        }
+        assert!(matches!(
+            key.scopes,
+            Some(ApiKeyScopes::Multiple(values)) if values == vec!["all", "lists:read"]
+        ));
     }
 
     #[test]
@@ -552,10 +560,7 @@ mod tests {
         }))
         .expect("api key with string scopes should parse");
 
-        match key.scopes {
-            Some(ApiKeyScopes::Single(value)) => assert_eq!(value, "all"),
-            _ => panic!("expected single scope"),
-        }
+        assert!(matches!(key.scopes, Some(ApiKeyScopes::Single(value)) if value == "all"));
     }
 }
 
