@@ -946,6 +946,7 @@ mod tests {
     }
 
     const TEST_KRAMLI_API_KEY_ENV: &str = "KRAMLI_API_KEY";
+    const TEST_KRAMLI_AUTO_HANDOFF_ENV: &str = "KRAMLI_AUTO_HANDOFF";
 
     #[test]
     fn list_update_and_batch_helpers_cover_branch_variants() {
@@ -1231,6 +1232,126 @@ mod tests {
         assert_eq!(requests[11], "POST /api/items/9/comments HTTP/1.1");
         assert_eq!(requests[12], "POST /api/lists/7/check-all HTTP/1.1");
         assert_eq!(requests[13], "POST /api/lists/7/clear-done HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn item_command_helpers_cover_alternate_output_branches() {
+        let responses = vec![
+            json!([{"id": 1, "text": "Nice"}]).to_string(),
+            json!([{"id": 7, "name": "Groceries"}]).to_string(),
+            json!([{"id": 5, "text": "Milk", "is_done": false}]).to_string(),
+            item_response(10, "Created Human"),
+            item_response(11, "Updated Without Tags"),
+            json!([{"id": 11, "list_id": 7, "text": "Updated Without Tags", "is_done": false, "tags": ["kept"]}]).to_string(),
+            json!({"id": 12, "text": "Done Human"}).to_string(),
+            json!({"upvoted_by_me": false, "upvote_count": 0}).to_string(),
+            json!({"ok": true}).to_string(),
+            list_response(7, "Groceries"),
+            json!([{"id": 1, "list_id": 7, "text": "Open", "is_done": false}]).to_string(),
+            json!({"id": 13, "text": "Json comment"}).to_string(),
+            json!({"ok": true}).to_string(),
+            json!({"count": 0}).to_string(),
+            json!([{"id": 1, "text": "Other"}]).to_string(),
+        ];
+        let (api, requests) = api_with_responses(responses).await;
+
+        std::env::set_var(TEST_KRAMLI_AUTO_HANDOFF_ENV, "false");
+        run_items_show(&api, false, 5)
+            .await
+            .expect("show should render human output");
+        run_items_add(
+            &api,
+            false,
+            ItemAddArgs {
+                list_id: 7,
+                text: "Created Human".to_string(),
+                quantity: None,
+                due: None,
+                due_time: None,
+                planned: None,
+                planned_time: None,
+                reminder: Some(true),
+                reminder_time: None,
+                reminder_days_before: None,
+                reminder_offsets: None,
+                travel_time_minutes: None,
+                priority: None,
+                tags: None,
+                notes: None,
+                parent: None,
+                assign: None,
+                color: None,
+                progress: None,
+            },
+        )
+        .await
+        .expect("add should render human output");
+        run_items_update(
+            &api,
+            false,
+            ItemUpdateArgs {
+                id: 11,
+                text: Some("Updated Without Tags".to_string()),
+                quantity: None,
+                due: None,
+                due_time: None,
+                planned: None,
+                planned_time: None,
+                reminder: None,
+                reminder_time: None,
+                reminder_days_before: None,
+                reminder_offsets: None,
+                travel_time_minutes: None,
+                priority: None,
+                tags: None,
+                notes: None,
+                assign: None,
+                color: None,
+                progress: None,
+            },
+        )
+        .await
+        .expect("update without tags should enrich from list");
+        run_items_done(&api, false, 12)
+            .await
+            .expect("done should render human output");
+        run_items_vote(&api, true, 12)
+            .await
+            .expect("vote should render json output");
+        run_items_delete(&api, true, 12)
+            .await
+            .expect("delete should render json output");
+        run_items_done_list(&api, false, 7)
+            .await
+            .expect("done list should render empty human output");
+        run_items_comment(&api, true, 12, "Json comment".to_string())
+            .await
+            .expect("comment should render json output");
+        run_items_check_all(&api, false, 7)
+            .await
+            .expect("check all should render human output");
+        run_items_clear_done(&api, true, 7)
+            .await
+            .expect("clear done should render json output");
+        assert!(fetch_item_from_list(&api, 7, 999).await.is_err());
+        std::env::remove_var(TEST_KRAMLI_AUTO_HANDOFF_ENV);
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests[0], "GET /api/items/5/comments HTTP/1.1");
+        assert_eq!(requests[1], "GET /api/lists HTTP/1.1");
+        assert_eq!(requests[2], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[3], "POST /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[4], "PUT /api/items/11 HTTP/1.1");
+        assert_eq!(requests[5], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[6], "PATCH /api/items/12/done HTTP/1.1");
+        assert_eq!(requests[7], "PATCH /api/items/12/upvote HTTP/1.1");
+        assert_eq!(requests[8], "DELETE /api/items/12 HTTP/1.1");
+        assert_eq!(requests[9], "GET /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[10], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[11], "POST /api/items/12/comments HTTP/1.1");
+        assert_eq!(requests[12], "POST /api/lists/7/check-all HTTP/1.1");
+        assert_eq!(requests[13], "POST /api/lists/7/clear-done HTTP/1.1");
+        assert_eq!(requests[14], "GET /api/lists/7/items HTTP/1.1");
     }
 
     #[tokio::test]
