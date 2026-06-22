@@ -9226,6 +9226,13 @@ mod tests {
     }
 
     #[test]
+    fn tui_icon_style_reads_raw_environment_value() {
+        std::env::set_var(KRAMLI_ICON_STYLE_ENV, "raw");
+        assert_eq!(tui_icon_style(), TuiIconStyle::Raw);
+        std::env::remove_var(KRAMLI_ICON_STYLE_ENV);
+    }
+
+    #[test]
     fn bootstrap_sprite_contains_icons_from_official_symbol_ids() {
         let sprite = r#"
             <svg xmlns="http://www.w3.org/2000/svg">
