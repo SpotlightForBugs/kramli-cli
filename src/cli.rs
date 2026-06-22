@@ -1705,6 +1705,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_command_dispatches_safe_api_backed_commands() {
+        let profile = serde_json::to_string(&sample_profile(Some("en"))).unwrap();
+        let responses = vec![
+            profile.clone(),
+            json!([{"id": 7, "name": "Groceries"}]).to_string(),
+            json!([{"id": 9, "list_id": 7, "text": "Milk", "is_done": false}]).to_string(),
+            json!([{"id": 4, "name": "House"}]).to_string(),
+            json!([{"user_id": 2, "display_name": "Ada", "role": "viewer", "type": "member"}])
+                .to_string(),
+            json!([{"id": 1, "name": "Read", "scopes": "all", "is_active": true}]).to_string(),
+            json!({"lists": [], "items": []}).to_string(),
+            json!([{"id": 1, "action": "created", "created_at": "2026-01-01"}]).to_string(),
+            json!({"ok": true}).to_string(),
+            json!({"ok": true}).to_string(),
+            profile,
+            json!({"security": {"score": 1, "max_score": 1, "factors": []}}).to_string(),
+            json!({"legal": {"pending": []}}).to_string(),
+            json!({"ok": true}).to_string(),
+            json!({"ok": true}).to_string(),
+        ];
+        let (base_url, requests) = server_with_base_url(responses).await;
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+                (TEST_KRAMLI_AUTO_HANDOFF_ENV, "false"),
+            ],
+            || async {
+                run_command(Commands::Status, true)
+                    .await
+                    .expect("status dispatch should succeed");
+                run_command(
+                    Commands::Lists {
+                        action: ListCmd::List,
+                    },
+                    true,
+                )
+                .await
+                .expect("lists dispatch should succeed");
+                run_command(
+                    Commands::Items {
+                        action: Box::new(ItemCmd::List {
+                            list_id: 7,
+                            open: false,
+                            completed: false,
+                            state: None,
+                            contains: None,
+                            newest: false,
+                            oldest: false,
+                            limit: None,
+                        }),
+                    },
+                    true,
+                )
+                .await
+                .expect("items dispatch should succeed");
+                run_command(
+                    Commands::Folders {
+                        action: FolderCmd::List,
+                    },
+                    true,
+                )
+                .await
+                .expect("folders dispatch should succeed");
+                run_command(
+                    Commands::Members {
+                        action: MemberCmd::List { list_id: 7 },
+                    },
+                    true,
+                )
+                .await
+                .expect("members dispatch should succeed");
+                run_command(
+                    Commands::Keys {
+                        action: KeyCmd::List,
+                    },
+                    true,
+                )
+                .await
+                .expect("keys dispatch should succeed");
+                run_command(
+                    Commands::Search {
+                        query: "milk".to_string(),
+                    },
+                    true,
+                )
+                .await
+                .expect("search dispatch should succeed");
+                run_command(
+                    Commands::Activity {
+                        list_id: 7,
+                        limit: 1,
+                    },
+                    true,
+                )
+                .await
+                .expect("activity dispatch should succeed");
+                run_command(Commands::Undo { list_id: 7 }, true)
+                    .await
+                    .expect("undo dispatch should succeed");
+                run_command(Commands::Redo { list_id: 7 }, true)
+                    .await
+                    .expect("redo dispatch should succeed");
+                run_command(Commands::Profile, true)
+                    .await
+                    .expect("profile dispatch should succeed");
+                run_command(
+                    Commands::Security {
+                        action: SecurityCmd::Status,
+                    },
+                    true,
+                )
+                .await
+                .expect("security dispatch should succeed");
+                run_command(
+                    Commands::AcceptTerms {
+                        docs: Some(vec!["agb".to_string(), "privacy".to_string()]),
+                    },
+                    true,
+                )
+                .await
+                .expect("accept terms dispatch should succeed");
+                run_command(
+                    Commands::Handoff {
+                        action: HandoffCmd::Clear,
+                    },
+                    true,
+                )
+                .await
+                .expect("handoff dispatch should succeed");
+                run_command(Commands::Ping, true)
+                    .await
+                    .expect("ping dispatch should succeed");
+                run_command(Commands::Config, true)
+                    .await
+                    .expect("config dispatch should render");
+                run_command(Commands::Completions { shell: Shell::Bash }, true)
+                    .await
+                    .expect("completions dispatch should render");
+                assert!(run_command(
+                    Commands::Batch {
+                        file: temp_batch_file("dispatch-batch", "not-a-command\n"),
+                        keep_going: false,
+                    },
+                    false,
+                )
+                .await
+                .is_err());
+            },
+        )
+        .await;
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests[0], "GET /api/profile HTTP/1.1");
+        assert_eq!(requests[1], "GET /api/lists HTTP/1.1");
+        assert_eq!(requests[2], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[3], "GET /api/folders HTTP/1.1");
+        assert_eq!(requests[4], "GET /api/lists/7/members HTTP/1.1");
+        assert_eq!(requests[5], "GET /api/api-keys HTTP/1.1");
+        assert!(requests[6].starts_with("GET /api/search?"));
+        assert_eq!(requests[7], "GET /api/lists/7/activity?limit=1 HTTP/1.1");
+        assert_eq!(requests[8], "POST /api/lists/7/undo HTTP/1.1");
+        assert_eq!(requests[9], "POST /api/lists/7/redo HTTP/1.1");
+        assert_eq!(requests[10], "GET /api/profile HTTP/1.1");
+        assert_eq!(requests[11], "GET /api/security HTTP/1.1");
+        assert_eq!(requests[12], "POST /api/accept-terms HTTP/1.1");
+        assert_eq!(requests[13], "POST /api/activity/clear HTTP/1.1");
+        assert_eq!(requests[14], "GET /api/ping HTTP/1.1");
+    }
+
+    #[tokio::test]
     async fn env_var_helper_restores_existing_values() {
         std::env::set_var(TEST_KRAMLI_API_KEY_ENV, "before");
         with_env_vars_async(&[(TEST_KRAMLI_API_KEY_ENV, "during")], || async {
