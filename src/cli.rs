@@ -292,6 +292,8 @@ fn resolve_list_reference(reference: &str) -> Result<i64, String> {
 mod tests {
     use super::*;
 
+    const TEST_KRAMLI_LANG_ENV: &str = "KRAMLI_LANG";
+
     fn encode_list_slug(id: i64) -> String {
         let mut n = id ^ LIST_ID_XOR_KEY;
         if n == 0 {
@@ -524,6 +526,173 @@ mod tests {
             None,
             &None
         ));
+    }
+
+    fn sample_profile(lang: Option<&str>) -> Profile {
+        Profile {
+            id: Some(7),
+            display_name: Some("Ada".to_string()),
+            email: Some("ada@example.test".to_string()),
+            photo_url: None,
+            lang: lang.map(str::to_string),
+            is_anonymous: Some(false),
+            created_at: Some("2026-01-01T00:00:00Z".to_string()),
+            legal: None,
+            terms_accepted: Some(true),
+        }
+    }
+
+    fn command_samples() -> Vec<(Commands, &'static str)> {
+        vec![
+            (Commands::Login { url: None }, "login"),
+            (Commands::Logout, "logout"),
+            (Commands::Status, "status"),
+            (
+                Commands::Lists {
+                    action: ListCmd::List,
+                },
+                "lists",
+            ),
+            (
+                Commands::Items {
+                    action: Box::new(ItemCmd::Done { id: 1 }),
+                },
+                "items",
+            ),
+            (
+                Commands::Folders {
+                    action: FolderCmd::List,
+                },
+                "folders",
+            ),
+            (
+                Commands::Members {
+                    action: MemberCmd::List { list_id: 1 },
+                },
+                "members",
+            ),
+            (
+                Commands::Keys {
+                    action: KeyCmd::List,
+                },
+                "keys",
+            ),
+            (
+                Commands::Search {
+                    query: "milk".to_string(),
+                },
+                "search",
+            ),
+            (
+                Commands::Activity {
+                    list_id: 1,
+                    limit: 5,
+                },
+                "activity",
+            ),
+            (Commands::Undo { list_id: 1 }, "undo"),
+            (Commands::Redo { list_id: 1 }, "redo"),
+            (Commands::Profile, "profile"),
+            (
+                Commands::Security {
+                    action: SecurityCmd::Status,
+                },
+                "security",
+            ),
+            (Commands::AcceptTerms { docs: None }, "accept_terms"),
+            (
+                Commands::Handoff {
+                    action: HandoffCmd::Clear,
+                },
+                "handoff",
+            ),
+            (Commands::Ping, "ping"),
+            (Commands::Config, "config"),
+            (Commands::UpdateCheck, "update_check"),
+            (
+                Commands::Privacy {
+                    action: PrivacyCmd::Reset,
+                },
+                "privacy",
+            ),
+            (Commands::Mcp, "mcp"),
+            (
+                Commands::Batch {
+                    file: "-".to_string(),
+                    keep_going: false,
+                },
+                "batch",
+            ),
+            (Commands::Completions { shell: Shell::Bash }, "completions"),
+        ]
+    }
+
+    #[test]
+    fn command_classifiers_cover_all_top_level_variants() {
+        for (command, label) in command_samples() {
+            assert_eq!(command_trace_name(&command), label);
+        }
+
+        assert!(!command_supports_profile_locale(Some(&Commands::Login {
+            url: None
+        })));
+        assert!(!command_supports_profile_locale(Some(
+            &Commands::Completions { shell: Shell::Bash }
+        )));
+        assert!(!command_supports_profile_locale(Some(
+            &Commands::UpdateCheck
+        )));
+        assert!(!command_supports_profile_locale(Some(&Commands::Privacy {
+            action: PrivacyCmd::Reset,
+        })));
+        assert!(command_supports_profile_locale(None));
+        assert!(command_supports_profile_locale(Some(&Commands::Status)));
+
+        assert!(!command_supports_auto_update_check(&Commands::Login {
+            url: None
+        }));
+        assert!(!command_supports_auto_update_check(
+            &Commands::Completions { shell: Shell::Bash }
+        ));
+        assert!(!command_supports_auto_update_check(&Commands::UpdateCheck));
+        assert!(!command_supports_auto_update_check(&Commands::Privacy {
+            action: PrivacyCmd::Reset,
+        }));
+        assert!(command_supports_auto_update_check(&Commands::Status));
+    }
+
+    #[test]
+    fn profile_locale_helpers_cover_env_profile_and_resolved_sources() {
+        crate::i18n::set_locale("en");
+        let profile = sample_profile(Some(" en_US.UTF-8 "));
+        assert_eq!(profile_lang(&profile).as_deref(), Some("en_US.UTF-8"));
+        assert_eq!(effective_lang_source(&profile), "profile");
+
+        let resolved_profile = sample_profile(Some("fr-FR"));
+        assert_eq!(effective_lang_source(&resolved_profile), "resolved");
+
+        std::env::set_var(TEST_KRAMLI_LANG_ENV, "de");
+        assert_eq!(effective_lang_source(&resolved_profile), "env");
+        apply_profile_locale_now(&sample_profile(Some("fr")));
+        std::env::remove_var(TEST_KRAMLI_LANG_ENV);
+
+        let empty_profile = sample_profile(Some("   "));
+        assert_eq!(profile_lang(&empty_profile), None);
+
+        crate::i18n::set_locale("pt-BR");
+        apply_profile_locale_now(&sample_profile(Some("fr-FR")));
+        assert_eq!(current_locale_code(), "fr-FR");
+
+        let json = profile_json_with_lang(&sample_profile(Some("fr-FR")));
+        assert_eq!(
+            json.get("profile_lang").and_then(Value::as_str),
+            Some("fr-FR")
+        );
+        assert_eq!(json.get("lang").and_then(Value::as_str), Some("fr-FR"));
+        assert_eq!(
+            json.get("lang_source").and_then(Value::as_str),
+            Some("profile")
+        );
     }
 
     fn list_response(id: i64, name: &str) -> String {
