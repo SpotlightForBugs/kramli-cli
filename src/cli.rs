@@ -914,6 +914,7 @@ mod tests {
     where
         Fut: std::future::Future<Output = T>,
     {
+        let _guard = ENV_LOCK.lock().await;
         let previous = vars
             .iter()
             .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
@@ -947,6 +948,7 @@ mod tests {
 
     const TEST_KRAMLI_API_KEY_ENV: &str = "KRAMLI_API_KEY";
     const TEST_KRAMLI_AUTO_HANDOFF_ENV: &str = "KRAMLI_AUTO_HANDOFF";
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn list_update_and_batch_helpers_cover_branch_variants() {
@@ -1397,6 +1399,177 @@ mod tests {
         assert_eq!(requests[14], "GET /api/lists/7/items HTTP/1.1");
         assert_eq!(requests[15], "GET /api/lists/7 HTTP/1.1");
         assert_eq!(requests[16], "GET /api/lists/7/items HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn folder_member_and_key_commands_cover_api_paths() {
+        let responses = vec![
+            json!([{"id": 3, "name": "House", "icon": "folder", "color": "#fff"}])
+                .to_string(),
+            json!({"id": 4, "name": "Created", "parent_folder_id": 3}).to_string(),
+            json!({"id": 4, "name": "Updated", "color": "#000"}).to_string(),
+            json!({"ok": true}).to_string(),
+            json!([{"user_id": 2, "display_name": "Ada", "email": "ada@example.test", "role": "editor", "type": "member"}]).to_string(),
+            json!({"ok": true}).to_string(),
+            json!({"ok": true}).to_string(),
+            json!({"ok": true}).to_string(),
+            json!({"invite_url": "https://kram.li/i/server"}).to_string(),
+            json!({"invite_url": "https://kram.li/i/json"}).to_string(),
+            json!({"ok": true}).to_string(),
+            json!({"ok": true}).to_string(),
+            json!([
+                {"id": 1, "name": "Full", "scopes": "all", "is_active": true, "last_used_at": "2026-01-01"},
+                {"id": 2, "name": null, "scopes": ["lists:read", "items:write"], "is_active": false, "last_used_at": null}
+            ]).to_string(),
+            json!([]).to_string(),
+            json!({"key": "kramli_new"}).to_string(),
+            json!({"key": "kramli_json"}).to_string(),
+            json!({"ok": true}).to_string(),
+        ];
+        let (base_url, requests) = server_with_base_url(responses).await;
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_folders(FolderCmd::List, true)
+                    .await
+                    .expect("folder list json should succeed");
+                run_folders(
+                    FolderCmd::Create {
+                        name: "Created".to_string(),
+                        icon: Some("folder".to_string()),
+                        color: Some("#fff".to_string()),
+                        parent: Some(3),
+                    },
+                    false,
+                )
+                .await
+                .expect("folder create should succeed");
+                run_folders(
+                    FolderCmd::Update {
+                        id: 4,
+                        name: Some("Updated".to_string()),
+                        icon: None,
+                        color: Some("#000".to_string()),
+                        parent: None,
+                    },
+                    true,
+                )
+                .await
+                .expect("folder update json should succeed");
+                assert!(run_folders(
+                    FolderCmd::Update {
+                        id: 4,
+                        name: None,
+                        icon: None,
+                        color: None,
+                        parent: None,
+                    },
+                    false,
+                )
+                .await
+                .is_err());
+                run_folders(FolderCmd::Delete { id: 4 }, false)
+                    .await
+                    .expect("folder delete should succeed");
+
+                run_members(MemberCmd::List { list_id: 7 }, true)
+                    .await
+                    .expect("member list json should succeed");
+                run_members(
+                    MemberCmd::Invite {
+                        list_id: 7,
+                        email: "ada@example.test".to_string(),
+                        role: "editor".to_string(),
+                    },
+                    false,
+                )
+                .await
+                .expect("member invite should succeed");
+                run_members(
+                    MemberCmd::Remove {
+                        list_id: 7,
+                        user_id: 2,
+                    },
+                    false,
+                )
+                .await
+                .expect("member remove should succeed");
+                run_members(
+                    MemberCmd::Role {
+                        list_id: 7,
+                        user_id: 2,
+                        role: "viewer".to_string(),
+                    },
+                    false,
+                )
+                .await
+                .expect("member role should succeed");
+                run_members(MemberCmd::InviteLink { list_id: 7 }, false)
+                    .await
+                    .expect("invite link human should succeed");
+                run_members(MemberCmd::InviteLink { list_id: 7 }, true)
+                    .await
+                    .expect("invite link json should succeed");
+                run_members(MemberCmd::Unshare { list_id: 7 }, false)
+                    .await
+                    .expect("unshare should succeed");
+                run_members(MemberCmd::Leave { list_id: 7 }, false)
+                    .await
+                    .expect("leave should succeed");
+
+                run_keys(KeyCmd::List, false)
+                    .await
+                    .expect("key list human should succeed");
+                run_keys(KeyCmd::List, false)
+                    .await
+                    .expect("empty key list should succeed");
+                run_keys(
+                    KeyCmd::Create {
+                        name: "CLI".to_string(),
+                        scopes: "all, lists:read".to_string(),
+                    },
+                    false,
+                )
+                .await
+                .expect("key create human should succeed");
+                run_keys(
+                    KeyCmd::Create {
+                        name: "JSON".to_string(),
+                        scopes: "items:write".to_string(),
+                    },
+                    true,
+                )
+                .await
+                .expect("key create json should succeed");
+                run_keys(KeyCmd::Revoke { key_id: 2 }, false)
+                    .await
+                    .expect("key revoke should succeed");
+            },
+        )
+        .await;
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests[0], "GET /api/folders HTTP/1.1");
+        assert_eq!(requests[1], "POST /api/folders HTTP/1.1");
+        assert_eq!(requests[2], "PUT /api/folders/4 HTTP/1.1");
+        assert_eq!(requests[3], "DELETE /api/folders/4 HTTP/1.1");
+        assert_eq!(requests[4], "GET /api/lists/7/members HTTP/1.1");
+        assert_eq!(requests[5], "POST /api/lists/7/invite HTTP/1.1");
+        assert_eq!(requests[6], "DELETE /api/lists/7/members/2 HTTP/1.1");
+        assert_eq!(requests[7], "PATCH /api/lists/7/members/2 HTTP/1.1");
+        assert_eq!(requests[8], "POST /api/lists/7/invite-link HTTP/1.1");
+        assert_eq!(requests[9], "POST /api/lists/7/invite-link HTTP/1.1");
+        assert_eq!(requests[10], "DELETE /api/lists/7/share HTTP/1.1");
+        assert_eq!(requests[11], "POST /api/lists/7/leave HTTP/1.1");
+        assert_eq!(requests[12], "GET /api/api-keys HTTP/1.1");
+        assert_eq!(requests[13], "GET /api/api-keys HTTP/1.1");
+        assert_eq!(requests[14], "POST /api/api-keys HTTP/1.1");
+        assert_eq!(requests[15], "POST /api/api-keys HTTP/1.1");
+        assert_eq!(requests[16], "DELETE /api/api-keys/2 HTTP/1.1");
     }
 
     #[tokio::test]
