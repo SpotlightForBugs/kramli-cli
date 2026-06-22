@@ -1252,6 +1252,8 @@ mod tests {
             json!({"ok": true}).to_string(),
             json!({"count": 0}).to_string(),
             json!([{"id": 1, "text": "Other"}]).to_string(),
+            list_response(7, "Groceries"),
+            json!([{"id": 2, "list_id": 7, "text": "Done", "is_done": true}]).to_string(),
         ];
         let (api, requests) = api_with_responses(responses).await;
 
@@ -1334,6 +1336,47 @@ mod tests {
             .await
             .expect("clear done should render json output");
         assert!(fetch_item_from_list(&api, 7, 999).await.is_err());
+        let mut item_without_list = ListItem {
+            id: 99,
+            list_id: None,
+            text: "No list".to_string(),
+            is_done: None,
+            quantity: None,
+            notes: None,
+            tldr: None,
+            due_date: None,
+            due_time: None,
+            planned_date: None,
+            planned_time: None,
+            repeat_label: None,
+            reminder: None,
+            reminder_time: None,
+            reminder_days_before: None,
+            reminder_offsets: None,
+            travel_time_minutes: None,
+            priority: None,
+            progress: None,
+            tags: None,
+            parent_item_id: None,
+            depth: None,
+            position: None,
+            completed_at: None,
+            created_at: None,
+            updated_at: None,
+            assigned_to: None,
+            child_count: None,
+            done_child_count: None,
+            comment_count: None,
+            color: None,
+            image_url: None,
+            image_filename: None,
+            attachments: None,
+        };
+        enrich_item_tags_from_list(&api, &mut item_without_list).await;
+        assert!(item_without_list.tags.is_none());
+        run_items_done_list(&api, false, 7)
+            .await
+            .expect("done list should render completed human output");
         std::env::remove_var(TEST_KRAMLI_AUTO_HANDOFF_ENV);
 
         let requests = requests.await.expect("test server should finish");
@@ -1352,6 +1395,8 @@ mod tests {
         assert_eq!(requests[12], "POST /api/lists/7/check-all HTTP/1.1");
         assert_eq!(requests[13], "POST /api/lists/7/clear-done HTTP/1.1");
         assert_eq!(requests[14], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[15], "GET /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[16], "GET /api/lists/7/items HTTP/1.1");
     }
 
     #[tokio::test]
