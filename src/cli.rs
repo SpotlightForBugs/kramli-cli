@@ -2160,6 +2160,16 @@ mod tests {
         let nested_error = temp_batch_file("nested-error", "batch -\n");
         assert!(run_batch(&nested_error, false, false).await.is_err());
     }
+
+    #[tokio::test]
+    async fn run_batch_json_reports_parse_nested_and_child_failures() {
+        let file = temp_batch_file(
+            "json-batch",
+            "# ignored\n\n\"unterminated\nnot-a-command\nbatch -\n",
+        );
+
+        assert!(run_batch_json(&file, true).await.is_err());
+    }
 }
 
 #[derive(Subcommand)]
