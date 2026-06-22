@@ -711,6 +711,7 @@ mod tests {
         assert!(resolve_list_reference("invalid!").is_err());
 
         assert_eq!(parse_states_arg("  ").unwrap(), Value::Array(Vec::new()));
+        assert!(parse_states_arg("{}").is_err());
         assert!(parse_states_arg("[invalid").is_err());
         assert!(parse_states_arg(" , , ").is_err());
         let csv_states = parse_states_arg(" Open : #fff , Review , Done ").unwrap();
@@ -750,6 +751,89 @@ mod tests {
         assert_eq!(parse_search_item_id("0"), None);
         assert_eq!(parse_search_item_id("#42"), Some(42));
         assert_eq!(parse_search_item_id(" 77 "), Some(77));
+    }
+
+    #[test]
+    fn item_filter_and_body_helpers_cover_branch_variants() {
+        let mut item = ListItem {
+            id: 5,
+            list_id: Some(9),
+            text: "Buy Milk".to_string(),
+            is_done: Some(false),
+            quantity: None,
+            notes: None,
+            tldr: None,
+            due_date: None,
+            due_time: None,
+            planned_date: None,
+            planned_time: None,
+            repeat_label: None,
+            reminder: None,
+            reminder_time: None,
+            reminder_days_before: None,
+            reminder_offsets: None,
+            travel_time_minutes: None,
+            priority: None,
+            progress: Some("Open".to_string()),
+            tags: None,
+            parent_item_id: None,
+            depth: None,
+            position: None,
+            completed_at: None,
+            created_at: None,
+            updated_at: None,
+            assigned_to: None,
+            child_count: None,
+            done_child_count: None,
+            comment_count: None,
+            color: None,
+            image_url: None,
+            image_filename: None,
+            attachments: None,
+        };
+
+        assert!(item_matches_filters(
+            &item,
+            true,
+            false,
+            Some("open"),
+            Some("milk")
+        ));
+        assert!(!item_matches_filters(&item, false, true, None, None));
+        assert!(!item_matches_filters(
+            &item,
+            false,
+            false,
+            Some("done"),
+            None
+        ));
+        assert!(!item_matches_filters(
+            &item,
+            false,
+            false,
+            None,
+            Some("bread")
+        ));
+        item.is_done = Some(true);
+        assert!(!item_matches_filters(&item, true, false, None, None));
+        assert!(item_matches_filters(&item, false, true, None, None));
+
+        let mut body = serde_json::Map::new();
+        insert_string(&mut body, "text", Some("Milk".to_string()));
+        insert_string(&mut body, "missing", None);
+        assert_eq!(body.get("text"), Some(&Value::String("Milk".to_string())));
+        assert!(body.get("missing").is_none());
+        assert_eq!(
+            parse_id_values("1, nope, 2, , 3"),
+            vec![Value::from(1), Value::from(2), Value::from(3)]
+        );
+
+        let handoff = handoff_body(4, Some("  ".to_string()), "Mac".to_string());
+        assert!(handoff.get("list_name").is_none());
+        assert_eq!(
+            handoff.get("device_label"),
+            Some(&Value::String("Mac".to_string()))
+        );
     }
 
     #[test]
@@ -1723,7 +1807,7 @@ fn parse_states_arg(raw: &str) -> Result<Value, String> {
         return Ok(Value::Array(Vec::new()));
     }
 
-    if trimmed.starts_with('[') {
+    if trimmed.starts_with('[') || trimmed.starts_with('{') {
         let parsed: Value = serde_json::from_str(trimmed)
             .map_err(|e| tr_args("cli-states-invalid-json", &[("error", e.to_string())]))?;
         if !parsed.is_array() {
