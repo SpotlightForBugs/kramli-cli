@@ -2170,6 +2170,29 @@ mod tests {
 
         assert!(run_batch_json(&file, true).await.is_err());
     }
+
+    #[tokio::test]
+    async fn run_batch_json_covers_read_break_and_success_branches() {
+        let missing = std::env::temp_dir().join(format!(
+            "kramli-cli-missing-json-batch-{}-{}.txt",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        assert!(run_batch_json(&missing.to_string_lossy(), true)
+            .await
+            .is_err());
+
+        let parse_break = temp_batch_file("json-batch-break", "\"unterminated\nstatus\n");
+        assert!(run_batch_json(&parse_break, false).await.is_err());
+
+        let child_failure = temp_batch_file("json-batch-child", "status\n");
+        assert!(run_batch_json(&child_failure, false).await.is_err());
+
+        let empty = temp_batch_file("json-batch-empty", "# comment\n\n");
+        run_batch_json(&empty, false)
+            .await
+            .expect("empty JSON batch should succeed");
+    }
 }
 
 #[derive(Subcommand)]
