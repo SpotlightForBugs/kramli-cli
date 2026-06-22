@@ -863,6 +863,10 @@ mod tests {
         json!({"id": id, "name": name}).to_string()
     }
 
+    fn item_response(id: i64, text: &str) -> String {
+        json!({"id": id, "list_id": 7, "text": text, "is_done": false}).to_string()
+    }
+
     async fn api_with_responses(
         responses: Vec<String>,
     ) -> (ApiClient, tokio::task::JoinHandle<Vec<String>>) {
@@ -1061,6 +1065,172 @@ mod tests {
         assert_eq!(requests[6], "PUT /api/lists/7 HTTP/1.1");
         assert_eq!(requests[7], "PUT /api/lists/7 HTTP/1.1");
         assert_eq!(requests[8], "PUT /api/lists/7 HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn item_command_helpers_cover_api_paths_and_outputs() {
+        let responses = vec![
+            json!([{"id": 1, "text": "Nice"}]).to_string(),
+            json!([{"id": 7, "name": "Groceries"}]).to_string(),
+            json!([{"id": 5, "list_id": 7, "text": "Milk", "is_done": false}]).to_string(),
+            json!([
+                {"id": 5, "list_id": 7, "text": "Milk", "is_done": false, "created_at": "2026-01-02"},
+                {"id": 6, "list_id": 7, "text": "Bread", "is_done": true, "created_at": "2026-01-01"}
+            ])
+            .to_string(),
+            item_response(9, "Created"),
+            item_response(9, "Updated"),
+            json!({"id": 9, "list_id": 7, "text": "Done", "tags": ["fresh"]}).to_string(),
+            json!({"id": 9, "list_id": 7, "text": "Done", "tags": ["fresh"]}).to_string(),
+            json!({"upvoted_by_me": true, "upvote_count": 3}).to_string(),
+            json!({"ok": true, "undo_token": "undo-item"}).to_string(),
+            json!([
+                {"id": 1, "list_id": 7, "text": "Open", "is_done": false},
+                {"id": 2, "list_id": 7, "text": "Done", "is_done": true}
+            ])
+            .to_string(),
+            json!({"id": 4, "text": "Looks good"}).to_string(),
+            json!({"ok": true}).to_string(),
+            json!({"count": 2}).to_string(),
+        ];
+        let (api, requests) = api_with_responses(responses).await;
+
+        run_items_show(&api, true, 5)
+            .await
+            .expect("show should render json");
+        run_items_list(
+            &api,
+            true,
+            ItemListArgs {
+                list_id: 7,
+                open: true,
+                completed: false,
+                state: Some("open".to_string()),
+                contains: Some("milk".to_string()),
+                newest: true,
+                oldest: false,
+                limit: Some(1),
+            },
+        )
+        .await
+        .expect("list should filter items");
+        run_items_add(
+            &api,
+            true,
+            ItemAddArgs {
+                list_id: 7,
+                text: "Created".to_string(),
+                quantity: Some("2".to_string()),
+                due: Some("2026-01-01".to_string()),
+                due_time: Some("09:00".to_string()),
+                planned: Some("2025-12-31".to_string()),
+                planned_time: Some("18:00".to_string()),
+                reminder: None,
+                reminder_time: Some("08:30".to_string()),
+                reminder_days_before: Some(1),
+                reminder_offsets: Some(vec![60, 1440]),
+                travel_time_minutes: Some(15),
+                priority: Some("high".to_string()),
+                tags: Some("fresh, dairy".to_string()),
+                notes: Some("remember".to_string()),
+                parent: Some(3),
+                assign: Some("1, nope, 2".to_string()),
+                color: Some("#ffffff".to_string()),
+                progress: Some("Open".to_string()),
+            },
+        )
+        .await
+        .expect("add should post item");
+        run_items_update(
+            &api,
+            true,
+            ItemUpdateArgs {
+                id: 9,
+                text: Some("Updated".to_string()),
+                quantity: Some("3".to_string()),
+                due: Some("2026-01-02".to_string()),
+                due_time: Some("10:00".to_string()),
+                planned: Some("2026-01-01".to_string()),
+                planned_time: Some("19:00".to_string()),
+                reminder: Some(false),
+                reminder_time: Some("09:15".to_string()),
+                reminder_days_before: Some(2),
+                reminder_offsets: Some(vec![30]),
+                travel_time_minutes: Some(20),
+                priority: Some("medium".to_string()),
+                tags: Some("done".to_string()),
+                notes: Some("updated".to_string()),
+                assign: Some("2,3".to_string()),
+                color: Some("#000000".to_string()),
+                progress: Some("Done".to_string()),
+            },
+        )
+        .await
+        .expect("update should put item");
+        run_items_done(&api, true, 9)
+            .await
+            .expect("done should patch item");
+        run_items_vote(&api, false, 9)
+            .await
+            .expect("vote should render human output");
+        run_items_delete(&api, false, 9)
+            .await
+            .expect("delete should render human output");
+        run_items_done_list(&api, true, 7)
+            .await
+            .expect("done list should filter completed items");
+        run_items_comment(&api, false, 9, "Looks good".to_string())
+            .await
+            .expect("comment should post text");
+        run_items_check_all(&api, true, 7)
+            .await
+            .expect("check all should post");
+        run_items_clear_done(&api, false, 7)
+            .await
+            .expect("clear done should post");
+
+        assert!(run_items_update(
+            &api,
+            true,
+            ItemUpdateArgs {
+                id: 10,
+                text: None,
+                quantity: None,
+                due: None,
+                due_time: None,
+                planned: None,
+                planned_time: None,
+                reminder: None,
+                reminder_time: None,
+                reminder_days_before: None,
+                reminder_offsets: None,
+                travel_time_minutes: None,
+                priority: None,
+                tags: None,
+                notes: None,
+                assign: None,
+                color: None,
+                progress: None,
+            },
+        )
+        .await
+        .is_err());
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests[0], "GET /api/items/5/comments HTTP/1.1");
+        assert_eq!(requests[1], "GET /api/lists HTTP/1.1");
+        assert_eq!(requests[2], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[3], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[4], "POST /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[5], "PUT /api/items/9 HTTP/1.1");
+        assert_eq!(requests[6], "PATCH /api/items/9/done HTTP/1.1");
+        assert_eq!(requests[7], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[8], "PATCH /api/items/9/upvote HTTP/1.1");
+        assert_eq!(requests[9], "DELETE /api/items/9 HTTP/1.1");
+        assert_eq!(requests[10], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[11], "POST /api/items/9/comments HTTP/1.1");
+        assert_eq!(requests[12], "POST /api/lists/7/check-all HTTP/1.1");
+        assert_eq!(requests[13], "POST /api/lists/7/clear-done HTTP/1.1");
     }
 
     #[tokio::test]
