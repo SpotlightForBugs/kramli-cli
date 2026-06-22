@@ -524,6 +524,24 @@ mod tests {
     use super::*;
     use crate::config::parse_env_bool;
     use sentry::protocol::{Event, Exception, LogEntry, Map};
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().expect("telemetry env lock poisoned");
+        let previous = std::env::var(key).ok();
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        let result = f();
+        match previous {
+            Some(previous) => std::env::set_var(key, previous),
+            None => std::env::remove_var(key),
+        }
+        result
+    }
 
     fn is_enabled_from_values(
         dnt: Option<&str>,
@@ -559,12 +577,68 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_env_helpers_parse_sampling_and_error_capture() {
+        with_env_var(KRAMLI_TRACES_SAMPLE_RATE_ENV, None, || {
+            assert_eq!(traces_sample_rate(), 1.0);
+        });
+        with_env_var(KRAMLI_TRACES_SAMPLE_RATE_ENV, Some("0.25"), || {
+            assert_eq!(traces_sample_rate(), 0.25);
+        });
+        with_env_var(KRAMLI_TRACES_SAMPLE_RATE_ENV, Some("-3"), || {
+            assert_eq!(traces_sample_rate(), 0.0);
+        });
+        with_env_var(KRAMLI_TRACES_SAMPLE_RATE_ENV, Some("3"), || {
+            assert_eq!(traces_sample_rate(), 1.0);
+        });
+        with_env_var(KRAMLI_TRACES_SAMPLE_RATE_ENV, Some("nan"), || {
+            assert_eq!(traces_sample_rate(), 1.0);
+        });
+
+        with_env_var(KRAMLI_CAPTURE_COMMAND_ERRORS_ENV, None, || {
+            assert!(!should_capture_command_error("boom"));
+        });
+        with_env_var(KRAMLI_CAPTURE_COMMAND_ERRORS_ENV, Some("yes"), || {
+            assert!(should_capture_command_error("boom"));
+        });
+        with_env_var(KRAMLI_CAPTURE_COMMAND_ERRORS_ENV, Some("off"), || {
+            assert!(!should_capture_command_error("boom"));
+        });
+        with_env_var(KRAMLI_CAPTURE_COMMAND_ERRORS_ENV, Some("maybe"), || {
+            assert!(!should_capture_command_error("boom"));
+        });
+    }
+
+    #[test]
+    fn telemetry_env_helper_restores_existing_values() {
+        std::env::set_var(KRAMLI_TRACES_SAMPLE_RATE_ENV, "0.5");
+
+        with_env_var(KRAMLI_TRACES_SAMPLE_RATE_ENV, Some("0.25"), || {
+            assert_eq!(
+                std::env::var(KRAMLI_TRACES_SAMPLE_RATE_ENV).as_deref(),
+                Ok("0.25")
+            );
+        });
+
+        assert_eq!(
+            std::env::var(KRAMLI_TRACES_SAMPLE_RATE_ENV).as_deref(),
+            Ok("0.5")
+        );
+        std::env::remove_var(KRAMLI_TRACES_SAMPLE_RATE_ENV);
+    }
+
+    #[test]
     fn drops_response_body() {
         let msg = "Could not parse response: expected value\nBody: {\"email\":\"a@b.com\"}";
         let scrubbed = scrub_message(msg);
         assert!(!scrubbed.contains("a@b.com"));
         assert!(!scrubbed.contains("Body:"));
         assert!(scrubbed.starts_with("Could not parse response:"));
+    }
+
+    #[test]
+    fn drops_response_body_with_spaced_marker() {
+        let msg = "Failed\n  Body : sensitive@example.com";
+        assert_eq!(scrub_message(msg), "Failed");
     }
 
     #[test]
@@ -618,6 +692,7 @@ mod tests {
 
     #[test]
     fn route_templates_drop_ids_tokens_and_query_values() {
+        assert_eq!(route_template("/"), "/");
         assert_eq!(
             route_template("/lists/123/items?search=milk"),
             "/lists/{id}/items"
@@ -633,6 +708,30 @@ mod tests {
         );
         assert_eq!(route_template("/security/login-ack"), "/security/login-ack");
         assert_eq!(route_template("/profile"), "/profile");
+        assert_eq!(status_class(204), "2xx");
+        assert_eq!(status_class(503), "5xx");
+    }
+
+    #[test]
+    fn disabled_trace_wrappers_are_inert() {
+        let transaction = TraceTransaction::start("test.transaction", "test");
+        transaction.set_tag("command", "status");
+        transaction.set_tag("email", "user@example.com");
+        transaction.set_data_i64("items", 3);
+        transaction.finish(true);
+
+        let transaction = TraceTransaction::start("test.transaction", "test");
+        transaction.finish(false);
+
+        let span = TraceSpan::child("test", "child");
+        span.set_tag("operation", "api");
+        span.set_tag("email", "user@example.com");
+        span.set_data_i64("count", 2);
+        span.set_status(true);
+        span.finish();
+
+        let span = TraceSpan::child("test", "child");
+        span.set_status(false);
     }
 
     #[test]
