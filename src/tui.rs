@@ -7961,6 +7961,57 @@ mod tests {
     }
 
     #[test]
+    fn render_helpers_cover_image_editor_help_and_mode_branches() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.profile_name = Some("Ada Lovelace".to_string());
+        app.lists = vec![test_shopping_list(
+            1,
+            "Groceries",
+            Some("bi-cart-fill"),
+            Some(9),
+            Some("Home / Weekly"),
+            true,
+        )];
+        app.selected_list = 0;
+
+        let image_source = "https://example.test/milk.jpg".to_string();
+        let mut item = sample_item(1, "Buy milk");
+        item.image_url = Some(image_source.clone());
+        app.items = vec![item];
+        app.detail_image = Some(DetailImageState {
+            source: image_source,
+            protocol: app
+                .picker
+                .new_resize_protocol(DynamicImage::new_rgba8(2, 2)),
+        });
+        app.profile_image = Some(DetailImageState {
+            source: "https://example.test/profile.png".to_string(),
+            protocol: app
+                .picker
+                .new_resize_protocol(DynamicImage::new_rgba8(2, 2)),
+        });
+        app.show_help = true;
+        app.open_filter_editor().expect("filter editor should open");
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+
+        app.show_help = false;
+        app.editor = None;
+        app.mode = ViewMode::Kanban;
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+
+        app.mode = ViewMode::Calendar;
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+
+        app.legal_consent_pending = true;
+        app.legal_accepting = true;
+        app.legal_pending_docs.clear();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+    }
+
+    #[test]
     fn empty_selection_helpers_are_inert() {
         assert_eq!(shifted_index(0, 3, 0), 0);
         assert_eq!(shifted_index(99, -3, 0), 0);
