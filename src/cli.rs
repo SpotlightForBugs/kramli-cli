@@ -1402,6 +1402,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_items_dispatches_all_subcommands() {
+        let responses = vec![
+            json!([{"id": 1, "list_id": 7, "text": "Milk", "is_done": false}]).to_string(),
+            json!([]).to_string(),
+            json!([{"id": 7, "name": "Groceries"}]).to_string(),
+            json!([{"id": 5, "list_id": 7, "text": "Shown", "is_done": false}]).to_string(),
+            item_response(9, "Created"),
+            item_response(9, "Updated"),
+            json!({"id": 9, "text": "Done", "is_done": true}).to_string(),
+            json!({"upvoted_by_me": true, "upvote_count": 1}).to_string(),
+            json!({"ok": true}).to_string(),
+            json!([{"id": 2, "list_id": 7, "text": "Done", "is_done": true}]).to_string(),
+            json!({"id": 3, "text": "Comment"}).to_string(),
+            json!({"ok": true}).to_string(),
+            json!({"count": 1}).to_string(),
+        ];
+        let (base_url, requests) = server_with_base_url(responses).await;
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+                (TEST_KRAMLI_AUTO_HANDOFF_ENV, "false"),
+            ],
+            || async {
+                run_items(
+                    ItemCmd::List {
+                        list_id: 7,
+                        open: false,
+                        completed: false,
+                        state: None,
+                        contains: None,
+                        newest: false,
+                        oldest: false,
+                        limit: None,
+                    },
+                    true,
+                )
+                .await
+                .expect("items list should dispatch");
+                run_items(ItemCmd::Show { id: 5 }, true)
+                    .await
+                    .expect("items show should dispatch");
+                run_items(
+                    ItemCmd::Add {
+                        list_id: 7,
+                        text: "Created".to_string(),
+                        quantity: None,
+                        due: None,
+                        due_time: None,
+                        planned: None,
+                        planned_time: None,
+                        reminder: None,
+                        reminder_time: None,
+                        reminder_days_before: None,
+                        reminder_offsets: None,
+                        travel_time_minutes: None,
+                        priority: None,
+                        tags: None,
+                        notes: None,
+                        parent: None,
+                        assign: None,
+                        color: None,
+                        progress: None,
+                    },
+                    true,
+                )
+                .await
+                .expect("items add should dispatch");
+                run_items(
+                    ItemCmd::Update {
+                        id: 9,
+                        text: Some("Updated".to_string()),
+                        quantity: None,
+                        due: None,
+                        due_time: None,
+                        planned: None,
+                        planned_time: None,
+                        reminder: None,
+                        reminder_time: None,
+                        reminder_days_before: None,
+                        reminder_offsets: None,
+                        travel_time_minutes: None,
+                        priority: None,
+                        tags: Some("done".to_string()),
+                        notes: None,
+                        assign: None,
+                        color: None,
+                        progress: None,
+                    },
+                    true,
+                )
+                .await
+                .expect("items update should dispatch");
+                run_items(ItemCmd::Done { id: 9 }, true)
+                    .await
+                    .expect("items done should dispatch");
+                run_items(ItemCmd::Vote { id: 9 }, true)
+                    .await
+                    .expect("items vote should dispatch");
+                run_items(ItemCmd::Delete { id: 9 }, true)
+                    .await
+                    .expect("items delete should dispatch");
+                run_items(ItemCmd::DoneList { list_id: 7 }, true)
+                    .await
+                    .expect("items done-list should dispatch");
+                run_items(
+                    ItemCmd::Comment {
+                        id: 9,
+                        text: "Comment".to_string(),
+                    },
+                    true,
+                )
+                .await
+                .expect("items comment should dispatch");
+                run_items(ItemCmd::CheckAll { list_id: 7 }, true)
+                    .await
+                    .expect("items check-all should dispatch");
+                run_items(ItemCmd::ClearDone { list_id: 7 }, true)
+                    .await
+                    .expect("items clear-done should dispatch");
+            },
+        )
+        .await;
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests[0], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[1], "GET /api/items/5/comments HTTP/1.1");
+        assert_eq!(requests[2], "GET /api/lists HTTP/1.1");
+        assert_eq!(requests[3], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[4], "POST /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[5], "PUT /api/items/9 HTTP/1.1");
+        assert_eq!(requests[6], "PATCH /api/items/9/done HTTP/1.1");
+        assert_eq!(requests[7], "PATCH /api/items/9/upvote HTTP/1.1");
+        assert_eq!(requests[8], "DELETE /api/items/9 HTTP/1.1");
+        assert_eq!(requests[9], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[10], "POST /api/items/9/comments HTTP/1.1");
+        assert_eq!(requests[11], "POST /api/lists/7/check-all HTTP/1.1");
+        assert_eq!(requests[12], "POST /api/lists/7/clear-done HTTP/1.1");
+    }
+
+    #[tokio::test]
     async fn folder_member_and_key_commands_cover_api_paths() {
         let responses = vec![
             json!([{"id": 3, "name": "House", "icon": "folder", "color": "#fff"}])
