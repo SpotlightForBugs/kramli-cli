@@ -1573,6 +1573,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn account_security_handoff_ping_and_config_commands_cover_api_paths() {
+        let profile = serde_json::to_string(&sample_profile(Some("en"))).unwrap();
+        let security = json!({
+            "security": {
+                "level_label": "Strong",
+                "score": 5,
+                "max_score": 7,
+                "factors": [
+                    {"label": "Password", "met": true},
+                    {"label": "Two-factor", "met": false}
+                ]
+            },
+            "security_email_login_alerts": false
+        })
+        .to_string();
+        let responses = vec![
+            profile.clone(),
+            profile,
+            security.clone(),
+            security,
+            json!({"ok": true, "message": "confirmed"}).to_string(),
+            json!({"ok": false, "error": "bad token"}).to_string(),
+            json!({"legal": {"pending": []}}).to_string(),
+            json!({"legal": {"pending": [{"key": "privacy"}]}}).to_string(),
+            json!({"ok": true, "viewing": true}).to_string(),
+            json!({"ok": true, "continued": true}).to_string(),
+            json!({"ok": true, "cleared": true}).to_string(),
+            json!({"ok": true}).to_string(),
+            json!({"ok": true}).to_string(),
+        ];
+        let (base_url, requests) = server_with_base_url(responses).await;
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_profile(false)
+                    .await
+                    .expect("profile human should fetch profile");
+                run_profile(true)
+                    .await
+                    .expect("profile json should fetch profile");
+                run_security(SecurityCmd::Status, false)
+                    .await
+                    .expect("security human should fetch status");
+                run_security(SecurityCmd::Status, true)
+                    .await
+                    .expect("security json should fetch status");
+                run_security(
+                    SecurityCmd::Ack {
+                        token: Some(" token-1 ".to_string()),
+                    },
+                    false,
+                )
+                .await
+                .expect("security ack should confirm");
+                assert!(run_security(
+                    SecurityCmd::Ack {
+                        token: Some("token-2".to_string()),
+                    },
+                    false,
+                )
+                .await
+                .is_err());
+                assert!(run_security(SecurityCmd::Ack { token: None }, false)
+                    .await
+                    .is_err());
+
+                run_accept_terms(Some(vec!["agb".to_string()]), false)
+                    .await
+                    .expect("accept terms human should post");
+                run_accept_terms(Some(vec!["privacy".to_string()]), true)
+                    .await
+                    .expect("accept terms json should post");
+                assert!(run_accept_terms(Some(vec!["unknown".to_string()]), false)
+                    .await
+                    .is_err());
+
+                run_handoff(
+                    HandoffCmd::Viewing {
+                        list_id: 7,
+                        list_name: Some("Groceries".to_string()),
+                        device: Some("Laptop".to_string()),
+                    },
+                    false,
+                )
+                .await
+                .expect("handoff viewing should post");
+                run_handoff(
+                    HandoffCmd::Continue {
+                        list_id: 7,
+                        list_name: None,
+                        device: None,
+                    },
+                    true,
+                )
+                .await
+                .expect("handoff continue json should post");
+                run_handoff(HandoffCmd::Clear, false)
+                    .await
+                    .expect("handoff clear should post");
+
+                run_ping(true).await.expect("ping json should succeed");
+                run_ping(false).await.expect("ping human should succeed");
+                run_config(true).expect("config json should render");
+                run_config(false).expect("config human should render");
+            },
+        )
+        .await;
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests[0], "GET /api/profile HTTP/1.1");
+        assert_eq!(requests[1], "GET /api/profile HTTP/1.1");
+        assert_eq!(requests[2], "GET /api/security HTTP/1.1");
+        assert_eq!(requests[3], "GET /api/security HTTP/1.1");
+        assert_eq!(requests[4], "POST /api/security/login-ack HTTP/1.1");
+        assert_eq!(requests[5], "POST /api/security/login-ack HTTP/1.1");
+        assert_eq!(requests[6], "POST /api/accept-terms HTTP/1.1");
+        assert_eq!(requests[7], "POST /api/accept-terms HTTP/1.1");
+        assert_eq!(requests[8], "POST /api/activity/viewing HTTP/1.1");
+        assert_eq!(
+            requests[9],
+            "POST /api/activity/continue-on-device HTTP/1.1"
+        );
+        assert_eq!(requests[10], "POST /api/activity/clear HTTP/1.1");
+        assert_eq!(requests[11], "GET /api/ping HTTP/1.1");
+        assert_eq!(requests[12], "GET /api/ping HTTP/1.1");
+    }
+
+    #[tokio::test]
     async fn env_var_helper_restores_existing_values() {
         std::env::set_var(TEST_KRAMLI_API_KEY_ENV, "before");
         with_env_vars_async(&[(TEST_KRAMLI_API_KEY_ENV, "during")], || async {
