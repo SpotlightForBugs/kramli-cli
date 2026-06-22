@@ -8550,6 +8550,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_apply_helpers_cover_profile_lists_images_and_load_messages() {
+        let mut app = test_app();
+
+        app.apply_profile_result(Err("profile failed".to_string()));
+        assert_eq!(app.status.as_deref(), Some("profile failed"));
+
+        app.beta_consent_pending = true;
+        app.apply_profile_result(Ok(Profile {
+            id: Some(1),
+            display_name: Some("Ada".to_string()),
+            email: Some("ada@example.test".to_string()),
+            photo_url: Some(" https://example.test/ada.png ".to_string()),
+            lang: Some("en".to_string()),
+            is_anonymous: Some(false),
+            created_at: None,
+            legal: Some(crate::models::ProfileLegalStatus {
+                pending: vec![crate::models::ProfilePendingLegalDoc {
+                    key: Some("privacy".to_string()),
+                }],
+            }),
+            terms_accepted: Some(false),
+        }));
+        assert_eq!(app.profile_name.as_deref(), Some("Ada"));
+        assert_eq!(
+            app.profile_photo_url.as_deref(),
+            Some("https://example.test/ada.png")
+        );
+        assert!(app.legal_consent_pending);
+
+        app.apply_accept_terms_result(Err("accept failed".to_string()));
+        assert_eq!(app.status.as_deref(), Some("accept failed"));
+        app.apply_accept_terms_result(Ok(
+            serde_json::json!({"legal": {"pending": [{"key": "agb"}]}}),
+        ));
+        assert!(app.legal_consent_pending);
+        app.apply_accept_terms_result(Ok(serde_json::json!({"legal": {"pending": []}})));
+        assert!(!app.legal_consent_pending);
+
+        app.apply_lists_result(Err("lists failed".to_string()));
+        assert_eq!(app.status.as_deref(), Some("lists failed"));
+        app.apply_lists_result(Ok(Vec::new()));
+        assert_eq!(app.status.as_deref(), Some(tr("output-no-lists").as_str()));
+        app.apply_lists_result(Ok(vec![test_list()]));
+        assert_eq!(app.selected_list_id(), Some(1));
+
+        app.apply_items_result(2, Ok(vec![sample_item(20, "Cached")]));
+        assert!(app.items_cache.contains_key(&2));
+        app.apply_items_result(1, Err("items failed".to_string()));
+        assert_eq!(app.status.as_deref(), Some("items failed"));
+        app.apply_items_result(1, Ok(vec![sample_item(1, "Alpha"), sample_item(2, "Beta")]));
+        assert_eq!(app.items.len(), 2);
+
+        app.apply_comments_result(
+            1,
+            Ok(vec![ItemComment {
+                id: 7,
+                text: Some("Nice".to_string()),
+                user_id: Some(3),
+                user_name: Some("Ada".to_string()),
+                user_email: None,
+                created_at: Some("2026-01-01".to_string()),
+            }]),
+        );
+        assert_eq!(app.comments_cache.get(&1).map(Vec::len), Some(1));
+
+        let mut image_bytes = std::io::Cursor::new(Vec::new());
+        DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut image_bytes, image::ImageFormat::Png)
+            .expect("test image should encode");
+        let bytes = image_bytes.into_inner();
+
+        app.pending_detail_image = Some("detail.png".to_string());
+        app.apply_detail_image_result("other.png".to_string(), Ok(bytes.clone()));
+        assert_eq!(app.pending_detail_image.as_deref(), Some("detail.png"));
+        app.apply_detail_image_result("detail.png".to_string(), Err("no image".to_string()));
+        assert_eq!(app.detail_image_note.as_deref(), Some("—"));
+        app.pending_detail_image = Some("detail.png".to_string());
+        app.apply_detail_image_result("detail.png".to_string(), Ok(Vec::new()));
+        assert_eq!(app.detail_image_note.as_deref(), Some("—"));
+        app.pending_detail_image = Some("detail.png".to_string());
+        app.apply_detail_image_result("detail.png".to_string(), Ok(bytes.clone()));
+        assert!(app.detail_image.is_some());
+
+        app.pending_profile_image = Some("profile.png".to_string());
+        app.apply_profile_image_result("other.png".to_string(), Ok(bytes.clone()));
+        assert_eq!(app.pending_profile_image.as_deref(), Some("profile.png"));
+        app.apply_profile_image_result("profile.png".to_string(), Err("no image".to_string()));
+        assert!(app.profile_image.is_none());
+        app.pending_profile_image = Some("profile.png".to_string());
+        app.apply_profile_image_result("profile.png".to_string(), Ok(bytes));
+        assert!(app.profile_image.is_some());
+
+        app.pending_list_icons.insert("cart".to_string());
+        app.apply_list_icon_result("cart".to_string(), Err("missing".to_string()));
+        assert!(app.failed_list_icons.contains("cart"));
+        app.pending_list_icons.insert("tag".to_string());
+        app.apply_list_icon_result("tag".to_string(), Ok(DynamicImage::new_rgba8(2, 2)));
+        assert!(!app.pending_list_icons.contains("tag"));
+
+        app.pending_open_image = Some("bad.png".to_string());
+        app.apply_open_image_result("bad.png".to_string(), Err("open failed".to_string()));
+        assert_eq!(app.status.as_deref(), Some("open failed"));
+        app.pending_open_image = Some("ok.png".to_string());
+        app.apply_open_image_result("ok.png".to_string(), Ok("opened".to_string()));
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|value| value.contains("opened")));
+
+        app.tx
+            .send(LoadMessage::Comments {
+                item_id: 2,
+                result: Ok(Vec::new()),
+            })
+            .expect("load message should send");
+        app.tx
+            .send(LoadMessage::AutoHandoffSent)
+            .expect("load message should send");
+        assert!(app.drain_load_messages());
+        assert!(app.comments_cache.contains_key(&2));
+        assert!(!app.drain_load_messages());
+    }
+
+    #[tokio::test]
     async fn editor_key_and_save_helpers_cover_refactored_branches() {
         let mut app = test_app();
         app.lists = vec![test_list()];
