@@ -530,6 +530,10 @@ mod tests {
 
     fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK.lock().expect("telemetry env lock poisoned");
+        with_env_var_locked(key, value, f)
+    }
+
+    fn with_env_var_locked<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
         let previous = std::env::var(key).ok();
         match value {
             Some(value) => std::env::set_var(key, value),
@@ -610,9 +614,10 @@ mod tests {
 
     #[test]
     fn telemetry_env_helper_restores_existing_values() {
+        let _guard = ENV_LOCK.lock().expect("telemetry env lock poisoned");
         std::env::set_var(KRAMLI_TRACES_SAMPLE_RATE_ENV, "0.5");
 
-        with_env_var(KRAMLI_TRACES_SAMPLE_RATE_ENV, Some("0.25"), || {
+        with_env_var_locked(KRAMLI_TRACES_SAMPLE_RATE_ENV, Some("0.25"), || {
             assert_eq!(
                 std::env::var(KRAMLI_TRACES_SAMPLE_RATE_ENV).as_deref(),
                 Ok("0.25")

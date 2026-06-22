@@ -77,19 +77,23 @@ impl Config {
     /// Persist non-sensitive configuration to disk with user-only permissions.
     pub(crate) fn save(&self) -> Result<(), String> {
         let path = Self::path();
+        self.save_to_path(&path)
+    }
+
+    fn save_to_path(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| tr_args("config-create-dir-error", &[("error", e.to_string())]))?;
         }
         let data = serde_json::to_string_pretty(&self.file).map_err(|e| e.to_string())?;
-        fs::write(&path, &data)
+        fs::write(path, &data)
             .map_err(|e| tr_args("config-save-error", &[("error", e.to_string())]))?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o600);
-            fs::set_permissions(&path, perms)
+            fs::set_permissions(path, perms)
                 .map_err(|e| tr_args("config-permissions-error", &[("error", e.to_string())]))?;
         }
         Ok(())
@@ -357,6 +361,7 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const HOME_ENV: &str = "HOME";
     const TEST_BOOL_ENV: &str = "KRAMLI_TEST_BOOL";
 
     fn with_env_vars<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
@@ -499,6 +504,48 @@ mod tests {
     }
 
     #[test]
+    fn missing_config_file_and_save_path_are_covered() {
+        let path = std::env::temp_dir()
+            .join("kramli-config-test-save")
+            .join(format!("{}-config.json", std::process::id()));
+        let cfg = Config::load_from_path(&path);
+        assert_eq!(cfg.base_url(), DEFAULT_BASE_URL);
+
+        let mut cfg = config_file(Some(true), Some(false));
+        cfg.set_base_url(Some("https://saved.example".to_string()));
+        cfg.save_to_path(&path).expect("save config fixture");
+
+        let saved = Config::load_from_path(&path);
+        assert_eq!(saved.base_url(), "https://saved.example");
+        assert!(saved.telemetry_enabled());
+        assert!(!saved.bootstrap_icons_enabled());
+
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+
+    #[test]
+    fn save_wrapper_uses_default_config_path() {
+        let home = std::env::temp_dir().join(format!("kramli-config-home-{}", std::process::id()));
+        let home_value = home.to_string_lossy().to_string();
+
+        with_env_vars(&[(HOME_ENV, home_value.as_str())], || {
+            let mut cfg = config_file(Some(true), Some(true));
+            cfg.set_base_url(Some("https://home.example".to_string()));
+            cfg.save().expect("save config via default path");
+
+            let path = Config::path();
+            assert!(path.exists());
+            let saved = Config::load_from_path(&path);
+            assert_eq!(saved.base_url(), "https://home.example");
+        });
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn keychain_fallback_branches_are_testable_without_system_keychain() {
         let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
         *TEST_KEYCHAIN_API_KEY
@@ -542,6 +589,21 @@ mod tests {
                 assert!(cfg.bootstrap_icons_preference_set());
             },
         );
+
+        with_env_vars(&[(KRAMLI_URL_ENV, ""), (KRAMLI_API_KEY_ENV, "")], || {
+            *TEST_KEYCHAIN_API_KEY
+                .lock()
+                .expect("keychain test lock poisoned") = Some(Ok(None));
+            let cfg = config_file(None, None);
+            assert_eq!(cfg.base_url(), DEFAULT_BASE_URL);
+            assert_eq!(cfg.api_key(), None);
+            assert_eq!(cfg.require_api_key(), Err(tr("config-not-logged-in")));
+            assert!(!cfg.has_api_key());
+            assert!(!cfg.api_key_from_env());
+            *TEST_KEYCHAIN_API_KEY
+                .lock()
+                .expect("keychain test lock poisoned") = None;
+        });
     }
 
     #[test]
