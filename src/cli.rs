@@ -1921,6 +1921,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_human_output_covers_logged_out_branch() {
+        with_env_vars_async(&[(TEST_KRAMLI_API_KEY_ENV, "")], || async {
+            run_status(false)
+                .await
+                .expect("logged out status should render");
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn env_var_helper_restores_existing_values() {
         std::env::set_var(TEST_KRAMLI_API_KEY_ENV, "before");
         with_env_vars_async(&[(TEST_KRAMLI_API_KEY_ENV, "during")], || async {
