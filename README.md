@@ -24,9 +24,6 @@
   </a>
 </p>
 
-<p align="center">
-  Command-line client for <a href="https://kramli.de">Kramli</a> >_ shopping lists, todos, and shared lists from your terminal.
-</p>
 
 <p align="center">
   <img src=".github/assets/og-image.jpg" alt="Kramli app preview" width="640">
