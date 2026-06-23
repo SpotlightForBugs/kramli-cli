@@ -11,7 +11,7 @@
 
 </p>
 <p align="center">
-  Command-line client for <a href="https://kramli.de">Kramli</a> — shopping lists, todos, and shared lists from your terminal.
+  Command-line client for <a href="https://kramli.de">Kramli</a> >_ shopping lists, todos, and shared lists from your terminal.
 </p>
 
 <p align="center">
