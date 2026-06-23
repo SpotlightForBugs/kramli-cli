@@ -4,12 +4,26 @@
 
 <h1 align="center">kramli-cli</h1>
 
- <p align="center"> 
-  
-[![DeepSource](https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli.svg/?label=code+coverage&show_trend=true&token=R3u8WNRSja7eRF8JiJrmNkUZ)](https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli/) 
-  [![DeepSource](https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli.svg/?label=resolved+issues&show_trend=true&token=R3u8WNRSja7eRF8JiJrmNkUZ)](https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli/)</p>
-
+<p align="center">
+  <strong>Command-line client for <a href="https://kramli.de">Kramli</a></strong><br>
+  Shopping lists, todos, and shared lists <i>>_</i> managed from your terminal.
 </p>
+
+<p align="center">
+  <a href="https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli/">
+    <img src="https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli.svg/?label=code+coverage&show_trend=true&token=R3u8WNRSja7eRF8JiJrmNkUZ" alt="Code Coverage">
+  </a>
+  <a href="https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli/">
+    <img src="https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli.svg/?label=resolved+issues&show_trend=true&token=R3u8WNRSja7eRF8JiJrmNkUZ" alt="Resolved Issues">
+  </a>
+  <a href="https://github.com/SpotlightForBugs/kramli-cli/releases/latest">
+    <img src="https://img.shields.io/github/v/release/SpotlightForBugs/kramli-cli" alt="Latest Release">
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
+  </a>
+</p>
+
 <p align="center">
   Command-line client for <a href="https://kramli.de">Kramli</a> >_ shopping lists, todos, and shared lists from your terminal.
 </p>
