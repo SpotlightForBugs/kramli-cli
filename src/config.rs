@@ -360,29 +360,29 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static TEST_KEYCHAIN_LOCK: Mutex<()> = Mutex::new(());
     const HOME_ENV: &str = "HOME";
     const TEST_BOOL_ENV: &str = "KRAMLI_TEST_BOOL";
 
     fn with_env_vars<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
-        let previous: Vec<_> = vars
-            .iter()
-            .map(|(name, _)| (*name, std::env::var(name).ok()))
-            .collect();
-        for (name, value) in vars {
-            std::env::set_var(name, value);
-        }
+        crate::test_env::with_env_vars(vars, f)
+    }
 
-        let result = f();
-
-        for (name, value) in previous {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-        result
+    fn with_clean_config_env<T>(f: impl FnOnce() -> T) -> T {
+        with_env_vars(
+            &[
+                (KRAMLI_URL_ENV, ""),
+                (KRAMLI_API_KEY_ENV, ""),
+                (DO_NOT_TRACK_ENV, ""),
+                (KRAMLI_NO_TELEMETRY_ENV, ""),
+                (KRAMLI_TELEMETRY_ENV, ""),
+                (KRAMLI_BOOTSTRAP_ICONS_ENV, ""),
+                (KRAMLI_TUI_BOOTSTRAP_ICONS_ENV, ""),
+                (KRAMLI_LOAD_BOOTSTRAP_ICONS_ENV, ""),
+                (TEST_BOOL_ENV, ""),
+            ],
+            f,
+        )
     }
 
     fn config_file(
@@ -399,7 +399,7 @@ mod tests {
     }
 
     fn with_test_keychain<T>(value: Result<Option<String>, String>, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
+        let _guard = TEST_KEYCHAIN_LOCK.lock().expect("test lock poisoned");
         {
             let mut keychain = TEST_KEYCHAIN_API_KEY
                 .lock()
@@ -418,20 +418,24 @@ mod tests {
 
     #[test]
     fn unset_preferences_are_disabled_until_user_answers() {
-        let cfg = config_file(None, None);
-        assert!(!cfg.telemetry_enabled());
-        assert!(!cfg.bootstrap_icons_enabled());
+        with_clean_config_env(|| {
+            let cfg = config_file(None, None);
+            assert!(!cfg.telemetry_enabled());
+            assert!(!cfg.bootstrap_icons_enabled());
+        });
     }
 
     #[test]
     fn saved_preferences_control_telemetry_and_bootstrap_icons() {
-        let cfg = config_file(Some(true), Some(true));
-        assert!(cfg.telemetry_enabled());
-        assert!(cfg.bootstrap_icons_enabled());
+        with_clean_config_env(|| {
+            let cfg = config_file(Some(true), Some(true));
+            assert!(cfg.telemetry_enabled());
+            assert!(cfg.bootstrap_icons_enabled());
 
-        let cfg = config_file(Some(false), Some(false));
-        assert!(!cfg.telemetry_enabled());
-        assert!(!cfg.bootstrap_icons_enabled());
+            let cfg = config_file(Some(false), Some(false));
+            assert!(!cfg.telemetry_enabled());
+            assert!(!cfg.bootstrap_icons_enabled());
+        });
     }
 
     #[test]
@@ -445,45 +449,48 @@ mod tests {
 
     #[test]
     fn config_getters_setters_and_reset_cover_persisted_fields() {
-        let mut cfg = config_file(Some(true), Some(false));
+        with_clean_config_env(|| {
+            let mut cfg = config_file(Some(true), Some(false));
 
-        cfg.set_base_url(Some("https://example.test".to_string()));
-        assert_eq!(cfg.base_url(), "https://example.test");
+            cfg.set_base_url(Some("https://example.test".to_string()));
+            assert_eq!(cfg.base_url(), "https://example.test");
 
-        cfg.set_telemetry_enabled(false);
-        cfg.set_bootstrap_icons_enabled(true);
-        assert!(cfg.telemetry_preference_set());
-        assert!(cfg.bootstrap_icons_preference_set());
-        assert!(!cfg.telemetry_enabled());
-        assert!(cfg.bootstrap_icons_enabled());
+            cfg.set_telemetry_enabled(false);
+            cfg.set_bootstrap_icons_enabled(true);
+            assert!(cfg.telemetry_preference_set());
+            assert!(cfg.bootstrap_icons_preference_set());
+            assert!(!cfg.telemetry_enabled());
+            assert!(cfg.bootstrap_icons_enabled());
 
-        cfg.set_update_check_state(
-            42,
-            Some("v9.9.9".to_string()),
-            Some("https://example.test/release".to_string()),
-        );
-        assert_eq!(cfg.update_check_last(), Some(42));
-        assert_eq!(cfg.update_check_latest().as_deref(), Some("v9.9.9"));
-        assert_eq!(
-            cfg.update_check_url().as_deref(),
-            Some("https://example.test/release")
-        );
+            cfg.set_update_check_state(
+                42,
+                Some("v9.9.9".to_string()),
+                Some("https://example.test/release".to_string()),
+            );
+            assert_eq!(cfg.update_check_last(), Some(42));
+            assert_eq!(cfg.update_check_latest().as_deref(), Some("v9.9.9"));
+            assert_eq!(
+                cfg.update_check_url().as_deref(),
+                Some("https://example.test/release")
+            );
 
-        cfg.reset_privacy_preferences();
-        assert!(!cfg.telemetry_preference_set());
-        assert!(!cfg.bootstrap_icons_preference_set());
+            cfg.reset_privacy_preferences();
+            assert!(!cfg.telemetry_preference_set());
+            assert!(!cfg.bootstrap_icons_preference_set());
+        });
     }
 
     #[test]
     fn load_from_existing_config_file_covers_parse_branch() {
-        let path = std::env::temp_dir().join(format!(
-            "kramli-config-test-{}-{}.json",
-            std::process::id(),
-            1
-        ));
-        fs::write(
-            &path,
-            r#"{
+        with_clean_config_env(|| {
+            let path = std::env::temp_dir().join(format!(
+                "kramli-config-test-{}-{}.json",
+                std::process::id(),
+                1
+            ));
+            fs::write(
+                &path,
+                r#"{
                 "base_url": "https://file.example",
                 "telemetry_enabled": true,
                 "bootstrap_icons_enabled": true,
@@ -491,39 +498,42 @@ mod tests {
                 "update_check_latest": "v9.9.9",
                 "update_check_url": "https://file.example/release"
             }"#,
-        )
-        .expect("write config fixture");
+            )
+            .expect("write config fixture");
 
-        let cfg = Config::load_from_path(&path);
-        assert_eq!(cfg.base_url(), "https://file.example");
-        assert!(cfg.telemetry_enabled());
-        assert!(cfg.bootstrap_icons_enabled());
-        assert_eq!(cfg.update_check_last(), Some(123));
+            let cfg = Config::load_from_path(&path);
+            assert_eq!(cfg.base_url(), "https://file.example");
+            assert!(cfg.telemetry_enabled());
+            assert!(cfg.bootstrap_icons_enabled());
+            assert_eq!(cfg.update_check_last(), Some(123));
 
-        let _ = fs::remove_file(path);
+            let _ = fs::remove_file(path);
+        });
     }
 
     #[test]
     fn missing_config_file_and_save_path_are_covered() {
-        let path = std::env::temp_dir()
-            .join("kramli-config-test-save")
-            .join(format!("{}-config.json", std::process::id()));
-        let cfg = Config::load_from_path(&path);
-        assert_eq!(cfg.base_url(), DEFAULT_BASE_URL);
+        with_clean_config_env(|| {
+            let path = std::env::temp_dir()
+                .join("kramli-config-test-save")
+                .join(format!("{}-config.json", std::process::id()));
+            let cfg = Config::load_from_path(&path);
+            assert_eq!(cfg.base_url(), DEFAULT_BASE_URL);
 
-        let mut cfg = config_file(Some(true), Some(false));
-        cfg.set_base_url(Some("https://saved.example".to_string()));
-        cfg.save_to_path(&path).expect("save config fixture");
+            let mut cfg = config_file(Some(true), Some(false));
+            cfg.set_base_url(Some("https://saved.example".to_string()));
+            cfg.save_to_path(&path).expect("save config fixture");
 
-        let saved = Config::load_from_path(&path);
-        assert_eq!(saved.base_url(), "https://saved.example");
-        assert!(saved.telemetry_enabled());
-        assert!(!saved.bootstrap_icons_enabled());
+            let saved = Config::load_from_path(&path);
+            assert_eq!(saved.base_url(), "https://saved.example");
+            assert!(saved.telemetry_enabled());
+            assert!(!saved.bootstrap_icons_enabled());
 
-        let _ = fs::remove_file(&path);
-        if let Some(parent) = path.parent() {
-            let _ = fs::remove_dir(parent);
-        }
+            let _ = fs::remove_file(&path);
+            if let Some(parent) = path.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+        });
     }
 
     #[test]
@@ -531,39 +541,55 @@ mod tests {
         let home = std::env::temp_dir().join(format!("kramli-config-home-{}", std::process::id()));
         let home_value = home.to_string_lossy().to_string();
 
-        with_env_vars(&[(HOME_ENV, home_value.as_str())], || {
-            let mut cfg = config_file(Some(true), Some(true));
-            cfg.set_base_url(Some("https://home.example".to_string()));
-            cfg.save().expect("save config via default path");
+        with_env_vars(
+            &[
+                (HOME_ENV, home_value.as_str()),
+                (KRAMLI_URL_ENV, ""),
+                (KRAMLI_API_KEY_ENV, ""),
+                (DO_NOT_TRACK_ENV, ""),
+                (KRAMLI_NO_TELEMETRY_ENV, ""),
+                (KRAMLI_TELEMETRY_ENV, ""),
+                (KRAMLI_BOOTSTRAP_ICONS_ENV, ""),
+                (KRAMLI_TUI_BOOTSTRAP_ICONS_ENV, ""),
+                (KRAMLI_LOAD_BOOTSTRAP_ICONS_ENV, ""),
+                (TEST_BOOL_ENV, ""),
+            ],
+            || {
+                let mut cfg = config_file(Some(true), Some(true));
+                cfg.set_base_url(Some("https://home.example".to_string()));
+                cfg.save().expect("save config via default path");
 
-            let path = Config::path();
-            assert!(path.exists());
-            let saved = Config::load_from_path(&path);
-            assert_eq!(saved.base_url(), "https://home.example");
-        });
+                let path = Config::path();
+                assert!(path.exists());
+                let saved = Config::load_from_path(&path);
+                assert_eq!(saved.base_url(), "https://home.example");
+            },
+        );
 
         let _ = fs::remove_dir_all(home);
     }
 
     #[test]
     fn keychain_fallback_branches_are_testable_without_system_keychain() {
-        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
-        *TEST_KEYCHAIN_API_KEY
-            .lock()
-            .expect("keychain test lock poisoned") = None;
-        assert_eq!(Config::keychain_api_key(), Ok(None));
-        drop(_guard);
+        with_clean_config_env(|| {
+            let _guard = TEST_KEYCHAIN_LOCK.lock().expect("test lock poisoned");
+            *TEST_KEYCHAIN_API_KEY
+                .lock()
+                .expect("keychain test lock poisoned") = None;
+            assert_eq!(Config::keychain_api_key(), Ok(None));
+            drop(_guard);
 
-        with_test_keychain(Ok(Some("stored-key".to_string())), || {
-            let cfg = config_file(None, None);
-            assert_eq!(cfg.api_key().as_deref(), Some("stored-key"));
-            assert_eq!(cfg.require_api_key().as_deref(), Ok("stored-key"));
-        });
+            with_test_keychain(Ok(Some("stored-key".to_string())), || {
+                let cfg = config_file(None, None);
+                assert_eq!(cfg.api_key().as_deref(), Some("stored-key"));
+                assert_eq!(cfg.require_api_key().as_deref(), Ok("stored-key"));
+            });
 
-        with_test_keychain(Ok(None), || {
-            let cfg = config_file(None, None);
-            assert_eq!(cfg.api_key(), None);
-            assert_eq!(cfg.require_api_key(), Err(tr("config-not-logged-in")));
+            with_test_keychain(Ok(None), || {
+                let cfg = config_file(None, None);
+                assert_eq!(cfg.api_key(), None);
+                assert_eq!(cfg.require_api_key(), Err(tr("config-not-logged-in")));
+            });
         });
     }
 
@@ -614,7 +640,9 @@ mod tests {
         with_env_vars(&[(TEST_BOOL_ENV, "off")], || {
             assert!(!env_is_truthy(TEST_BOOL_ENV));
         });
-        assert!(!env_is_truthy(TEST_BOOL_ENV));
+        with_env_vars(&[(TEST_BOOL_ENV, "")], || {
+            assert!(!env_is_truthy(TEST_BOOL_ENV));
+        });
 
         with_env_vars(
             &[(DO_NOT_TRACK_ENV, "1"), (KRAMLI_TELEMETRY_ENV, "true")],
@@ -640,16 +668,17 @@ mod tests {
 
     #[test]
     fn env_test_helper_restores_existing_values() {
-        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
-        std::env::set_var(TEST_BOOL_ENV, "before");
-        drop(_guard);
+        crate::test_env::with_env_lock(|| {
+            std::env::set_var(TEST_BOOL_ENV, "before");
+        });
 
         with_env_vars(&[(TEST_BOOL_ENV, "during")], || {
             assert_eq!(std::env::var(TEST_BOOL_ENV).as_deref(), Ok("during"));
         });
 
-        let _guard = ENV_LOCK.lock().expect("env test lock poisoned");
-        assert_eq!(std::env::var(TEST_BOOL_ENV).as_deref(), Ok("before"));
-        std::env::remove_var(TEST_BOOL_ENV);
+        crate::test_env::with_env_lock(|| {
+            assert_eq!(std::env::var(TEST_BOOL_ENV).as_deref(), Ok("before"));
+            std::env::remove_var(TEST_BOOL_ENV);
+        });
     }
 }

@@ -440,6 +440,11 @@ mod tests {
     }
 
     #[test]
+    fn parse_search_response_object_with_null_lists_is_rejected() {
+        assert!(SearchResponse::from_value(serde_json::json!({"lists": null})).is_err());
+    }
+
+    #[test]
     fn parse_search_response_accepts_flat_hits() {
         let value = serde_json::json!([
             {

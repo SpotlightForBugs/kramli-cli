@@ -9,18 +9,49 @@ mod models;
 mod output;
 mod telemetry;
 mod tui;
+#[cfg(test)]
+mod test_env;
 
+#[cfg(not(test))]
 use clap::Parser;
 use cli::{Cli, Commands};
 use config::Config;
+#[cfg(not(test))]
 use dialoguer::Confirm;
 use i18n::tr;
+#[cfg(not(test))]
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
+#[cfg(not(test))]
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    if let Err(error) = ensure_first_run_preferences(&cli) {
+    run_with_cli(Cli::parse())
+}
+
+#[cfg(test)]
+fn main() -> ExitCode {
+    ExitCode::SUCCESS
+}
+
+fn run_with_cli(cli: Cli) -> ExitCode {
+    run_with_cli_hooks(
+        cli,
+        ensure_first_run_preferences,
+        || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn run_with_cli_hooks<F, G>(cli: Cli, ensure_prefs: F, build_runtime: G) -> ExitCode
+where
+    F: Fn(&Cli) -> Result<(), String>,
+    G: Fn() -> Result<tokio::runtime::Runtime, String>,
+{
+    if let Err(error) = ensure_prefs(&cli) {
         eprintln!("\x1b[31m{}\x1b[0m {error}", tr("main-error-prefix"));
         return ExitCode::FAILURE;
     }
@@ -29,10 +60,7 @@ fn main() -> ExitCode {
     // consent. PII stays disabled and every event is scrubbed before it leaves
     // the machine.
     let guard = init_telemetry();
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
+    let runtime = match build_runtime() {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("\x1b[31m{}\x1b[0m {error}", tr("main-error-prefix"));
@@ -78,12 +106,37 @@ fn first_run_prompt_blocked(cli: &Cli, stdin_terminal: bool, stdout_terminal: bo
     !should_prompt_first_run_preferences(cli) || !stdin_terminal || !stdout_terminal
 }
 
+#[cfg(not(test))]
 fn ensure_first_run_preferences(cli: &Cli) -> Result<(), String> {
-    if first_run_prompt_blocked(
+    ensure_first_run_preferences_with(
         cli,
         std::io::stdin().is_terminal(),
         std::io::stdout().is_terminal(),
-    ) {
+        |prompt, default_value| {
+            Confirm::new()
+                .with_prompt(prompt)
+                .default(default_value)
+                .interact()
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+#[cfg(test)]
+fn ensure_first_run_preferences(cli: &Cli) -> Result<(), String> {
+    ensure_first_run_preferences_with(cli, false, false, |_, _| Ok(true))
+}
+
+fn ensure_first_run_preferences_with<F>(
+    cli: &Cli,
+    stdin_terminal: bool,
+    stdout_terminal: bool,
+    mut ask_confirm: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str, bool) -> Result<bool, String>,
+{
+    if first_run_prompt_blocked(cli, stdin_terminal, stdout_terminal) {
         return Ok(());
     }
 
@@ -94,30 +147,18 @@ fn ensure_first_run_preferences(cli: &Cli) -> Result<(), String> {
         println!("{}", tr("main-consent-telemetry-title"));
         println!("{}", tr("main-consent-telemetry-body"));
         println!("{}", tr("main-consent-telemetry-change"));
-        let enabled = Confirm::new()
-            .with_prompt(tr("main-consent-telemetry-prompt"))
-            .default(true)
-            .interact()
-            .map_err(|error| error.to_string())?;
+        let enabled = ask_confirm(&tr("main-consent-telemetry-prompt"), true)?;
         cfg.set_telemetry_enabled(enabled);
-        changed = true;
-    }
+        changed = true; }
 
     if !cfg.bootstrap_icons_preference_set() {
         println!();
         println!("{}", tr("main-consent-bootstrap-body"));
-        let enabled = Confirm::new()
-            .with_prompt(tr("main-consent-bootstrap-prompt"))
-            .default(true)
-            .interact()
-            .map_err(|error| error.to_string())?;
+        let enabled = ask_confirm(&tr("main-consent-bootstrap-prompt"), true)?;
         cfg.set_bootstrap_icons_enabled(enabled);
-        changed = true;
-    }
+        changed = true; }
 
-    if changed {
-        cfg.save()?;
-    }
+    if changed { cfg.save()?; }
     Ok(())
 }
 
@@ -144,7 +185,8 @@ fn should_prompt_first_run_preferences(cli: &Cli) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{HandoffCmd, PrivacyCmd};
+    use crate::cli::{HandoffCmd, ListCmd, PrivacyCmd};
+    use crate::config::Config;
     use clap_complete::Shell;
 
     const DO_NOT_TRACK_ENV: &str = "DO_NOT_TRACK";
@@ -155,6 +197,50 @@ mod tests {
             interactive: false,
             command,
         }
+    }
+
+    #[test]
+    fn run_with_cli_hooks_handles_preference_and_runtime_failures() {
+        fn runtime_error() -> Result<tokio::runtime::Runtime, String> {
+            Err("runtime failed".to_string())
+        }
+
+        let cli = cli_for(Some(Commands::Status));
+
+        let preference_failure = run_with_cli_hooks(
+            cli_for(Some(Commands::Status)),
+            |_| Err("pref failed".to_string()),
+            runtime_error,
+        );
+        assert_eq!(preference_failure, ExitCode::FAILURE);
+
+        let runtime_failure = run_with_cli_hooks(cli, |_| Ok(()), runtime_error);
+        assert_eq!(runtime_failure, ExitCode::FAILURE);
+
+        let runtime_success = run_with_cli_hooks(
+            cli_for(Some(Commands::Status)),
+            |_| Ok(()),
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())
+            },
+        );
+        assert_eq!(runtime_success, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn run_with_cli_covers_success_and_error_outcomes() {
+        assert_eq!(run_with_cli(cli_for(Some(Commands::Status))), ExitCode::SUCCESS);
+        assert_eq!(
+            run_with_cli(cli_for(Some(Commands::Lists {
+                action: ListCmd::Resolve {
+                    reference: " ".to_string()
+                }
+            }))),
+            ExitCode::FAILURE
+        );
     }
 
     #[test]
@@ -225,15 +311,100 @@ mod tests {
 
     #[test]
     fn telemetry_init_reads_disabled_environment() {
-        std::env::set_var(DO_NOT_TRACK_ENV, "1");
-        let guard = init_telemetry();
-        std::env::remove_var(DO_NOT_TRACK_ENV);
-        assert!(guard.is_none());
+        crate::test_env::with_env_vars(&[(DO_NOT_TRACK_ENV, "1")], || {
+            let guard = init_telemetry();
+            assert!(guard.is_none());
+        });
     }
 
     #[test]
     fn telemetry_init_can_enable_guard_from_environment() {
         let guard = init_telemetry_when(true);
         assert!(guard.is_some());
+    }
+
+    #[test]
+    fn test_main_entrypoint_is_inert_under_cfg_test() {
+        assert_eq!(main(), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn run_with_cli_can_capture_errors_when_enabled() {
+        crate::test_env::with_env_vars(
+            &[("KRAMLI_TELEMETRY", "1"), ("KRAMLI_CAPTURE_COMMAND_ERRORS", "1")],
+            || {
+                let exit = run_with_cli(cli_for(Some(Commands::Lists {
+                    action: ListCmd::Resolve {
+                        reference: " ".to_string(),
+                    },
+                })));
+                assert_eq!(exit, ExitCode::FAILURE);
+            },
+        );
+    }
+
+    #[test]
+    fn first_run_prompt_helper_covers_confirm_save_and_error_paths() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-main-first-run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0_u128, |value| value.as_nanos())
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+
+        crate::test_env::with_env_vars(
+            &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("config root should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("config root should be valid utf-8"),
+                ),
+                ("DO_NOT_TRACK", ""),
+                ("KRAMLI_NO_TELEMETRY", ""),
+                ("KRAMLI_TELEMETRY", ""),
+                ("KRAMLI_BOOTSTRAP_ICONS", ""),
+                ("KRAMLI_TUI_BOOTSTRAP_ICONS", ""),
+                ("KRAMLI_LOAD_BOOTSTRAP_ICONS", ""),
+            ],
+            || {
+                let cli = cli_for(Some(Commands::Status));
+                let mut prompts = Vec::new();
+                ensure_first_run_preferences_with(&cli, true, true, |prompt, default| {
+                    prompts.push((prompt.to_string(), default));
+                    Ok(false)
+                })
+                .expect("prompt helper should succeed");
+
+                assert_eq!(prompts.len(), 2);
+                assert!(prompts.iter().all(|(_, default)| *default));
+
+                let saved = Config::load();
+                assert!(saved.telemetry_preference_set());
+                assert!(saved.bootstrap_icons_preference_set());
+                assert!(!saved.telemetry_enabled());
+                assert!(!saved.bootstrap_icons_enabled());
+
+                let _ = std::fs::remove_file(Config::path());
+
+                let failing = ensure_first_run_preferences_with(
+                    &cli_for(Some(Commands::Handoff {
+                        action: HandoffCmd::Clear,
+                    })),
+                    true,
+                    true,
+                    |_, _| Err("prompt failed".to_string()),
+                );
+                assert!(failing.is_err());
+            },
+        );
     }
 }

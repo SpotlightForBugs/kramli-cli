@@ -859,7 +859,11 @@ mod tests {
         let handle = tokio::spawn(async move {
             let mut requests = Vec::new();
             for response in responses {
-                let (mut stream, _) = listener.accept().await.expect("accept request");
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .expect("test server accept timed out")
+                        .expect("accept request");
                 let mut buf = vec![0_u8; 8192];
                 let n = stream.read(&mut buf).await.expect("read request");
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();

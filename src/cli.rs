@@ -19,6 +19,8 @@ use crate::telemetry;
 const NO_COLOR_ENV: &str = "NO_COLOR";
 const KRAMLI_DEVICE_LABEL_ENV: &str = "KRAMLI_DEVICE_LABEL";
 const KRAMLI_ACK_TOKEN_ENV: &str = "KRAMLI_ACK_TOKEN";
+const KRAMLI_BATCH_EXECUTABLE_ENV: &str = "KRAMLI_BATCH_EXECUTABLE";
+const KRAMLI_UPDATE_CHECK_URL_ENV: &str = "KRAMLI_UPDATE_CHECK_URL";
 
 #[derive(Parser)]
 #[command(
@@ -315,6 +317,11 @@ mod tests {
     }
 
     #[test]
+    fn encode_list_slug_zero_value_uses_single_zero_character() {
+        assert_eq!(encode_list_slug(LIST_ID_XOR_KEY), "0");
+    }
+
+    #[test]
     fn resolves_private_list_urls_with_hash_item_fragments() {
         let slug = encode_list_slug(46);
 
@@ -364,6 +371,12 @@ mod tests {
     #[test]
     fn rejects_empty_list_references() {
         assert!(resolve_list_reference("  ").is_err());
+    }
+
+    #[test]
+    fn rejects_slug_references_that_overflow_decoding() {
+        let overflowing = "a".repeat(200);
+        assert!(resolve_list_reference(&overflowing).is_err());
     }
 
     #[test]
@@ -731,10 +744,10 @@ mod tests {
         let resolved_profile = sample_profile(Some("fr-FR"));
         assert_eq!(effective_lang_source(&resolved_profile), "resolved");
 
-        std::env::set_var(TEST_KRAMLI_LANG_ENV, "de");
-        assert_eq!(effective_lang_source(&resolved_profile), "env");
-        apply_profile_locale_now(&sample_profile(Some("fr")));
-        std::env::remove_var(TEST_KRAMLI_LANG_ENV);
+        crate::test_env::with_env_vars(&[(TEST_KRAMLI_LANG_ENV, "de")], || {
+            assert_eq!(effective_lang_source(&resolved_profile), "env");
+            apply_profile_locale_now(&sample_profile(Some("fr")));
+        });
 
         let empty_profile = sample_profile(Some("   "));
         assert_eq!(profile_lang(&empty_profile), None);
@@ -757,11 +770,48 @@ mod tests {
 
     #[tokio::test]
     async fn profile_locale_auto_apply_covers_skip_guards() {
-        std::env::set_var(TEST_KRAMLI_LANG_ENV, "en");
-        maybe_apply_profile_locale(Some(&Commands::Status)).await;
-        std::env::remove_var(TEST_KRAMLI_LANG_ENV);
+        with_env_vars_async(&[(TEST_KRAMLI_LANG_ENV, "en")], || async {
+            maybe_apply_profile_locale(Some(&Commands::Status)).await;
+        })
+        .await;
 
         maybe_apply_profile_locale(Some(&Commands::Login { url: None })).await;
+    }
+
+    #[tokio::test]
+    async fn profile_locale_auto_apply_covers_api_failure_and_success_paths() {
+        let command = Commands::Status;
+        crate::i18n::set_locale("en");
+
+        with_env_vars_async(
+            &[("KRAMLI_URL", "http://::invalid-url"), (TEST_KRAMLI_API_KEY_ENV, "kramli_test")],
+            || async {
+                maybe_apply_profile_locale(Some(&command)).await;
+            },
+        )
+        .await;
+
+        with_env_vars_async(
+            &[("KRAMLI_URL", "http://127.0.0.1:9"), (TEST_KRAMLI_API_KEY_ENV, "kramli_test")],
+            || async {
+                maybe_apply_profile_locale(Some(&command)).await;
+            },
+        )
+        .await;
+
+        let profile = serde_json::to_string(&sample_profile(Some("it-IT"))).unwrap();
+        let (base_url, requests) = server_with_base_url(vec![profile]).await;
+        with_env_vars_async(
+            &[("KRAMLI_URL", base_url.as_str()), (TEST_KRAMLI_API_KEY_ENV, "kramli_test")],
+            || async {
+                maybe_apply_profile_locale(Some(&command)).await;
+            },
+        )
+        .await;
+        assert_eq!(current_locale_code(), "it-IT");
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["GET /api/profile HTTP/1.1"]);
     }
 
     #[test]
@@ -906,25 +956,27 @@ mod tests {
 
     #[test]
     fn env_flags_cover_defaults_truthy_falsey_and_invalid_values() {
-        std::env::remove_var(TEST_ENV_FLAG_ENV);
-        assert!(env_flag_enabled(TEST_ENV_FLAG_ENV, true));
-        assert!(!env_flag_enabled(TEST_ENV_FLAG_ENV, false));
+        crate::test_env::with_env_lock(|| {
+            std::env::remove_var(TEST_ENV_FLAG_ENV);
+            assert!(env_flag_enabled(TEST_ENV_FLAG_ENV, true));
+            assert!(!env_flag_enabled(TEST_ENV_FLAG_ENV, false));
 
-        for value in ["0", "false", "off", "no"] {
-            std::env::set_var(TEST_ENV_FLAG_ENV, value);
-            assert!(!env_flag_enabled(TEST_ENV_FLAG_ENV, true));
-        }
+            for value in ["0", "false", "off", "no"] {
+                std::env::set_var(TEST_ENV_FLAG_ENV, value);
+                assert!(!env_flag_enabled(TEST_ENV_FLAG_ENV, true));
+            }
 
-        for value in ["1", "true", "on", "yes"] {
-            std::env::set_var(TEST_ENV_FLAG_ENV, value);
-            assert!(env_flag_enabled(TEST_ENV_FLAG_ENV, false));
-        }
+            for value in ["1", "true", "on", "yes"] {
+                std::env::set_var(TEST_ENV_FLAG_ENV, value);
+                assert!(env_flag_enabled(TEST_ENV_FLAG_ENV, false));
+            }
 
-        std::env::set_var(TEST_ENV_FLAG_ENV, "  ");
-        assert!(env_flag_enabled(TEST_ENV_FLAG_ENV, true));
-        std::env::set_var(TEST_ENV_FLAG_ENV, "maybe");
-        assert!(!env_flag_enabled(TEST_ENV_FLAG_ENV, false));
-        std::env::remove_var(TEST_ENV_FLAG_ENV);
+            std::env::set_var(TEST_ENV_FLAG_ENV, "  ");
+            assert!(env_flag_enabled(TEST_ENV_FLAG_ENV, true));
+            std::env::set_var(TEST_ENV_FLAG_ENV, "maybe");
+            assert!(!env_flag_enabled(TEST_ENV_FLAG_ENV, false));
+            std::env::remove_var(TEST_ENV_FLAG_ENV);
+        });
     }
 
     fn list_response(id: i64, name: &str) -> String {
@@ -947,7 +999,13 @@ mod tests {
         let handle = tokio::spawn(async move {
             let mut requests = Vec::new();
             for body in responses {
-                let (mut stream, _) = listener.accept().await.expect("request should connect");
+                let (mut stream, _) = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    listener.accept(),
+                )
+                .await
+                .expect("test server accept timed out")
+                .expect("request should connect");
                 let mut buffer = [0_u8; 4096];
                 let read = stream.read(&mut buffer).await.expect("request should read");
                 let request = String::from_utf8_lossy(&buffer[..read]).to_string();
@@ -978,11 +1036,60 @@ mod tests {
         (api.base_url_for_tests().to_string(), handle)
     }
 
+    async fn server_with_status(
+        status: u16,
+        body: &str,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener.local_addr().expect("test server should have addr");
+        let body = body.to_string();
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let (mut stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("test server accept timed out")
+                    .expect("request should connect");
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).await.expect("request should read");
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            requests.push(request.lines().next().unwrap_or_default().to_string());
+            let header = format!(
+                "HTTP/1.1 {status} TEST\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(header.as_bytes())
+                .await
+                .expect("response header should write");
+            stream
+                .write_all(body.as_bytes())
+                .await
+                .expect("response body should write");
+            requests
+        });
+
+        (format!("http://{addr}"), handle)
+    }
+
     async fn with_env_vars_async<T, Fut>(vars: &[(&str, &str)], f: impl FnOnce() -> Fut) -> T
     where
         Fut: std::future::Future<Output = T>,
     {
-        let _guard = ENV_LOCK.lock().await;
+        crate::test_env::with_env_vars_async(vars, f).await
+    }
+
+    async fn with_env_vars_async_unlocked<T, Fut>(
+        vars: &[(&str, &str)],
+        f: impl FnOnce() -> Fut,
+    ) -> T
+    where
+        Fut: std::future::Future<Output = T>,
+    {
         let previous = vars
             .iter()
             .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
@@ -991,7 +1098,7 @@ mod tests {
             std::env::set_var(key, value);
         }
 
-        let result = f().await;
+        let output = f().await;
 
         for (key, value) in previous {
             if let Some(value) = value {
@@ -1001,7 +1108,7 @@ mod tests {
             }
         }
 
-        result
+        output
     }
 
     fn temp_batch_file(name: &str, content: &str) -> String {
@@ -1014,9 +1121,25 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    fn temp_batch_executable(name: &str, script_body: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "kramli-cli-{name}-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::write(&path, script_body).expect("batch executable should write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(&path, perms)
+                .expect("batch executable should become executable");
+        }
+        path.to_string_lossy().into_owned()
+    }
+
     const TEST_KRAMLI_API_KEY_ENV: &str = "KRAMLI_API_KEY";
     const TEST_KRAMLI_AUTO_HANDOFF_ENV: &str = "KRAMLI_AUTO_HANDOFF";
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn list_update_and_batch_helpers_cover_branch_variants() {
@@ -1327,127 +1450,128 @@ mod tests {
         ];
         let (api, requests) = api_with_responses(responses).await;
 
-        std::env::set_var(TEST_KRAMLI_AUTO_HANDOFF_ENV, "false");
-        run_items_show(&api, false, 5)
+        with_env_vars_async(&[(TEST_KRAMLI_AUTO_HANDOFF_ENV, "false")], || async {
+            run_items_show(&api, false, 5)
+                .await
+                .expect("show should render human output");
+            run_items_add(
+                &api,
+                false,
+                ItemAddArgs {
+                    list_id: 7,
+                    text: "Created Human".to_string(),
+                    quantity: None,
+                    due: None,
+                    due_time: None,
+                    planned: None,
+                    planned_time: None,
+                    reminder: Some(true),
+                    reminder_time: None,
+                    reminder_days_before: None,
+                    reminder_offsets: None,
+                    travel_time_minutes: None,
+                    priority: None,
+                    tags: None,
+                    notes: None,
+                    parent: None,
+                    assign: None,
+                    color: None,
+                    progress: None,
+                },
+            )
             .await
-            .expect("show should render human output");
-        run_items_add(
-            &api,
-            false,
-            ItemAddArgs {
-                list_id: 7,
-                text: "Created Human".to_string(),
+            .expect("add should render human output");
+            run_items_update(
+                &api,
+                false,
+                ItemUpdateArgs {
+                    id: 11,
+                    text: Some("Updated Without Tags".to_string()),
+                    quantity: None,
+                    due: None,
+                    due_time: None,
+                    planned: None,
+                    planned_time: None,
+                    reminder: None,
+                    reminder_time: None,
+                    reminder_days_before: None,
+                    reminder_offsets: None,
+                    travel_time_minutes: None,
+                    priority: None,
+                    tags: None,
+                    notes: None,
+                    assign: None,
+                    color: None,
+                    progress: None,
+                },
+            )
+            .await
+            .expect("update without tags should enrich from list");
+            run_items_done(&api, false, 12)
+                .await
+                .expect("done should render human output");
+            run_items_vote(&api, true, 12)
+                .await
+                .expect("vote should render json output");
+            run_items_delete(&api, true, 12)
+                .await
+                .expect("delete should render json output");
+            run_items_done_list(&api, false, 7)
+                .await
+                .expect("done list should render empty human output");
+            run_items_comment(&api, true, 12, "Json comment".to_string())
+                .await
+                .expect("comment should render json output");
+            run_items_check_all(&api, false, 7)
+                .await
+                .expect("check all should render human output");
+            run_items_clear_done(&api, true, 7)
+                .await
+                .expect("clear done should render json output");
+            assert!(fetch_item_from_list(&api, 7, 999).await.is_err());
+            let mut item_without_list = ListItem {
+                id: 99,
+                list_id: None,
+                text: "No list".to_string(),
+                is_done: None,
                 quantity: None,
-                due: None,
-                due_time: None,
-                planned: None,
-                planned_time: None,
-                reminder: Some(true),
-                reminder_time: None,
-                reminder_days_before: None,
-                reminder_offsets: None,
-                travel_time_minutes: None,
-                priority: None,
-                tags: None,
                 notes: None,
-                parent: None,
-                assign: None,
-                color: None,
-                progress: None,
-            },
-        )
-        .await
-        .expect("add should render human output");
-        run_items_update(
-            &api,
-            false,
-            ItemUpdateArgs {
-                id: 11,
-                text: Some("Updated Without Tags".to_string()),
-                quantity: None,
-                due: None,
+                tldr: None,
+                due_date: None,
                 due_time: None,
-                planned: None,
+                planned_date: None,
                 planned_time: None,
+                repeat_label: None,
                 reminder: None,
                 reminder_time: None,
                 reminder_days_before: None,
                 reminder_offsets: None,
                 travel_time_minutes: None,
                 priority: None,
-                tags: None,
-                notes: None,
-                assign: None,
-                color: None,
                 progress: None,
-            },
-        )
-        .await
-        .expect("update without tags should enrich from list");
-        run_items_done(&api, false, 12)
-            .await
-            .expect("done should render human output");
-        run_items_vote(&api, true, 12)
-            .await
-            .expect("vote should render json output");
-        run_items_delete(&api, true, 12)
-            .await
-            .expect("delete should render json output");
-        run_items_done_list(&api, false, 7)
-            .await
-            .expect("done list should render empty human output");
-        run_items_comment(&api, true, 12, "Json comment".to_string())
-            .await
-            .expect("comment should render json output");
-        run_items_check_all(&api, false, 7)
-            .await
-            .expect("check all should render human output");
-        run_items_clear_done(&api, true, 7)
-            .await
-            .expect("clear done should render json output");
-        assert!(fetch_item_from_list(&api, 7, 999).await.is_err());
-        let mut item_without_list = ListItem {
-            id: 99,
-            list_id: None,
-            text: "No list".to_string(),
-            is_done: None,
-            quantity: None,
-            notes: None,
-            tldr: None,
-            due_date: None,
-            due_time: None,
-            planned_date: None,
-            planned_time: None,
-            repeat_label: None,
-            reminder: None,
-            reminder_time: None,
-            reminder_days_before: None,
-            reminder_offsets: None,
-            travel_time_minutes: None,
-            priority: None,
-            progress: None,
-            tags: None,
-            parent_item_id: None,
-            depth: None,
-            position: None,
-            completed_at: None,
-            created_at: None,
-            updated_at: None,
-            assigned_to: None,
-            child_count: None,
-            done_child_count: None,
-            comment_count: None,
-            color: None,
-            image_url: None,
-            image_filename: None,
-            attachments: None,
-        };
-        enrich_item_tags_from_list(&api, &mut item_without_list).await;
-        assert!(item_without_list.tags.is_none());
-        run_items_done_list(&api, false, 7)
-            .await
-            .expect("done list should render completed human output");
-        std::env::remove_var(TEST_KRAMLI_AUTO_HANDOFF_ENV);
+                tags: None,
+                parent_item_id: None,
+                depth: None,
+                position: None,
+                completed_at: None,
+                created_at: None,
+                updated_at: None,
+                assigned_to: None,
+                child_count: None,
+                done_child_count: None,
+                comment_count: None,
+                color: None,
+                image_url: None,
+                image_filename: None,
+                attachments: None,
+            };
+            enrich_item_tags_from_list(&api, &mut item_without_list).await;
+            assert!(item_without_list.tags.is_none());
+            run_items_done_list(&api, false, 7)
+                .await
+                .expect("done list should render completed human output");
+        })
+        .await;
 
         let requests = requests.await.expect("test server should finish");
         assert_eq!(requests[0], "GET /api/items/5/comments HTTP/1.1");
@@ -1915,6 +2039,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ping_privacy_and_update_output_cover_remaining_branches() {
+        let (base_url, requests) = server_with_status(500, "{}").await;
+        with_env_vars_async(&[("KRAMLI_URL", base_url.as_str())], || async {
+            run_ping(false)
+                .await
+                .expect("ping human should handle non-success status");
+        })
+        .await;
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["GET /api/ping HTTP/1.1"]);
+
+        let temp_config_root = std::env::temp_dir().join(format!(
+            "kramli-cli-privacy-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&temp_config_root).expect("temp config dir should be created");
+        with_env_vars_async(
+            &[(
+                "XDG_CONFIG_HOME",
+                temp_config_root
+                    .to_str()
+                    .expect("temp config dir should be valid utf-8"),
+            )],
+            || async {
+                run_privacy(PrivacyCmd::Reset, true).expect("privacy reset json should succeed");
+                run_privacy(PrivacyCmd::Reset, false)
+                    .expect("privacy reset human should succeed");
+            },
+        )
+        .await;
+
+        print_update_check_result(
+            "1.2.3".to_string(),
+            GitHubRelease {
+                tag_name: "1.2.3".to_string(),
+                html_url: None,
+            },
+            false,
+        )
+        .expect("up-to-date output should succeed");
+        print_update_check_result(
+            "1.2.3".to_string(),
+            GitHubRelease {
+                tag_name: "not-a-semver".to_string(),
+                html_url: None,
+            },
+            false,
+        )
+        .expect("unknown-version output should succeed");
+    }
+
+    #[tokio::test]
     async fn run_command_dispatches_safe_api_backed_commands() {
         let profile = serde_json::to_string(&sample_profile(Some("en"))).unwrap();
         let responses = vec![
@@ -2142,19 +2319,23 @@ mod tests {
 
     #[tokio::test]
     async fn env_var_helper_restores_existing_values() {
-        std::env::set_var(TEST_KRAMLI_API_KEY_ENV, "before");
-        with_env_vars_async(&[(TEST_KRAMLI_API_KEY_ENV, "during")], || async {
+        with_env_vars_async(&[(TEST_KRAMLI_API_KEY_ENV, "before")], || async {
+            with_env_vars_async_unlocked(&[(TEST_KRAMLI_API_KEY_ENV, "during")], || async {
+                assert_eq!(
+                    std::env::var(TEST_KRAMLI_API_KEY_ENV).as_deref(),
+                    Ok("during")
+                );
+            })
+            .await;
+
             assert_eq!(
                 std::env::var(TEST_KRAMLI_API_KEY_ENV).as_deref(),
-                Ok("during")
+                Ok("before")
             );
         })
         .await;
-        assert_eq!(
-            std::env::var(TEST_KRAMLI_API_KEY_ENV).as_deref(),
-            Ok("before")
-        );
-        std::env::remove_var(TEST_KRAMLI_API_KEY_ENV);
+
+        assert!(std::env::var(TEST_KRAMLI_API_KEY_ENV).is_err());
     }
 
     #[tokio::test]
@@ -2260,6 +2441,473 @@ mod tests {
         run_batch_json(&empty, false)
             .await
             .expect("empty JSON batch should succeed");
+    }
+
+    #[tokio::test]
+    async fn run_batch_json_covers_custom_executable_json_and_spawn_error_paths() {
+        let batch_file = temp_batch_file("json-batch-custom-exe", "status\n");
+        let ok_script = temp_batch_executable(
+            "json-batch-ok-script",
+            "#!/bin/sh\nprintf '{\"ok\":true}\\n'\n",
+        );
+
+        with_env_vars_async(
+            &[(KRAMLI_BATCH_EXECUTABLE_ENV, ok_script.as_str())],
+            || async {
+                run_batch_json(&batch_file, false)
+                    .await
+                    .expect("custom executable should allow successful JSON parse");
+            },
+        )
+        .await;
+
+        with_env_vars_async(
+            &[(KRAMLI_BATCH_EXECUTABLE_ENV, "/definitely/missing-kramli-executable")],
+            || async {
+                let err = run_batch_json(&batch_file, false)
+                    .await
+                    .expect_err("missing executable should produce spawn error");
+                assert!(err.contains("line 1:"));
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn run_batch_non_json_covers_success_and_runtime_failure_paths() {
+        let ok_file = temp_batch_file("batch-non-json-ok", "# comment\n\nconfig\n");
+        run_batch(&ok_file, false, false)
+            .await
+            .expect("non-json batch with config should succeed");
+
+        let fail_file = temp_batch_file("batch-non-json-fail", "lists resolve '   '\n");
+        assert!(run_batch(&fail_file, false, false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn status_logged_in_and_profile_error_branches_are_covered() {
+        let profile = serde_json::to_string(&sample_profile(Some("en"))).unwrap();
+        let (base_url, requests) = server_with_base_url(vec![profile.clone(), profile]).await;
+        with_env_vars_async(
+            &[("KRAMLI_URL", base_url.as_str()), (TEST_KRAMLI_API_KEY_ENV, "kramli_test")],
+            || async {
+                run_status(true)
+                    .await
+                    .expect("status json logged-in branch should succeed");
+                run_status(false)
+                    .await
+                    .expect("status human logged-in branch should succeed");
+            },
+        )
+        .await;
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(
+            requests,
+            vec!["GET /api/profile HTTP/1.1", "GET /api/profile HTTP/1.1"]
+        );
+
+        let (error_base_url, error_requests) = server_with_status(500, "{}").await;
+        with_env_vars_async(
+            &[("KRAMLI_URL", error_base_url.as_str()), (TEST_KRAMLI_API_KEY_ENV, "kramli_test")],
+            || async {
+                run_status(false)
+                    .await
+                    .expect("status human should tolerate profile endpoint errors");
+            },
+        )
+        .await;
+        let error_requests = error_requests.await.expect("test server should finish");
+        assert_eq!(error_requests, vec!["GET /api/profile HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn invite_link_and_key_create_fallback_outputs_are_covered() {
+        let responses = vec![json!({"ok": true}).to_string(), json!({"id": 1}).to_string()];
+        let (base_url, requests) = server_with_base_url(responses).await;
+
+        with_env_vars_async(
+            &[("KRAMLI_URL", base_url.as_str()), (TEST_KRAMLI_API_KEY_ENV, "kramli_test")],
+            || async {
+                run_members(MemberCmd::InviteLink { list_id: 7 }, false)
+                    .await
+                    .expect("invite-link fallback output should succeed");
+                run_keys(
+                    KeyCmd::Create {
+                        name: "fallback".to_string(),
+                        scopes: "all".to_string(),
+                    },
+                    false,
+                )
+                .await
+                .expect("key-create fallback output should succeed");
+            },
+        )
+        .await;
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests[0], "POST /api/lists/7/invite-link HTTP/1.1");
+        assert_eq!(requests[1], "POST /api/api-keys HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn list_resolve_and_accept_terms_pending_human_branch_are_covered() {
+        with_env_vars_async(&[(TEST_KRAMLI_API_KEY_ENV, "kramli_test")], || async {
+            run_lists(
+                ListCmd::Resolve {
+                    reference: "7".to_string(),
+                },
+                false,
+            )
+            .await
+            .expect("list resolve should render human output");
+        })
+        .await;
+
+        let (base_url, requests) = server_with_base_url(vec![
+            json!({"legal": {"pending": [{"key": "agb"}, {"key": "privacy"}]}}).to_string(),
+        ])
+        .await;
+        with_env_vars_async(
+            &[("KRAMLI_URL", base_url.as_str()), (TEST_KRAMLI_API_KEY_ENV, "kramli_test")],
+            || async {
+                run_accept_terms(None, false)
+                    .await
+                    .expect("accept terms should render pending-doc human branch");
+            },
+        )
+        .await;
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["POST /api/accept-terms HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn handoff_device_label_prefers_env_and_truncates_values() {
+        let long_label = "X".repeat(120);
+        with_env_vars_async(
+            &[(KRAMLI_DEVICE_LABEL_ENV, long_label.as_str())],
+            || async {
+                let label = default_handoff_device_label(None);
+                assert_eq!(label.len(), 80);
+                assert!(label.chars().all(|ch| ch == 'X'));
+            },
+        )
+        .await;
+    }
+
+    #[test]
+    fn update_check_human_output_available_branch_is_covered() {
+        print_update_check_result(
+            "1.0.0".to_string(),
+            GitHubRelease {
+                tag_name: "1.1.0".to_string(),
+                html_url: Some("https://example.invalid/release".to_string()),
+            },
+            false,
+        )
+        .expect("update-available output should succeed");
+    }
+
+    #[test]
+    fn run_logout_is_inert_without_credentials() {
+        run_logout().expect("logout should succeed even without stored key");
+    }
+
+    #[tokio::test]
+    async fn run_login_with_covers_invalid_success_and_profile_error_paths() {
+        assert!(run_login_with(None, || Ok("bad".to_string()), |_, _| Ok(()), |_| Ok(()))
+            .await
+            .is_err());
+
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-cli-login-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+
+        let profile = serde_json::to_string(&sample_profile(Some("en"))).unwrap();
+        let (base_url, requests) = server_with_base_url(vec![profile]).await;
+        with_env_vars_async(
+            &[
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_login_with(
+                    None,
+                    || Ok("kramli_test".to_string()),
+                    |_, _| Ok(()),
+                    |_| Ok(()),
+                )
+                .await
+                .expect("login helper should succeed for valid profile response");
+            },
+        )
+        .await;
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["GET /api/profile HTTP/1.1"]);
+
+        let (error_base_url, error_requests) = server_with_status(500, "{}").await;
+        let deleted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        with_env_vars_async(
+            &[
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                ("KRAMLI_URL", error_base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || {
+                let deleted = deleted.clone();
+                async move {
+                    assert!(run_login_with(
+                        None,
+                        || Ok("kramli_test".to_string()),
+                        |_, _| Ok(()),
+                        move |_| {
+                            deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .is_err());
+                }
+            },
+        )
+        .await;
+        assert!(deleted.load(std::sync::atomic::Ordering::SeqCst));
+        let error_requests = error_requests.await.expect("test server should finish");
+        assert_eq!(error_requests, vec!["GET /api/profile HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn run_login_wrapper_is_reachable_under_cfg_test() {
+        assert!(run_login(None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_login_with_url_override_and_prompt_error_branches_are_covered() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-cli-login-url-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+
+        with_env_vars_async(
+            &[(
+                "XDG_CONFIG_HOME",
+                config_root
+                    .to_str()
+                    .expect("temp config root should be valid utf-8"),
+            )],
+            || async {
+                assert!(run_login_with(
+                    Some("http://127.0.0.1:65535".to_string()),
+                    || Err("prompt failed".to_string()),
+                    |_, _| Ok(()),
+                    |_| Ok(()),
+                )
+                .await
+                .is_err());
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn update_fetch_and_notice_cover_http_parse_success_and_cache_paths() {
+        let (http_error_url, http_error_requests) = server_with_status(503, "{}").await;
+        with_env_vars_async(
+            &[(KRAMLI_UPDATE_CHECK_URL_ENV, &format!("{http_error_url}/latest"))],
+            || async {
+                assert!(fetch_latest_release().await.is_err());
+            },
+        )
+        .await;
+        let http_error_requests = http_error_requests
+            .await
+            .expect("test server should finish");
+        assert_eq!(http_error_requests, vec!["GET /latest HTTP/1.1"]);
+
+        let (invalid_json_url, invalid_json_requests) = server_with_status(200, "not-json").await;
+        with_env_vars_async(
+            &[(KRAMLI_UPDATE_CHECK_URL_ENV, &format!("{invalid_json_url}/latest"))],
+            || async {
+                assert!(fetch_latest_release().await.is_err());
+            },
+        )
+        .await;
+        let invalid_json_requests = invalid_json_requests
+            .await
+            .expect("test server should finish");
+        assert_eq!(invalid_json_requests, vec!["GET /latest HTTP/1.1"]);
+
+        let release = json!({"tag_name": "9.9.9", "html_url": "https://example.invalid/v9.9.9"})
+            .to_string();
+        let (update_api, ok_requests) =
+            api_with_responses(vec![release.clone(), release.clone(), release]).await;
+        let ok_url = update_api.base_url_for_tests().to_string();
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-cli-update-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+
+        with_env_vars_async(
+            &[
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                (KRAMLI_UPDATE_CHECK_URL_ENV, &format!("{ok_url}/latest")),
+                ("KRAMLI_AUTO_UPDATE_CHECK", "1"),
+                ("DO_NOT_TRACK", "0"),
+                ("KRAMLI_NO_TELEMETRY", "0"),
+            ],
+            || async {
+                let fetched = fetch_latest_release()
+                    .await
+                    .expect("fetch_latest_release should parse a valid response");
+                assert_eq!(fetched.tag_name, "9.9.9");
+
+                maybe_auto_update_notice().await;
+                run_update_check(true)
+                    .await
+                    .expect("run_update_check should update cached release metadata");
+
+                let cfg = Config::load();
+                assert_eq!(cfg.update_check_latest().as_deref(), Some("9.9.9"));
+                assert_eq!(
+                    cfg.update_check_url().as_deref(),
+                    Some("https://example.invalid/v9.9.9")
+                );
+            },
+        )
+        .await;
+
+        ok_requests.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_release_covers_transport_and_body_read_errors() {
+        with_env_vars_async(&[(KRAMLI_UPDATE_CHECK_URL_ENV, "http://::invalid-url")], || async {
+            assert!(fetch_latest_release().await.is_err());
+        })
+        .await;
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener.local_addr().expect("test server should have addr");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("test server accept timed out")
+                    .expect("request should connect");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).await.expect("request should read");
+            let header =
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 99\r\nconnection: close\r\n\r\n";
+            stream
+                .write_all(header.as_bytes())
+                .await
+                .expect("response header should write");
+            stream
+                .write_all(b"{")
+                .await
+                .expect("partial response body should write");
+        });
+
+        with_env_vars_async(
+            &[(KRAMLI_UPDATE_CHECK_URL_ENV, &format!("http://{addr}/latest"))],
+            || async {
+                assert!(fetch_latest_release().await.is_err());
+            },
+        )
+        .await;
+        handle.await.expect("test server should finish");
+    }
+
+    #[tokio::test]
+    async fn maybe_auto_update_notice_available_branch_is_covered() {
+        let release = json!({"tag_name": "99.0.0", "html_url": null}).to_string();
+        let (base_url, requests) = server_with_status(200, &release).await;
+
+        let mut cfg = Config::load();
+        cfg.set_update_check_state(0, None, None);
+        let _ = cfg.save();
+
+        with_env_vars_async(
+            &[
+                (KRAMLI_UPDATE_CHECK_URL_ENV, &format!("{base_url}/latest")),
+                ("KRAMLI_AUTO_UPDATE_CHECK", "1"),
+                ("DO_NOT_TRACK", "0"),
+                ("KRAMLI_NO_TELEMETRY", "0"),
+            ],
+            || async {
+                maybe_auto_update_notice().await;
+            },
+        )
+        .await;
+
+        requests.abort();
+    }
+
+    #[tokio::test]
+    async fn list_show_auto_handoff_and_tag_enrichment_paths_are_covered() {
+        let responses = vec![
+            json!({"id": 7, "name": "Groceries"}).to_string(),
+            json!({"ok": true}).to_string(),
+            json!([{"id": 9, "list_id": 7, "text": "Milk", "is_done": false, "tags": ["fresh"]}]).to_string(),
+        ];
+        let (base_url, requests) = server_with_base_url(responses).await;
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+                (TEST_KRAMLI_AUTO_HANDOFF_ENV, "1"),
+            ],
+            || async {
+                run_lists(ListCmd::Show { id: 7 }, false)
+                    .await
+                    .expect("list show should render human output and auto-handoff");
+
+                let api = get_api().expect("api should be available from env");
+                let mut done_response = json!({"list_id": 7});
+                enrich_done_response_tags(&api, 9, &mut done_response).await;
+                assert_eq!(done_response["tags"], json!(["fresh"]));
+            },
+        )
+        .await;
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests[0], "GET /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[1], "POST /api/activity/viewing HTTP/1.1");
+        assert_eq!(requests[2], "GET /api/lists/7/items HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn run_batch_parse_error_branches_are_covered() {
+        let bad = temp_batch_file("batch-parse-error", "items add \"unterminated\n");
+        assert!(run_batch(&bad, false, false).await.is_err());
+        assert!(run_batch_json(&bad, false).await.is_err());
     }
 }
 
@@ -2867,6 +3515,39 @@ fn profile_json_with_lang(profile: &Profile) -> Value {
 // ─── Login ───
 
 async fn run_login(url: Option<String>) -> Result<(), String> {
+    run_login_with(
+        url,
+        prompt_api_key,
+        |cfg, key| cfg.set_api_key(key),
+        |cfg| cfg.delete_api_key(),
+    )
+    .await
+}
+
+#[cfg(not(test))]
+fn prompt_api_key() -> Result<String, String> {
+    dialoguer::Password::new()
+        .with_prompt(tr("cli-api-key-label"))
+        .interact()
+        .map_err(|e| tr_args("cli-input-error", &[("error", e.to_string())]))
+}
+
+#[cfg(test)]
+fn prompt_api_key() -> Result<String, String> {
+    Err("prompt unavailable in test context".to_string())
+}
+
+async fn run_login_with<Prompt, SetKey, DeleteKey>(
+    url: Option<String>,
+    prompt_key: Prompt,
+    set_api_key: SetKey,
+    delete_api_key: DeleteKey,
+) -> Result<(), String>
+where
+    Prompt: FnOnce() -> Result<String, String>,
+    SetKey: Fn(&Config, &str) -> Result<(), String>,
+    DeleteKey: Fn(&Config) -> Result<(), String>,
+{
     let mut cfg = Config::load();
     if let Some(ref u) = url {
         cfg.set_base_url(Some(u.clone()));
@@ -2884,17 +3565,14 @@ async fn run_login(url: Option<String>) -> Result<(), String> {
         )
     );
 
-    let key: String = dialoguer::Password::new()
-        .with_prompt(tr("cli-api-key-label"))
-        .interact()
-        .map_err(|e| tr_args("cli-input-error", &[("error", e.to_string())]))?;
+    let key: String = prompt_key()?;
 
     let key = key.trim().to_string();
     if !key.starts_with("kramli_") {
         return Err(tr("cli-api-key-invalid-format"));
     }
 
-    cfg.set_api_key(&key)?;
+    set_api_key(&cfg, &key)?;
     cfg.save()?;
 
     let api = ApiClient::new(&cfg)?;
@@ -2910,7 +3588,7 @@ async fn run_login(url: Option<String>) -> Result<(), String> {
             println!("  {}", tr("cli-api-key-stored"));
         }
         Err(e) => {
-            cfg.delete_api_key()?;
+            delete_api_key(&cfg)?;
             return Err(tr_args("cli-api-key-invalid", &[("error", e)]));
         }
     }
@@ -3207,13 +3885,21 @@ fn update_is_available(current: &str, latest: &str) -> Option<bool> {
     Some(latest > current)
 }
 
+fn update_check_url() -> String {
+    std::env::var(KRAMLI_UPDATE_CHECK_URL_ENV)
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .unwrap_or_else(|| UPDATE_CHECK_URL.to_string())
+}
+
 async fn fetch_latest_release() -> Result<GitHubRelease, String> {
     let span = telemetry::TraceSpan::child("http.client", "update_check");
     span.set_tag("operation", "update_check");
     span.set_tag("api.method", "GET");
     span.set_tag("api.route", "external_release");
     let response = match reqwest::Client::new()
-        .get(UPDATE_CHECK_URL)
+        .get(update_check_url())
         .header(
             reqwest::header::USER_AGENT,
             format!("kramli-cli/{}", env!("CARGO_PKG_VERSION")),
@@ -4753,7 +5439,7 @@ async fn run_batch_json(file: &str, keep_going: bool) -> Result<(), String> {
         })?
     };
 
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = batch_child_executable()?;
     let mut results = Vec::new();
     let mut executed = 0usize;
     let mut failed = 0usize;
@@ -4869,6 +5555,16 @@ async fn run_batch_json(file: &str, keep_going: bool) -> Result<(), String> {
     } else {
         Err(first_error.unwrap_or_else(|| tr("cli-batch-failed")))
     }
+}
+
+fn batch_child_executable() -> Result<std::path::PathBuf, String> {
+    if let Ok(raw) = std::env::var(KRAMLI_BATCH_EXECUTABLE_ENV) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Ok(std::path::PathBuf::from(trimmed));
+        }
+    }
+    std::env::current_exe().map_err(|e| e.to_string())
 }
 
 fn batch_child_args(line: &str) -> Result<Vec<String>, String> {
@@ -5083,7 +5779,14 @@ async fn run_update_check(as_json: bool) -> Result<(), String> {
     );
     let _ = cfg.save();
 
-    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    print_update_check_result(env!("CARGO_PKG_VERSION").to_string(), release, as_json)
+}
+
+fn print_update_check_result(
+    current_version: String,
+    release: GitHubRelease,
+    as_json: bool,
+) -> Result<(), String> {
     let latest_version = release.tag_name.clone();
     let update_available = update_is_available(&current_version, &latest_version);
 

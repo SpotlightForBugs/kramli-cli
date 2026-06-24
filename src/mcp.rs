@@ -28,12 +28,18 @@ struct IncomingMessage {
 pub(crate) async fn run_stdio() -> Result<(), String> {
     let mut stdin = io::stdin();
     let mut stdout = io::stdout();
+    run_with_io(&mut stdin, &mut stdout).await
+}
+
+async fn run_with_io<R, W>(stdin: &mut R, stdout: &mut W) -> Result<(), String>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut buffer = Vec::new();
 
-    while let Some(message) = read_message(&mut stdin, &mut buffer).await? {
-        if let Some(response) = handle_message(message.value).await {
-            write_message(&mut stdout, &response, message.framing).await?;
-        }
+    while let Some(message) = read_message(stdin, &mut buffer).await? {
+        if let Some(response) = handle_message(message.value).await { write_message(stdout, &response, message.framing).await?; }
     }
 
     Ok(())
@@ -485,9 +491,6 @@ fn try_parse_message(buffer: &mut Vec<u8>) -> Result<Option<IncomingMessage>, St
     if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
         let line: Vec<u8> = buffer.drain(..=newline).collect();
         let trimmed = String::from_utf8_lossy(&line).trim().to_string();
-        if trimmed.is_empty() {
-            return Ok(None);
-        }
         let value = serde_json::from_str(&trimmed)
             .map_err(|e| tr_args("mcp-invalid-json-line", &[("error", e.to_string())]))?;
         return Ok(Some(IncomingMessage {
@@ -685,13 +688,57 @@ fn tools() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        content_length, error_response, handle_message, insert_optional_string,
-        insert_reminder_fields, mcp_method_trace_name, mcp_tool_trace_name, optional_bool,
-        optional_i64, optional_i64_array, optional_string, optional_string_array, read_message,
-        required_i64, required_string, tool_result, tool_text_result, tools, try_parse_message,
-        write_message, MessageFraming,
+        content_length, create_item, delete_item, error_response, handle_message,
+        handle_tool_call,
+        insert_optional_string, insert_reminder_fields, list_items, mcp_method_trace_name,
+        mcp_tool_trace_name, optional_bool, optional_i64, optional_i64_array, optional_string,
+        optional_string_array, read_message, required_i64, required_string, run_stdio,
+        run_with_io, toggle_item_done, tool_result, tool_text_result, tools, try_parse_message,
+        update_item, write_message, MessageFraming,
     };
+    use crate::api::ApiClient;
     use serde_json::{json, Map, Value};
+    use std::future::Future;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn api_with_responses(
+        responses: Vec<String>,
+    ) -> (ApiClient, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener.local_addr().expect("test server should have addr");
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for body in responses {
+                let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("test server accept timed out")
+                    .expect("request should connect");
+                let mut buffer = [0_u8; 4096];
+                let read = stream.read(&mut buffer).await.expect("request should read");
+                requests.push(String::from_utf8_lossy(&buffer[..read]).to_string());
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(header.as_bytes())
+                    .await
+                    .expect("response header should write");
+                stream
+                    .write_all(body.as_bytes())
+                    .await
+                    .expect("response body should write");
+            }
+            requests
+        });
+
+        (ApiClient::for_tests(&format!("http://{addr}")), handle)
+    }
 
     fn schedule_properties_for_tool(tool_name: &str) -> Map<String, Value> {
         let tool = tools()
@@ -705,6 +752,57 @@ mod tests {
             .and_then(Value::as_object)
             .cloned()
             .expect("tool inputSchema.properties must exist")
+    }
+
+    async fn with_env_vars_async<T, Fut>(vars: &[(&str, &str)], f: impl FnOnce() -> Fut) -> T
+    where
+        Fut: Future<Output = T>,
+    {
+        crate::test_env::with_env_vars_async(vars, f).await
+    }
+
+    async fn with_env_vars_async_unlocked<T, Fut>(
+        vars: &[(&str, &str)],
+        f: impl FnOnce() -> Fut,
+    ) -> T
+    where
+        Fut: Future<Output = T>,
+    {
+        let previous = vars
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
+            .collect::<Vec<_>>();
+        for (key, value) in vars {
+            std::env::set_var(key, value);
+        }
+
+        let output = f().await;
+
+        for (key, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+
+        output
+    }
+
+    #[tokio::test]
+    async fn env_helper_restores_existing_values() {
+        const TEST_ENV: &str = "KRAMLI_MCP_TEST_TMP";
+        crate::test_env::with_env_vars_async(&[(TEST_ENV, "before")], || async {
+            with_env_vars_async_unlocked(&[(TEST_ENV, "during")], || async {
+                assert_eq!(std::env::var(TEST_ENV).as_deref(), Ok("during"));
+            })
+            .await;
+
+            assert_eq!(std::env::var(TEST_ENV).as_deref(), Ok("before"));
+        })
+        .await;
+
+        assert!(std::env::var(TEST_ENV).is_err());
     }
 
     #[test]
@@ -753,47 +851,52 @@ mod tests {
 
     #[tokio::test]
     async fn handles_protocol_messages_without_tool_api() {
-        assert!(handle_message(json!({"jsonrpc": "2.0", "method": "ping"}))
+        with_env_vars_async(&[("KRAMLI_API_KEY", ""), ("KRAMLI_URL", "")], || async {
+            assert!(handle_message(json!({"jsonrpc": "2.0", "method": "ping"}))
+                .await
+                .is_none());
+            assert!(handle_message(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "notifications/changed"})
+            )
             .await
             .is_none());
-        assert!(handle_message(
-            json!({"jsonrpc": "2.0", "id": 1, "method": "notifications/changed"})
-        )
-        .await
-        .is_none());
 
-        let initialized =
-            handle_message(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
+            let initialized =
+                handle_message(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
+                    .await
+                    .expect("initialize response");
+            assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+
+            let ping = handle_message(json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}))
                 .await
-                .expect("initialize response");
-        assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+                .expect("ping response");
+            assert_eq!(ping["result"], json!({}));
 
-        let ping = handle_message(json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}))
+            let listed =
+                handle_message(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}))
+                    .await
+                    .expect("tools/list response");
+            assert!(listed["result"]["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.len() >= 6));
+
+            let tool_without_credentials = handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {"name": "list_lists"}
+            }))
             .await
-            .expect("ping response");
-        assert_eq!(ping["result"], json!({}));
+            .expect("tools/call error response");
+            assert_eq!(tool_without_credentials["error"]["code"], -32603);
 
-        let listed = handle_message(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}))
-            .await
-            .expect("tools/list response");
-        assert!(listed["result"]["tools"]
-            .as_array()
-            .is_some_and(|tools| tools.len() >= 6));
-
-        let tool_without_credentials = handle_message(json!({
-            "jsonrpc": "2.0",
-            "id": 5,
-            "method": "tools/call",
-            "params": {"name": "list_lists"}
-        }))
-        .await
-        .expect("tools/call error response");
-        assert_eq!(tool_without_credentials["error"]["code"], -32603);
-
-        let unknown = handle_message(json!({"jsonrpc": "2.0", "id": 4, "method": "custom"}))
-            .await
-            .expect("unknown response");
-        assert_eq!(unknown["error"]["code"], -32601);
+            let unknown =
+                handle_message(json!({"jsonrpc": "2.0", "id": 4, "method": "custom"}))
+                    .await
+                    .expect("unknown response");
+            assert_eq!(unknown["error"]["code"], -32601);
+        })
+        .await;
     }
 
     #[test]
@@ -1204,5 +1307,379 @@ mod tests {
         assert!(text.starts_with("Content-Length: "));
         assert!(text.contains("\r\n\r\n"));
         assert!(text.contains("\"ok\":true"));
+    }
+
+    #[tokio::test]
+    async fn list_items_and_item_mutations_cover_api_paths() {
+        let (api, requests) = api_with_responses(vec![
+            json!([
+                {
+                    "id": 1,
+                    "list_id": 7,
+                    "text": "Milk",
+                    "is_done": false,
+                    "progress": "Todo",
+                    "created_at": "2026-01-03"
+                },
+                {
+                    "id": 2,
+                    "list_id": 7,
+                    "text": "Milk done",
+                    "is_done": true,
+                    "progress": "Todo",
+                    "created_at": "2026-01-02"
+                },
+                {
+                    "id": 3,
+                    "list_id": 7,
+                    "text": "Bread",
+                    "is_done": false,
+                    "progress": "Todo",
+                    "created_at": "2026-01-01"
+                }
+            ])
+            .to_string(),
+            json!([
+                {
+                    "id": 10,
+                    "list_id": 7,
+                    "text": "first",
+                    "is_done": false,
+                    "created_at": "2026-01-01"
+                },
+                {
+                    "id": 11,
+                    "list_id": 7,
+                    "text": "second",
+                    "is_done": false,
+                    "created_at": "2026-01-02"
+                }
+            ])
+            .to_string(),
+            json!({"id": 99, "text": "Created"}).to_string(),
+            json!({"id": 99, "text": "Updated"}).to_string(),
+            json!({"id": 99, "is_done": true}).to_string(),
+            json!({"ok": true}).to_string(),
+        ])
+        .await;
+
+        let args = json!({
+            "list_id": 7,
+            "open": true,
+            "state": "todo",
+            "contains": "milk",
+            "newest": true,
+            "limit": 1
+        })
+        .as_object()
+        .cloned()
+        .expect("args object");
+        let filtered = list_items(&api, &args).await.expect("list_items should succeed");
+        let filtered = filtered.as_array().expect("array response");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["id"], 1);
+
+        let args = json!({
+            "list_id": 7,
+            "oldest": true,
+            "completed": false
+        })
+        .as_object()
+        .cloned()
+        .expect("args object");
+        let ordered = list_items(&api, &args).await.expect("list_items should succeed");
+        let ordered = ordered.as_array().expect("array response");
+        assert_eq!(ordered[0]["id"], 10);
+
+        let create_args = json!({
+            "list_id": 7,
+            "text": "Created",
+            "quantity": "2",
+            "notes": "memo",
+            "due_date": "2026-02-01",
+            "due_time": "09:00",
+            "planned_date": "2026-01-31",
+            "planned_time": "18:00",
+            "reminder_time": "08:30",
+            "reminder_offsets": [30, 60],
+            "travel_time_minutes": 15,
+            "priority": "high",
+            "progress": "todo",
+            "tags": ["x", "y"],
+            "parent_item_id": 5
+        })
+        .as_object()
+        .cloned()
+        .expect("args object");
+        let created = create_item(&api, &create_args)
+            .await
+            .expect("create_item should succeed");
+        assert_eq!(created["id"], 99);
+
+        let update_args = json!({
+            "id": 99,
+            "text": "Updated",
+            "color": "#fff",
+            "assigned_to": [1, 2],
+            "reminder": false
+        })
+        .as_object()
+        .cloned()
+        .expect("args object");
+        let updated = update_item(&api, &update_args)
+            .await
+            .expect("update_item should succeed");
+        assert_eq!(updated["text"], "Updated");
+
+        let no_change_args = json!({"id": 99})
+            .as_object()
+            .cloned()
+            .expect("args object");
+        assert!(update_item(&api, &no_change_args).await.is_err());
+
+        let toggle_args = json!({"id": 99})
+            .as_object()
+            .cloned()
+            .expect("args object");
+        let toggled = toggle_item_done(&api, &toggle_args)
+            .await
+            .expect("toggle should succeed");
+        assert_eq!(toggled["is_done"], true);
+
+        let deleted = delete_item(&api, &toggle_args)
+            .await
+            .expect("delete should succeed");
+        assert_eq!(deleted["ok"], true);
+
+        let requests = requests.await.expect("server should finish");
+        let first_lines = requests
+            .iter()
+            .map(|request| request.lines().next().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first_lines,
+            vec![
+                "GET /api/lists/7/items HTTP/1.1",
+                "GET /api/lists/7/items HTTP/1.1",
+                "POST /api/lists/7/items HTTP/1.1",
+                "PUT /api/items/99 HTTP/1.1",
+                "PATCH /api/items/99/done HTTP/1.1",
+                "DELETE /api/items/99 HTTP/1.1"
+            ]
+        );
+
+        assert!(requests[2].contains("\"parent_item_id\":5"));
+        assert!(requests[2].contains("\"reminder\":true"));
+        assert!(requests[3].contains("\"assigned_to\":[1,2]"));
+        assert!(requests[3].contains("\"reminder\":false"));
+    }
+
+    #[tokio::test]
+    async fn io_loop_and_tool_dispatch_cover_remaining_paths() {
+        let (stream_client, stream_server) = tokio::io::duplex(4096);
+        let (mut reader, mut writer) = tokio::io::split(stream_server);
+        let mut client = stream_client;
+        let server_task = tokio::spawn(async move { run_with_io(&mut reader, &mut writer).await });
+
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+            .await
+            .expect("request should be written");
+        client
+            .shutdown()
+            .await
+            .expect("client write side should close");
+        let mut output = Vec::new();
+        client
+            .read_to_end(&mut output)
+            .await
+            .expect("response should be readable");
+        server_task
+            .await
+            .expect("io task join should succeed")
+            .expect("io loop should succeed");
+
+        let text = String::from_utf8(output).expect("response output should be utf8");
+        assert!(text.contains("\"result\":{}"));
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", "http://127.0.0.1:9"),
+                ("KRAMLI_API_KEY", "kramli_test"),
+            ],
+            || async {
+                let missing_name = handle_tool_call(&json!({})).await;
+                assert!(missing_name.is_err());
+
+                let unknown = handle_tool_call(&json!({"name": "unknown_tool"}))
+                    .await
+                    .expect("unknown tool should return tool error result");
+                assert!(unknown.get("isError").and_then(Value::as_bool).unwrap_or(false));
+
+                let missing_args =
+                    handle_tool_call(&json!({"name": "list_items", "arguments": {}}))
+                        .await
+                        .expect("list_items without args should return tool error result");
+                assert!(missing_args
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false));
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn list_lists_and_handle_tool_call_cover_success_path() {
+        let (api, requests) = api_with_responses(vec![
+            json!([
+                {
+                    "id": 7,
+                    "name": "Groceries",
+                    "icon": "cart",
+                    "color": "#00aa00"
+                }
+            ])
+            .to_string(),
+            json!([
+                {
+                    "id": 9,
+                    "name": "Weekend",
+                    "icon": "calendar",
+                    "color": "#112233"
+                }
+            ])
+            .to_string(),
+        ])
+        .await;
+
+        let listed = super::list_lists(&api)
+            .await
+            .expect("list_lists should succeed");
+        assert_eq!(listed[0]["id"], 7);
+
+        let base_url = api.base_url_for_tests().to_string();
+        let result = with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                ("KRAMLI_API_KEY", "kramli_test"),
+            ],
+            || async {
+                handle_tool_call(&json!({"name": "list_lists"}))
+                    .await
+                    .expect("list_lists tool should succeed")
+            },
+        )
+        .await;
+        assert!(!result["isError"].as_bool().unwrap_or(true));
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Weekend")));
+
+        let requests = requests.await.expect("server should finish");
+        let first_lines = requests
+            .iter()
+            .map(|request| request.lines().next().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first_lines,
+            vec!["GET /api/lists HTTP/1.1", "GET /api/lists HTTP/1.1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_items_and_update_tags_cover_remaining_filter_and_body_paths() {
+        let (api, requests) = api_with_responses(vec![
+            json!([
+                {
+                    "id": 1,
+                    "list_id": 5,
+                    "text": "Open",
+                    "is_done": false,
+                    "progress": "todo",
+                    "created_at": "2026-01-01"
+                },
+                {
+                    "id": 2,
+                    "list_id": 5,
+                    "text": "Done",
+                    "is_done": true,
+                    "progress": "done",
+                    "created_at": "2026-01-02"
+                }
+            ])
+            .to_string(),
+            json!([
+                {
+                    "id": 1,
+                    "list_id": 5,
+                    "text": "Open",
+                    "is_done": false,
+                    "progress": "todo",
+                    "created_at": "2026-01-01"
+                }
+            ])
+            .to_string(),
+            json!({"id": 9, "text": "Tagged"}).to_string(),
+        ])
+        .await;
+
+        let completed_args = json!({"list_id": 5, "completed": true})
+            .as_object()
+            .cloned()
+            .expect("args object");
+        let completed = list_items(&api, &completed_args)
+            .await
+            .expect("completed list should succeed");
+        assert_eq!(completed.as_array().expect("array").len(), 1);
+        assert_eq!(completed[0]["id"], 2);
+
+        let mismatched_state_args = json!({"list_id": 5, "state": "in_progress", "oldest": true})
+            .as_object()
+            .cloned()
+            .expect("args object");
+        let mismatched = list_items(&api, &mismatched_state_args)
+            .await
+            .expect("state mismatch query should succeed");
+        assert!(mismatched.as_array().expect("array").is_empty());
+
+        let update_args = json!({"id": 9, "tags": ["  one  ", "two", ""]})
+            .as_object()
+            .cloned()
+            .expect("args object");
+        let updated = update_item(&api, &update_args)
+            .await
+            .expect("update with tags should succeed");
+        assert_eq!(updated["id"], 9);
+
+        let requests = requests.await.expect("server should finish");
+        assert!(requests[2].contains("\"tags\":[\"one\",\"two\"]"));
+    }
+
+    #[test]
+    fn parser_waits_for_full_content_length_body_and_skips_header_lines_without_colon() {
+        let body = b"{}";
+        let mut incomplete = b"HeaderWithoutColon\r\nContent-Length: 2\r\n\r\n{".to_vec();
+        assert!(try_parse_message(&mut incomplete)
+            .expect("incomplete body should wait")
+            .is_none());
+
+        let mut complete = b"HeaderWithoutColon\r\nContent-Length: 2\r\n\r\n{}".to_vec();
+        let parsed = try_parse_message(&mut complete)
+            .expect("complete body should parse")
+            .expect("message expected");
+        assert_eq!(parsed.value, json!({}));
+        assert!(matches!(parsed.framing, MessageFraming::ContentLength));
+        assert!(complete.is_empty());
+
+        let mut no_content_length = b"HeaderWithoutColon\r\nAnotherBadLine\r\n\r\n{}".to_vec();
+        assert!(try_parse_message(&mut no_content_length).is_err());
+
+        assert_eq!(body.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn run_stdio_entrypoint_is_reachable_under_timeout() {
+        let _ = tokio::time::timeout(Duration::from_millis(5), run_stdio()).await;
     }
 }

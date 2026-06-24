@@ -149,15 +149,12 @@ pub(crate) fn tr_args(key: &str, args: &[(&str, String)]) -> String {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Mutex;
 
     use super::{
         apply_profile_locale, current_locale_code, detect_locale, is_explicit_lang_set,
         normalize_candidate, parse_supported_locale, set_locale, tr, tr_args,
         try_parse_supported_locale, KRAMLI_LANG_ENV, SUPPORTED_LANGS,
     };
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn locale_file(lang: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -209,8 +206,7 @@ mod tests {
         }
     }
 
-    fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().expect("i18n env lock poisoned");
+    fn with_env_var_inner<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
         let previous = std::env::var(key).ok();
         match value {
             Some(value) => std::env::set_var(key, value),
@@ -222,6 +218,10 @@ mod tests {
             None => std::env::remove_var(key),
         }
         result
+    }
+
+    fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        crate::test_env::with_env_lock(|| with_env_var_inner(key, value, f))
     }
 
     #[test]
@@ -269,14 +269,16 @@ mod tests {
 
     #[test]
     fn env_helper_restores_existing_lang_value() {
-        std::env::set_var(KRAMLI_LANG_ENV, "en");
+        crate::test_env::with_env_lock(|| {
+            std::env::set_var(KRAMLI_LANG_ENV, "en");
 
-        with_env_var(KRAMLI_LANG_ENV, Some("fr"), || {
-            assert_eq!(std::env::var(KRAMLI_LANG_ENV).as_deref(), Ok("fr"));
+            with_env_var_inner(KRAMLI_LANG_ENV, Some("fr"), || {
+                assert_eq!(std::env::var(KRAMLI_LANG_ENV).as_deref(), Ok("fr"));
+            });
+
+            assert_eq!(std::env::var(KRAMLI_LANG_ENV).as_deref(), Ok("en"));
+            std::env::remove_var(KRAMLI_LANG_ENV);
         });
-
-        assert_eq!(std::env::var(KRAMLI_LANG_ENV).as_deref(), Ok("en"));
-        std::env::remove_var(KRAMLI_LANG_ENV);
     }
 
     #[test]
