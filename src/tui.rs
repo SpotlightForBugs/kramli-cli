@@ -8761,6 +8761,9 @@ mod tests {
 
     #[test]
     fn restore_terminal_function_is_reachable() {
+        if !std::io::IsTerminal::is_terminal(&io::stdout()) {
+            return;
+        }
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend).expect("stdout terminal should construct");
         let _ = restore_terminal(&mut terminal);
