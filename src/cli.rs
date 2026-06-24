@@ -784,7 +784,10 @@ mod tests {
         crate::i18n::set_locale("en");
 
         with_env_vars_async(
-            &[("KRAMLI_URL", "http://::invalid-url"), (TEST_KRAMLI_API_KEY_ENV, "kramli_test")],
+            &[
+                ("KRAMLI_URL", "http://::invalid-url"),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
             || async {
                 maybe_apply_profile_locale(Some(&command)).await;
             },
@@ -792,7 +795,10 @@ mod tests {
         .await;
 
         with_env_vars_async(
-            &[("KRAMLI_URL", "http://127.0.0.1:9"), (TEST_KRAMLI_API_KEY_ENV, "kramli_test")],
+            &[
+                ("KRAMLI_URL", "http://127.0.0.1:9"),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
             || async {
                 maybe_apply_profile_locale(Some(&command)).await;
             },
@@ -802,7 +808,10 @@ mod tests {
         let profile = serde_json::to_string(&sample_profile(Some("it-IT"))).unwrap();
         let (base_url, requests) = server_with_base_url(vec![profile]).await;
         with_env_vars_async(
-            &[("KRAMLI_URL", base_url.as_str()), (TEST_KRAMLI_API_KEY_ENV, "kramli_test")],
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
             || async {
                 maybe_apply_profile_locale(Some(&command)).await;
             },
@@ -999,13 +1008,11 @@ mod tests {
         let handle = tokio::spawn(async move {
             let mut requests = Vec::new();
             for body in responses {
-                let (mut stream, _) = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    listener.accept(),
-                )
-                .await
-                .expect("test server accept timed out")
-                .expect("request should connect");
+                let (mut stream, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                        .await
+                        .expect("test server accept timed out")
+                        .expect("request should connect");
                 let mut buffer = [0_u8; 4096];
                 let read = stream.read(&mut buffer).await.expect("request should read");
                 let request = String::from_utf8_lossy(&buffer[..read]).to_string();
@@ -2065,8 +2072,7 @@ mod tests {
             )],
             || async {
                 run_privacy(PrivacyCmd::Reset, true).expect("privacy reset json should succeed");
-                run_privacy(PrivacyCmd::Reset, false)
-                    .expect("privacy reset human should succeed");
+                run_privacy(PrivacyCmd::Reset, false).expect("privacy reset human should succeed");
             },
         )
         .await;
@@ -2462,7 +2468,10 @@ mod tests {
         .await;
 
         with_env_vars_async(
-            &[(KRAMLI_BATCH_EXECUTABLE_ENV, "/definitely/missing-kramli-executable")],
+            &[(
+                KRAMLI_BATCH_EXECUTABLE_ENV,
+                "/definitely/missing-kramli-executable",
+            )],
             || async {
                 let err = run_batch_json(&batch_file, false)
                     .await
@@ -2489,7 +2498,10 @@ mod tests {
         let profile = serde_json::to_string(&sample_profile(Some("en"))).unwrap();
         let (base_url, requests) = server_with_base_url(vec![profile.clone(), profile]).await;
         with_env_vars_async(
-            &[("KRAMLI_URL", base_url.as_str()), (TEST_KRAMLI_API_KEY_ENV, "kramli_test")],
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
             || async {
                 run_status(true)
                     .await
@@ -2508,7 +2520,10 @@ mod tests {
 
         let (error_base_url, error_requests) = server_with_status(500, "{}").await;
         with_env_vars_async(
-            &[("KRAMLI_URL", error_base_url.as_str()), (TEST_KRAMLI_API_KEY_ENV, "kramli_test")],
+            &[
+                ("KRAMLI_URL", error_base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
             || async {
                 run_status(false)
                     .await
@@ -2522,11 +2537,17 @@ mod tests {
 
     #[tokio::test]
     async fn invite_link_and_key_create_fallback_outputs_are_covered() {
-        let responses = vec![json!({"ok": true}).to_string(), json!({"id": 1}).to_string()];
+        let responses = vec![
+            json!({"ok": true}).to_string(),
+            json!({"id": 1}).to_string(),
+        ];
         let (base_url, requests) = server_with_base_url(responses).await;
 
         with_env_vars_async(
-            &[("KRAMLI_URL", base_url.as_str()), (TEST_KRAMLI_API_KEY_ENV, "kramli_test")],
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
             || async {
                 run_members(MemberCmd::InviteLink { list_id: 7 }, false)
                     .await
@@ -2568,7 +2589,10 @@ mod tests {
         ])
         .await;
         with_env_vars_async(
-            &[("KRAMLI_URL", base_url.as_str()), (TEST_KRAMLI_API_KEY_ENV, "kramli_test")],
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
             || async {
                 run_accept_terms(None, false)
                     .await
@@ -2615,9 +2639,11 @@ mod tests {
 
     #[tokio::test]
     async fn run_login_with_covers_invalid_success_and_profile_error_paths() {
-        assert!(run_login_with(None, || Ok("bad".to_string()), |_, _| Ok(()), |_| Ok(()))
-            .await
-            .is_err());
+        assert!(
+            run_login_with(None, || Ok("bad".to_string()), |_, _| Ok(()), |_| Ok(()))
+                .await
+                .is_err()
+        );
 
         let config_root = std::env::temp_dir().join(format!(
             "kramli-cli-login-{}-{}",
@@ -2729,7 +2755,10 @@ mod tests {
     async fn update_fetch_and_notice_cover_http_parse_success_and_cache_paths() {
         let (http_error_url, http_error_requests) = server_with_status(503, "{}").await;
         with_env_vars_async(
-            &[(KRAMLI_UPDATE_CHECK_URL_ENV, &format!("{http_error_url}/latest"))],
+            &[(
+                KRAMLI_UPDATE_CHECK_URL_ENV,
+                &format!("{http_error_url}/latest"),
+            )],
             || async {
                 assert!(fetch_latest_release().await.is_err());
             },
@@ -2742,7 +2771,10 @@ mod tests {
 
         let (invalid_json_url, invalid_json_requests) = server_with_status(200, "not-json").await;
         with_env_vars_async(
-            &[(KRAMLI_UPDATE_CHECK_URL_ENV, &format!("{invalid_json_url}/latest"))],
+            &[(
+                KRAMLI_UPDATE_CHECK_URL_ENV,
+                &format!("{invalid_json_url}/latest"),
+            )],
             || async {
                 assert!(fetch_latest_release().await.is_err());
             },
@@ -2753,8 +2785,8 @@ mod tests {
             .expect("test server should finish");
         assert_eq!(invalid_json_requests, vec!["GET /latest HTTP/1.1"]);
 
-        let release = json!({"tag_name": "9.9.9", "html_url": "https://example.invalid/v9.9.9"})
-            .to_string();
+        let release =
+            json!({"tag_name": "9.9.9", "html_url": "https://example.invalid/v9.9.9"}).to_string();
         let (update_api, ok_requests) =
             api_with_responses(vec![release.clone(), release.clone(), release]).await;
         let ok_url = update_api.base_url_for_tests().to_string();
@@ -2804,9 +2836,12 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_latest_release_covers_transport_and_body_read_errors() {
-        with_env_vars_async(&[(KRAMLI_UPDATE_CHECK_URL_ENV, "http://::invalid-url")], || async {
-            assert!(fetch_latest_release().await.is_err());
-        })
+        with_env_vars_async(
+            &[(KRAMLI_UPDATE_CHECK_URL_ENV, "http://::invalid-url")],
+            || async {
+                assert!(fetch_latest_release().await.is_err());
+            },
+        )
         .await;
 
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2835,7 +2870,10 @@ mod tests {
         });
 
         with_env_vars_async(
-            &[(KRAMLI_UPDATE_CHECK_URL_ENV, &format!("http://{addr}/latest"))],
+            &[(
+                KRAMLI_UPDATE_CHECK_URL_ENV,
+                &format!("http://{addr}/latest"),
+            )],
             || async {
                 assert!(fetch_latest_release().await.is_err());
             },
@@ -2874,7 +2912,8 @@ mod tests {
         let responses = vec![
             json!({"id": 7, "name": "Groceries"}).to_string(),
             json!({"ok": true}).to_string(),
-            json!([{"id": 9, "list_id": 7, "text": "Milk", "is_done": false, "tags": ["fresh"]}]).to_string(),
+            json!([{"id": 9, "list_id": 7, "text": "Milk", "is_done": false, "tags": ["fresh"]}])
+                .to_string(),
         ];
         let (base_url, requests) = server_with_base_url(responses).await;
 

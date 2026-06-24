@@ -1015,7 +1015,10 @@ async fn handle_runtime_event<B: Backend>(
     }
 }
 
-async fn run_event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(), String> {
+async fn run_event_loop<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+) -> Result<(), String> {
     let mut dirty = true;
     loop {
         if app.drain_load_messages() {
@@ -1037,7 +1040,8 @@ async fn run_event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -
         }
 
         loop {
-            if handle_runtime_event(terminal, app, event::read().map_err(|e| e.to_string())?).await?
+            if handle_runtime_event(terminal, app, event::read().map_err(|e| e.to_string())?)
+                .await?
             {
                 dirty = true;
             }
@@ -7915,13 +7919,11 @@ mod tests {
         let handle = tokio::spawn(async move {
             let mut requests = Vec::new();
             for body in responses {
-                let (mut stream, _) = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    listener.accept(),
-                )
-                .await
-                .expect("test server accept timed out")
-                .expect("request should connect");
+                let (mut stream, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                        .await
+                        .expect("test server accept timed out")
+                        .expect("request should connect");
                 let mut buffer = [0_u8; 4096];
                 let read = stream.read(&mut buffer).await.expect("request should read");
                 let request = String::from_utf8_lossy(&buffer[..read]).to_string();
@@ -8363,7 +8365,10 @@ mod tests {
         app.comments_cache.insert(2, Vec::new());
 
         app.open_comment_editor().unwrap();
-        assert_eq!(app.editor.as_ref().map(|editor| editor.mode), Some(EditorMode::Comment));
+        assert_eq!(
+            app.editor.as_ref().map(|editor| editor.mode),
+            Some(EditorMode::Comment)
+        );
         app.editor = None;
 
         app.editor = Some(EditorState {
@@ -8636,28 +8641,24 @@ mod tests {
                 .expect("release key should be ignored")
         );
 
-        assert!(
-            handle_runtime_event(
-                &mut terminal,
-                &mut app,
-                Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            )
-            .await
-            .expect("global quit key should be handled")
-        );
+        assert!(handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        )
+        .await
+        .expect("global quit key should be handled"));
         assert!(app.should_quit);
 
         app.should_quit = false;
         app.beta_consent_pending = true;
-        assert!(
-            handle_runtime_event(
-                &mut terminal,
-                &mut app,
-                Event::Mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 2)),
-            )
-            .await
-            .expect("beta consent mouse event should be handled")
-        );
+        assert!(handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 2)),
+        )
+        .await
+        .expect("beta consent mouse event should be handled"));
 
         app.beta_consent_pending = false;
         app.editor = Some(EditorState {
@@ -8679,24 +8680,20 @@ mod tests {
             notes: String::default(),
             active_field: EditorField::Text,
         });
-        assert!(
-            handle_runtime_event(
-                &mut terminal,
-                &mut app,
-                Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty())),
-            )
-            .await
-            .expect("editor key event should be handled")
-        );
-        assert!(
-            handle_runtime_event(
-                &mut terminal,
-                &mut app,
-                Event::Mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0)),
-            )
-            .await
-            .expect("editor mouse event should be handled")
-        );
+        assert!(handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty())),
+        )
+        .await
+        .expect("editor key event should be handled"));
+        assert!(handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0)),
+        )
+        .await
+        .expect("editor mouse event should be handled"));
 
         assert!(
             handle_runtime_event(&mut terminal, &mut app, Event::Resize(100, 40))
@@ -8836,7 +8833,10 @@ mod tests {
         )
         .await
         .expect("non-started drag should only update status");
-        assert_eq!(app.status.as_deref(), Some(tr("tui-help-calendar-3").as_str()));
+        assert_eq!(
+            app.status.as_deref(),
+            Some(tr("tui-help-calendar-3").as_str())
+        );
 
         app.calendar_drag_item = Some(0);
         app.calendar_drag_source_date = Some(SimpleDate {
@@ -9880,10 +9880,7 @@ mod tests {
             let list_requests = requests.await.expect("test server should finish");
             assert_eq!(
                 list_requests,
-                vec![
-                    "GET /api/lists HTTP/1.1",
-                    "GET /api/lists/1/items HTTP/1.1"
-                ]
+                vec!["GET /api/lists HTTP/1.1", "GET /api/lists/1/items HTTP/1.1"]
             );
 
             std::env::set_var(KRAMLI_AUTO_HANDOFF_ENV, "1");
@@ -9910,7 +9907,10 @@ mod tests {
             assert!(due_processed);
 
             let handoff_requests = requests.await.expect("test server should finish");
-            assert_eq!(handoff_requests, vec!["POST /api/activity/viewing HTTP/1.1"]);
+            assert_eq!(
+                handoff_requests,
+                vec!["POST /api/activity/viewing HTTP/1.1"]
+            );
 
             match previous_auto_handoff {
                 Some(value) => std::env::set_var(KRAMLI_AUTO_HANDOFF_ENV, value),
@@ -9955,22 +9955,30 @@ mod tests {
                 .unwrap();
             assert_eq!(app.items[0].is_done, Some(true));
 
-            app.trigger_footer_action(FooterAction::Delete).await.unwrap();
+            app.trigger_footer_action(FooterAction::Delete)
+                .await
+                .unwrap();
             assert!(app.items.is_empty());
 
-            app.trigger_footer_action(FooterAction::Members).await.unwrap();
+            app.trigger_footer_action(FooterAction::Members)
+                .await
+                .unwrap();
             assert!(app
                 .status
                 .as_deref()
                 .is_some_and(|value| value.contains("4")));
 
-            app.trigger_footer_action(FooterAction::Invite).await.unwrap();
+            app.trigger_footer_action(FooterAction::Invite)
+                .await
+                .unwrap();
             assert!(app
                 .status
                 .as_deref()
                 .is_some_and(|value| value.contains("https://kram.li/i/from-test")));
 
-            app.trigger_footer_action(FooterAction::Invite).await.unwrap();
+            app.trigger_footer_action(FooterAction::Invite)
+                .await
+                .unwrap();
             assert!(app
                 .status
                 .as_deref()
@@ -9987,7 +9995,9 @@ mod tests {
             }
             assert_eq!(app.items.len(), 1);
 
-            app.trigger_footer_action(FooterAction::Members).await.unwrap();
+            app.trigger_footer_action(FooterAction::Members)
+                .await
+                .unwrap();
             assert_eq!(app.status, Some(tr("output-no-members")));
 
             app.trigger_footer_action(FooterAction::Help).await.unwrap();
@@ -10000,9 +10010,15 @@ mod tests {
             app.trigger_footer_action(FooterAction::ToggleDone)
                 .await
                 .unwrap();
-            app.trigger_footer_action(FooterAction::Delete).await.unwrap();
-            app.trigger_footer_action(FooterAction::Members).await.unwrap();
-            app.trigger_footer_action(FooterAction::Invite).await.unwrap();
+            app.trigger_footer_action(FooterAction::Delete)
+                .await
+                .unwrap();
+            app.trigger_footer_action(FooterAction::Members)
+                .await
+                .unwrap();
+            app.trigger_footer_action(FooterAction::Invite)
+                .await
+                .unwrap();
             app.trigger_footer_action(FooterAction::Undo).await.unwrap();
 
             let requests = requests.await.expect("test server should finish");
@@ -11645,11 +11661,9 @@ mod tests {
                 &Picker::halfblocks(),
                 true,
             );
-            assert!(
-                lines
-                    .iter()
-                    .any(|line| line.contains("img env protocol=(unset) images=(unset)"))
-            );
+            assert!(lines
+                .iter()
+                .any(|line| line.contains("img env protocol=(unset) images=(unset)")));
 
             match previous_protocol {
                 Some(value) => std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, value),
@@ -11804,9 +11818,16 @@ mod tests {
         assert_eq!(app.progress_choices().len(), 2);
 
         let mut item = sample_item(1, "Task");
-        item.tags = Some(vec!["Milk".to_string(), " milk ".to_string(), "Bread".to_string()]);
+        item.tags = Some(vec![
+            "Milk".to_string(),
+            " milk ".to_string(),
+            "Bread".to_string(),
+        ]);
         app.items = vec![item];
-        assert_eq!(app.tag_suggestions(), vec!["Bread".to_string(), "Milk".to_string()]);
+        assert_eq!(
+            app.tag_suggestions(),
+            vec!["Bread".to_string(), "Milk".to_string()]
+        );
 
         app.editor = Some(EditorState {
             mode: EditorMode::Edit,
@@ -11858,11 +11879,10 @@ mod tests {
             terms_accepted: Some(false),
         };
         app.apply_profile_result(Ok(profile));
-        assert!(
-            app.status
-                .as_deref()
-                .is_some_and(|value| value.contains("privacy"))
-        );
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|value| value.contains("privacy")));
         app.apply_profile_result(Err("profile failed".to_string()));
         assert_eq!(app.status.as_deref(), Some("profile failed"));
 
