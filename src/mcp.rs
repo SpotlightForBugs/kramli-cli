@@ -39,7 +39,9 @@ where
     let mut buffer = Vec::new();
 
     while let Some(message) = read_message(stdin, &mut buffer).await? {
-        if let Some(response) = handle_message(message.value).await { write_message(stdout, &response, message.framing).await?; }
+        if let Some(response) = handle_message(message.value).await {
+            write_message(stdout, &response, message.framing).await?;
+        }
     }
 
     Ok(())
@@ -688,13 +690,12 @@ fn tools() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        content_length, create_item, delete_item, error_response, handle_message,
-        handle_tool_call,
+        content_length, create_item, delete_item, error_response, handle_message, handle_tool_call,
         insert_optional_string, insert_reminder_fields, list_items, mcp_method_trace_name,
         mcp_tool_trace_name, optional_bool, optional_i64, optional_i64_array, optional_string,
-        optional_string_array, read_message, required_i64, required_string, run_stdio,
-        run_with_io, toggle_item_done, tool_result, tool_text_result, tools, try_parse_message,
-        update_item, write_message, MessageFraming,
+        optional_string_array, read_message, required_i64, required_string, run_stdio, run_with_io,
+        toggle_item_done, tool_result, tool_text_result, tools, try_parse_message, update_item,
+        write_message, MessageFraming,
     };
     use crate::api::ApiClient;
     use serde_json::{json, Map, Value};
@@ -714,10 +715,11 @@ mod tests {
         let handle = tokio::spawn(async move {
             let mut requests = Vec::new();
             for body in responses {
-                let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                    .await
-                    .expect("test server accept timed out")
-                    .expect("request should connect");
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .expect("test server accept timed out")
+                        .expect("request should connect");
                 let mut buffer = [0_u8; 4096];
                 let read = stream.read(&mut buffer).await.expect("request should read");
                 requests.push(String::from_utf8_lossy(&buffer[..read]).to_string());
@@ -872,10 +874,9 @@ mod tests {
                 .expect("ping response");
             assert_eq!(ping["result"], json!({}));
 
-            let listed =
-                handle_message(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}))
-                    .await
-                    .expect("tools/list response");
+            let listed = handle_message(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}))
+                .await
+                .expect("tools/list response");
             assert!(listed["result"]["tools"]
                 .as_array()
                 .is_some_and(|tools| tools.len() >= 6));
@@ -890,10 +891,9 @@ mod tests {
             .expect("tools/call error response");
             assert_eq!(tool_without_credentials["error"]["code"], -32603);
 
-            let unknown =
-                handle_message(json!({"jsonrpc": "2.0", "id": 4, "method": "custom"}))
-                    .await
-                    .expect("unknown response");
+            let unknown = handle_message(json!({"jsonrpc": "2.0", "id": 4, "method": "custom"}))
+                .await
+                .expect("unknown response");
             assert_eq!(unknown["error"]["code"], -32601);
         })
         .await;
@@ -1374,7 +1374,9 @@ mod tests {
         .as_object()
         .cloned()
         .expect("args object");
-        let filtered = list_items(&api, &args).await.expect("list_items should succeed");
+        let filtered = list_items(&api, &args)
+            .await
+            .expect("list_items should succeed");
         let filtered = filtered.as_array().expect("array response");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["id"], 1);
@@ -1387,7 +1389,9 @@ mod tests {
         .as_object()
         .cloned()
         .expect("args object");
-        let ordered = list_items(&api, &args).await.expect("list_items should succeed");
+        let ordered = list_items(&api, &args)
+            .await
+            .expect("list_items should succeed");
         let ordered = ordered.as_array().expect("array response");
         assert_eq!(ordered[0]["id"], 10);
 
@@ -1431,16 +1435,10 @@ mod tests {
             .expect("update_item should succeed");
         assert_eq!(updated["text"], "Updated");
 
-        let no_change_args = json!({"id": 99})
-            .as_object()
-            .cloned()
-            .expect("args object");
+        let no_change_args = json!({"id": 99}).as_object().cloned().expect("args object");
         assert!(update_item(&api, &no_change_args).await.is_err());
 
-        let toggle_args = json!({"id": 99})
-            .as_object()
-            .cloned()
-            .expect("args object");
+        let toggle_args = json!({"id": 99}).as_object().cloned().expect("args object");
         let toggled = toggle_item_done(&api, &toggle_args)
             .await
             .expect("toggle should succeed");
@@ -1514,7 +1512,10 @@ mod tests {
                 let unknown = handle_tool_call(&json!({"name": "unknown_tool"}))
                     .await
                     .expect("unknown tool should return tool error result");
-                assert!(unknown.get("isError").and_then(Value::as_bool).unwrap_or(false));
+                assert!(unknown
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false));
 
                 let missing_args =
                     handle_tool_call(&json!({"name": "list_items", "arguments": {}}))
