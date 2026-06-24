@@ -2950,10 +2950,12 @@ pub(crate) enum ItemCmd {
         text: String,
         #[arg(short, long)]
         quantity: Option<String>,
+        /// Due date (ISO like 2026-12-31 or localized text such as "morgen")
         #[arg(short, long)]
         due: Option<String>,
         #[arg(long)]
         due_time: Option<String>,
+        /// Planned date (ISO like 2026-12-31 or localized text)
         #[arg(long, alias = "planned-date")]
         planned: Option<String>,
         #[arg(long)]
@@ -2994,10 +2996,12 @@ pub(crate) enum ItemCmd {
         text: Option<String>,
         #[arg(short, long)]
         quantity: Option<String>,
+        /// Due date (ISO like 2026-12-31 or localized text such as "morgen")
         #[arg(short, long)]
         due: Option<String>,
         #[arg(long)]
         due_time: Option<String>,
+        /// Planned date (ISO like 2026-12-31 or localized text)
         #[arg(long, alias = "planned-date")]
         planned: Option<String>,
         #[arg(long)]

@@ -617,9 +617,9 @@ fn tools() -> Vec<Value> {
                     "text": {"type": "string"},
                     "quantity": {"type": "string"},
                     "notes": {"type": "string"},
-                    "due_date": {"type": "string", "description": "Due date (YYYY-MM-DD)."},
+                    "due_date": {"type": "string", "description": "Due date (YYYY-MM-DD or localized text)."},
                     "due_time": {"type": "string", "description": "Due time (HH:MM)."},
-                    "planned_date": {"type": "string", "description": "Planned date (YYYY-MM-DD)."},
+                    "planned_date": {"type": "string", "description": "Planned date (YYYY-MM-DD or localized text)."},
                     "planned_time": {"type": "string", "description": "Planned time (HH:MM)."},
                     "reminder": {"type": "boolean", "description": "Enable additional reminders."},
                     "reminder_time": {"type": "string", "description": "Reminder time (HH:MM)."},
@@ -645,9 +645,9 @@ fn tools() -> Vec<Value> {
                     "text": {"type": "string"},
                     "quantity": {"type": "string"},
                     "notes": {"type": "string"},
-                    "due_date": {"type": "string", "description": "Due date (YYYY-MM-DD)."},
+                    "due_date": {"type": "string", "description": "Due date (YYYY-MM-DD or localized text)."},
                     "due_time": {"type": "string", "description": "Due time (HH:MM)."},
-                    "planned_date": {"type": "string", "description": "Planned date (YYYY-MM-DD)."},
+                    "planned_date": {"type": "string", "description": "Planned date (YYYY-MM-DD or localized text)."},
                     "planned_time": {"type": "string", "description": "Planned time (HH:MM)."},
                     "reminder": {"type": "boolean", "description": "Enable additional reminders."},
                     "reminder_time": {"type": "string", "description": "Reminder time (HH:MM)."},
@@ -994,9 +994,12 @@ mod tests {
             .and_then(|entry| entry.get("description"))
             .and_then(Value::as_str);
 
-        assert_eq!(due_date, Some("Due date (YYYY-MM-DD)."));
+        assert_eq!(due_date, Some("Due date (YYYY-MM-DD or localized text)."));
         assert_eq!(due_time, Some("Due time (HH:MM)."));
-        assert_eq!(planned_date, Some("Planned date (YYYY-MM-DD)."));
+        assert_eq!(
+            planned_date,
+            Some("Planned date (YYYY-MM-DD or localized text).")
+        );
         assert_eq!(planned_time, Some("Planned time (HH:MM)."));
         assert_eq!(reminder, Some("Enable additional reminders."));
         assert_eq!(reminder_time, Some("Reminder time (HH:MM)."));
@@ -1035,7 +1038,10 @@ mod tests {
             .and_then(Value::as_str);
 
         assert_eq!(reminder, Some("Enable additional reminders."));
-        assert_eq!(planned_date, Some("Planned date (YYYY-MM-DD)."));
+        assert_eq!(
+            planned_date,
+            Some("Planned date (YYYY-MM-DD or localized text).")
+        );
         assert_eq!(
             travel_time_minutes,
             Some("Travel time in minutes (independent from reminders).")

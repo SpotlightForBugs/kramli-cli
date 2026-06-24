@@ -4168,27 +4168,47 @@ fn valid_due_date_input(raw: &str) -> bool {
     if value.is_empty() {
         return true;
     }
-    if parse_iso_date(value).is_none() {
-        return false;
+    if due_date_input_looks_iso(value) {
+        if parse_iso_date(value).is_none() {
+            return false;
+        }
+        if value.len() == 10 {
+            return true;
+        }
+        if parse_due_time(value).is_none() {
+            return false;
+        }
+        return value
+            .get(16..)
+            .unwrap_or_default()
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, ':' | 'Z' | 'z' | '+' | '-'));
     }
-    if value.len() == 10 {
-        return true;
-    }
-    if parse_due_time(value).is_none() {
-        return false;
-    }
-    value
-        .get(16..)
-        .unwrap_or_default()
-        .chars()
-        .all(|ch| ch.is_ascii_digit() || matches!(ch, ':' | 'Z' | 'z' | '+' | '-'))
+    due_date_localized_text_allowed(value)
 }
 
 fn due_date_input_prefix_allowed(raw: &str) -> bool {
     let value = raw.trim();
-    value.len() <= 25
+    value.len() <= 48
+        && (value.is_empty()
+            || value.chars().all(|ch| {
+                ch.is_ascii_digit() || matches!(ch, '-' | 'T' | 't' | ':' | 'Z' | 'z' | '+' | ' ')
+            })
+            || due_date_localized_text_allowed(value))
+}
+
+fn due_date_input_looks_iso(value: &str) -> bool {
+    value.starts_with(|ch: char| ch.is_ascii_digit()) && value.contains('-')
+}
+
+fn due_date_localized_text_allowed(value: &str) -> bool {
+    value.len() <= 48
         && value.chars().all(|ch| {
-            ch.is_ascii_digit() || matches!(ch, '-' | 'T' | 't' | ':' | 'Z' | 'z' | '+' | ' ')
+            ch.is_alphanumeric()
+                || matches!(
+                    ch,
+                    ' ' | '-' | '_' | '/' | '.' | ':' | '+' | ',' | '(' | ')'
+                )
         })
 }
 
@@ -9645,6 +9665,41 @@ mod tests {
         );
         assert!(app.legal_consent_pending);
 
+        app.beta_consent_pending = false;
+        app.apply_profile_result(Ok(Profile {
+            id: Some(2),
+            display_name: None,
+            email: Some("grace@example.test".to_string()),
+            photo_url: None,
+            lang: None,
+            is_anonymous: Some(false),
+            created_at: None,
+            legal: Some(crate::models::ProfileLegalStatus {
+                pending: vec![crate::models::ProfilePendingLegalDoc {
+                    key: Some("agb".to_string()),
+                }],
+            }),
+            terms_accepted: Some(false),
+        }));
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|value| value.contains("agb")));
+
+        let (reload_api, reload_requests) = api_with_responses(vec![serde_json::json!([
+            {"id": 1, "name": "Groceries"}
+        ])
+        .to_string()])
+        .await;
+        let mut reload_app = App::new(reload_api, true);
+        reload_app.reload_lists_background();
+        let reload_message = reload_app.rx.recv().await.expect("lists should load");
+        match reload_message {
+            LoadMessage::Lists(Ok(lists)) => assert_eq!(lists.len(), 1),
+            _ => panic!("unexpected reload message"),
+        }
+        assert_eq!(reload_requests.await.unwrap()[0], "GET /api/lists HTTP/1.1");
+
         app.apply_accept_terms_result(Err("accept failed".to_string()));
         assert_eq!(app.status.as_deref(), Some("accept failed"));
         app.apply_accept_terms_result(Ok(
@@ -9660,6 +9715,43 @@ mod tests {
         assert_eq!(app.status.as_deref(), Some(tr("output-no-lists").as_str()));
         app.apply_lists_result(Ok(vec![test_list()]));
         assert_eq!(app.selected_list_id(), Some(1));
+
+        let mut no_handoff_app = test_app();
+        no_handoff_app.send_auto_handoff_viewing_background();
+        assert!(no_handoff_app.pending_auto_handoff_list_id.is_none());
+        while app.rx.try_recv().is_ok() {}
+        app.send_auto_handoff_viewing_background();
+        loop {
+            match app.rx.recv().await.expect("handoff should be scheduled") {
+                LoadMessage::AutoHandoffDue { list_id, list_name } => {
+                    assert_eq!(list_id, 1);
+                    assert_eq!(list_name, "Groceries");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let (items_api, item_requests) = api_with_responses(vec![serde_json::json!([
+            {"id": 1, "list_id": 1, "text": "Loaded", "is_done": false}
+        ])
+        .to_string()])
+        .await;
+        let mut loading_app = App::new(items_api, true);
+        loading_app.lists = vec![test_list()];
+        loading_app.load_items_for_selected_list(false);
+        let items_message = loading_app.rx.recv().await.expect("items should load");
+        match items_message {
+            LoadMessage::Items { list_id, result } => {
+                assert_eq!(list_id, 1);
+                assert_eq!(result.unwrap().len(), 1);
+            }
+            _ => panic!("unexpected items message"),
+        }
+        assert_eq!(
+            item_requests.await.unwrap()[0],
+            "GET /api/lists/1/items HTTP/1.1"
+        );
 
         app.apply_items_result(2, Ok(vec![sample_item(20, "Cached")]));
         assert!(app.items_cache.contains_key(&2));
@@ -9705,6 +9797,9 @@ mod tests {
         app.apply_profile_image_result("profile.png".to_string(), Err("no image".to_string()));
         assert!(app.profile_image.is_none());
         app.pending_profile_image = Some("profile.png".to_string());
+        app.apply_profile_image_result("profile.png".to_string(), Ok(Vec::new()));
+        assert!(app.profile_image.is_none());
+        app.pending_profile_image = Some("profile.png".to_string());
         app.apply_profile_image_result("profile.png".to_string(), Ok(bytes));
         assert!(app.profile_image.is_some());
 
@@ -9721,6 +9816,9 @@ mod tests {
         app.pending_list_icons.insert("cart".to_string());
         app.apply_list_icon_result("cart".to_string(), Err("missing".to_string()));
         assert!(app.failed_list_icons.contains("cart"));
+        app.pending_list_icons.insert("empty".to_string());
+        app.apply_list_icon_result("empty".to_string(), Ok(DynamicImage::new_rgba8(0, 0)));
+        assert!(app.failed_list_icons.contains("empty"));
         app.pending_list_icons.insert("tag".to_string());
         app.apply_list_icon_result("tag".to_string(), Ok(DynamicImage::new_rgba8(2, 2)));
         assert!(!app.pending_list_icons.contains("tag"));
@@ -9730,7 +9828,6 @@ mod tests {
         app.apply_open_image_result("other.png".to_string(), Ok("ignored".to_string()));
         assert_eq!(app.pending_open_image.as_deref(), Some("expected.png"));
         assert_eq!(app.status.as_deref(), Some("unchanged"));
-
         app.pending_open_image = Some("bad.png".to_string());
         app.apply_open_image_result("bad.png".to_string(), Err("open failed".to_string()));
         assert_eq!(app.status.as_deref(), Some("open failed"));
@@ -10956,11 +11053,14 @@ mod tests {
         assert!(valid_due_date_input("2026-06-17"));
         assert!(valid_due_date_input("2026-06-17T09:30"));
         assert!(valid_due_date_input("2026-06-17T09:30:00Z"));
-        assert!(!valid_due_date_input("morgen"));
+        assert!(valid_due_date_input("morgen"));
+        assert!(valid_due_date_input("tomorrow 09:30"));
+        assert!(valid_due_date_input("mañana"));
         assert!(!valid_due_date_input("2026-02-29"));
         assert!(!valid_due_date_input("2026-06-17 later"));
         assert!(due_date_input_prefix_allowed("2026-06-"));
-        assert!(!due_date_input_prefix_allowed("morgen"));
+        assert!(due_date_input_prefix_allowed("morgen"));
+        assert!(due_date_input_prefix_allowed("mañana"));
     }
 
     #[test]
