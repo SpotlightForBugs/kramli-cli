@@ -1442,12 +1442,12 @@ mod tests {
         let toggled = toggle_item_done(&api, &toggle_args)
             .await
             .expect("toggle should succeed");
-        assert!(toggled["is_done"]);
+        assert_eq!(toggled["is_done"], true);
 
         let deleted = delete_item(&api, &toggle_args)
             .await
             .expect("delete should succeed");
-        assert!(deleted["ok"]);
+        assert_eq!(deleted["ok"], true);
 
         let requests = requests.await.expect("server should finish");
         let first_lines = requests
