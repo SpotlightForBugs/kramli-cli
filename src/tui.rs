@@ -1827,6 +1827,10 @@ impl App {
             self.failed_list_icons.insert(icon);
             return;
         };
+        if image.width() == 0 || image.height() == 0 {
+            self.failed_list_icons.insert(icon);
+            return;
+        }
         match self.picker.new_protocol(
             image,
             Size::new(2, 1),
