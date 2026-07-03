@@ -198,6 +198,12 @@ pub(crate) enum ListCmd {
         color: Option<String>,
         #[arg(short, long)]
         folder: Option<i64>,
+        /// List type: tasks or note (aliases like todo/notizzettel are accepted)
+        #[arg(long = "type")]
+        list_type: Option<String>,
+        /// Initial note content (for note lists)
+        #[arg(long)]
+        note_content: Option<String>,
         /// Custom states as CSV (e.g. "Open,In Progress,Review,Done")
         /// or as JSON array (e.g. '[{"name":"Review","color":"#7c3aed"}]').
         #[arg(long)]
@@ -213,6 +219,12 @@ pub(crate) enum ListCmd {
         icon: Option<String>,
         #[arg(short, long)]
         color: Option<String>,
+        /// List type: tasks or note (aliases like todo/notizzettel are accepted)
+        #[arg(long = "type")]
+        list_type: Option<String>,
+        /// Full note content (for note lists)
+        #[arg(long)]
+        note_content: Option<String>,
         /// Custom states as CSV (e.g. "Open,In Progress,Review,Done")
         /// or as JSON array (e.g. '[{"name":"Review","color":"#7c3aed"}]').
         #[arg(long)]
@@ -1154,6 +1166,8 @@ mod tests {
             Some("Groceries".to_string()),
             Some("cart".to_string()),
             Some("#ffffff".to_string()),
+            Some("notizzettel".to_string()),
+            Some("# Notiz".to_string()),
             Some("Open:#336699,Done".to_string()),
         )
         .expect("list body should build");
@@ -1166,8 +1180,25 @@ mod tests {
             body.get("color"),
             Some(&Value::String("#ffffff".to_string()))
         );
+        assert_eq!(
+            body.get("list_type"),
+            Some(&Value::String("note".to_string()))
+        );
+        assert_eq!(
+            body.get("note_content"),
+            Some(&Value::String("# Notiz".to_string()))
+        );
         assert!(body.get("states").is_some_and(Value::is_array));
-        assert!(update_list_body(None, None, None, None).is_err());
+        assert!(update_list_body(None, None, None, None, None, None).is_err());
+
+        assert_eq!(
+            normalize_list_type_arg(Some("Notizzettel".to_string())).as_deref(),
+            Some("note")
+        );
+        assert_eq!(
+            normalize_list_type_arg(Some("TODO".to_string())).as_deref(),
+            Some("tasks")
+        );
 
         let mut failed = 0;
         let mut first_error = None;
@@ -1211,6 +1242,8 @@ mod tests {
             Some("cart".to_string()),
             Some("#ffffff".to_string()),
             Some(3),
+            Some("tasks".to_string()),
+            None,
             Some("Open:#336699,Done".to_string()),
         )
         .await
@@ -1222,6 +1255,8 @@ mod tests {
             None,
             None,
             None,
+            Some("notizzettel".to_string()),
+            Some("# Einkauf\n- Milch".to_string()),
             None,
         )
         .await
@@ -1234,12 +1269,24 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect("update human should succeed");
-        run_lists_update(&api, true, 7, None, Some("list".to_string()), None, None)
-            .await
-            .expect("update json should succeed");
+        run_lists_update(
+            &api,
+            true,
+            7,
+            None,
+            Some("list".to_string()),
+            None,
+            Some("note".to_string()),
+            Some("Updated note".to_string()),
+            None,
+        )
+        .await
+        .expect("update json should succeed");
         run_lists_delete(&api, false, 7)
             .await
             .expect("delete human should succeed");
@@ -1598,6 +1645,41 @@ mod tests {
         assert_eq!(requests[14], "GET /api/lists/7/items HTTP/1.1");
         assert_eq!(requests[15], "GET /api/lists/7 HTTP/1.1");
         assert_eq!(requests[16], "GET /api/lists/7/items HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn items_list_uses_note_content_for_note_lists() {
+        let responses = vec![json!({
+            "id": 7,
+            "name": "Notizzettel",
+            "list_type": "notizzettel",
+            "note_content": "# Einkauf\n- [ ] Milch"
+        })
+        .to_string()];
+        let (api, requests) = api_with_responses(responses).await;
+
+        with_env_vars_async(&[(TEST_KRAMLI_AUTO_HANDOFF_ENV, "false")], || async {
+            run_items_list(
+                &api,
+                false,
+                ItemListArgs {
+                    list_id: 7,
+                    open: false,
+                    completed: false,
+                    state: None,
+                    contains: None,
+                    newest: false,
+                    oldest: false,
+                    limit: None,
+                },
+            )
+            .await
+            .expect("note list should render note content");
+        })
+        .await;
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["GET /api/lists/7 HTTP/1.1"]);
     }
 
     #[tokio::test]
@@ -2363,6 +2445,8 @@ mod tests {
                         icon: None,
                         color: None,
                         folder: None,
+                        list_type: Some("notizzettel".to_string()),
+                        note_content: Some("# Start".to_string()),
                         states: None,
                     },
                     true,
@@ -2375,6 +2459,8 @@ mod tests {
                         name: Some("Updated".to_string()),
                         icon: None,
                         color: None,
+                        list_type: Some("tasks".to_string()),
+                        note_content: None,
                         states: None,
                     },
                     true,
@@ -3749,6 +3835,39 @@ fn parse_states_arg(raw: &str) -> Result<Value, String> {
     Ok(Value::Array(states))
 }
 
+fn normalize_list_type_arg(list_type: Option<String>) -> Option<String> {
+    let normalized = list_type?.trim().to_ascii_lowercase().trim().to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let canonical = match normalized.as_str() {
+        "task" | "tasks" | "todo" | "todos" | "list" | "items" => "tasks",
+        "note" | "notes" | "markdown" | "notizzettel" => "note",
+        _ => normalized.as_str(),
+    };
+    Some(canonical.to_string())
+}
+
+fn is_note_list_type(list_type: Option<&str>) -> bool {
+    normalize_list_type_arg(list_type.map(str::to_string)).as_deref() == Some("note")
+}
+
+fn list_note_content(payload: &Value) -> Option<&str> {
+    payload
+        .get("note_content")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn list_type_value(payload: &Value) -> Option<&str> {
+    payload.get("list_type").and_then(Value::as_str)
+}
+
+fn list_from_payload(payload: Value) -> Result<ShoppingList, String> {
+    serde_json::from_value(payload).map_err(|e| e.to_string())
+}
+
 fn normalize_progress_value(progress: Option<String>) -> Option<Value> {
     progress.map(|value| {
         let trimmed = value.trim();
@@ -4112,8 +4231,19 @@ async fn run_lists(cmd: ListCmd, as_json: bool) -> Result<(), String> {
             });
         }
         ListCmd::Show { id } => {
-            let list: ShoppingList = api.get(&format!("/lists/{id}")).await?;
-            json_or!(as_json, list, output::print_list_detail(&list));
+            let payload: Value = api.get(&format!("/lists/{id}")).await?;
+            let list = list_from_payload(payload.clone())?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+            } else {
+                output::print_list_detail(&list);
+                if is_note_list_type(list_type_value(&payload)) {
+                    output::print_note_content(list_note_content(&payload));
+                }
+            }
             maybe_auto_handoff(&api, id, Some(&list.name), as_json).await;
         }
         ListCmd::Create {
@@ -4121,15 +4251,45 @@ async fn run_lists(cmd: ListCmd, as_json: bool) -> Result<(), String> {
             icon,
             color,
             folder,
+            list_type,
+            note_content,
             states,
-        } => run_lists_create(&api, as_json, name, icon, color, folder, states).await?,
+        } => {
+            run_lists_create(
+                &api,
+                as_json,
+                name,
+                icon,
+                color,
+                folder,
+                list_type,
+                note_content,
+                states,
+            )
+            .await?
+        }
         ListCmd::Update {
             id,
             name,
             icon,
             color,
+            list_type,
+            note_content,
             states,
-        } => run_lists_update(&api, as_json, id, name, icon, color, states).await?,
+        } => {
+            run_lists_update(
+                &api,
+                as_json,
+                id,
+                name,
+                icon,
+                color,
+                list_type,
+                note_content,
+                states,
+            )
+            .await?
+        }
         ListCmd::Delete { id } => run_lists_delete(&api, as_json, id).await?,
         ListCmd::Move { id, folder_id } => run_lists_move(&api, as_json, id, folder_id).await?,
     }
@@ -4143,6 +4303,8 @@ async fn run_lists_create(
     icon: Option<String>,
     color: Option<String>,
     folder: Option<i64>,
+    list_type: Option<String>,
+    note_content: Option<String>,
     states: Option<String>,
 ) -> Result<(), String> {
     let body = CreateList {
@@ -4152,14 +4314,21 @@ async fn run_lists_create(
         folder_id: folder,
     };
     let mut payload = serde_json::to_value(&body).map_err(|e| e.to_string())?;
+    if let Some(list_type) = normalize_list_type_arg(list_type) {
+        payload["list_type"] = Value::String(list_type);
+    }
+    if let Some(note_content) = note_content {
+        payload["note_content"] = Value::String(note_content);
+    }
     if let Some(states_raw) = states {
         payload["states"] = parse_states_arg(&states_raw)?;
     }
-    let list: ShoppingList = api.post("/lists", &payload).await?;
+    let payload: Value = api.post("/lists", &payload).await?;
+    let list = list_from_payload(payload.clone())?;
     if as_json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&list).unwrap_or_default()
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
         );
     } else {
         println!(
@@ -4168,6 +4337,9 @@ async fn run_lists_create(
             tr_args("cli-list-created", &[("id", list.id.to_string())])
         );
         output::print_list_detail(&list);
+        if is_note_list_type(list_type_value(&payload)) {
+            output::print_note_content(list_note_content(&payload));
+        }
     }
     Ok(())
 }
@@ -4179,14 +4351,25 @@ async fn run_lists_update(
     name: Option<String>,
     icon: Option<String>,
     color: Option<String>,
+    list_type: Option<String>,
+    note_content: Option<String>,
     states: Option<String>,
 ) -> Result<(), String> {
-    let body = update_list_body(name, icon, color, states)?;
-    let list: ShoppingList = api.put(&format!("/lists/{id}"), &body).await?;
-    json_or!(as_json, list, {
+    let body = update_list_body(name, icon, color, list_type, note_content, states)?;
+    let payload: Value = api.put(&format!("/lists/{id}"), &body).await?;
+    let list = list_from_payload(payload.clone())?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+    } else {
         println!("{} {}", "✓".green(), tr("cli-list-updated"));
         output::print_list_detail(&list);
-    });
+        if is_note_list_type(list_type_value(&payload)) {
+            output::print_note_content(list_note_content(&payload));
+        }
+    }
     Ok(())
 }
 
@@ -4194,12 +4377,18 @@ fn update_list_body(
     name: Option<String>,
     icon: Option<String>,
     color: Option<String>,
+    list_type: Option<String>,
+    note_content: Option<String>,
     states: Option<String>,
 ) -> Result<serde_json::Map<String, Value>, String> {
     let mut body = serde_json::Map::new();
     insert_string(&mut body, "name", name);
     insert_string(&mut body, "icon", icon);
     insert_string(&mut body, "color", color);
+    if let Some(list_type) = normalize_list_type_arg(list_type) {
+        body.insert("list_type".into(), Value::String(list_type));
+    }
+    insert_string(&mut body, "note_content", note_content);
     if let Some(states_raw) = states {
         body.insert("states".into(), parse_states_arg(&states_raw)?);
     }
@@ -4424,10 +4613,29 @@ async fn run_items_list(api: &ApiClient, as_json: bool, args: ItemListArgs) -> R
     let list = if as_json {
         None
     } else {
-        api.get::<ShoppingList>(&format!("/lists/{list_id}"))
-            .await
-            .ok()
+        api.get::<Value>(&format!("/lists/{list_id}")).await.ok()
     };
+    let list_model = list
+        .as_ref()
+        .and_then(|value| list_from_payload(value.clone()).ok());
+    if !as_json
+        && list
+            .as_ref()
+            .is_some_and(|value| is_note_list_type(list_type_value(value)))
+    {
+        output::print_note_for_list(
+            list_model.as_ref(),
+            list.as_ref().and_then(list_note_content),
+        );
+        maybe_auto_handoff(
+            api,
+            list_id,
+            list_model.as_ref().map(|l| l.name.as_str()),
+            as_json,
+        )
+        .await;
+        return Ok(());
+    }
     let items: Vec<ListItem> = api.get(&format!("/lists/{list_id}/items")).await?;
     let state_filter = state
         .map(|value| value.trim().to_ascii_lowercase())
@@ -4461,12 +4669,12 @@ async fn run_items_list(api: &ApiClient, as_json: bool, args: ItemListArgs) -> R
     json_or!(
         as_json,
         filtered,
-        output::print_items_for_list(list.as_ref(), &filtered)
+        output::print_items_for_list(list_model.as_ref(), &filtered)
     );
     maybe_auto_handoff(
         api,
         list_id,
-        list.as_ref().map(|l| l.name.as_str()),
+        list_model.as_ref().map(|l| l.name.as_str()),
         as_json,
     )
     .await;

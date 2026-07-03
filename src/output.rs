@@ -499,6 +499,43 @@ pub(crate) fn print_list_detail(l: &ShoppingList) {
     );
 }
 
+/// Print note content for a note list detail view.
+pub(crate) fn print_note_content(note_content: Option<&str>) {
+    let Some(note_content) = note_content
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+
+    println!("   {}:", tr("label-notes"));
+    for line in note_content.lines() {
+        println!("     {line}");
+    }
+}
+
+/// Print a note-list document in the item-list view.
+pub(crate) fn print_note_for_list(list: Option<&ShoppingList>, note_content: Option<&str>) {
+    if let Some(list) = list {
+        println!(
+            "{}: {}",
+            tr("label-items"),
+            list_display_name_with_folder(list)
+        );
+    }
+
+    let note_content = note_content.unwrap_or("").trim();
+    if note_content.is_empty() {
+        println!("{}", tr("output-no-items").dimmed());
+        return;
+    }
+
+    println!("  {}", tr("label-notes").magenta());
+    for line in note_content.lines() {
+        println!("    {line}");
+    }
+}
+
 // ── Items ──
 
 /// Strip HTML tags from a string (best-effort, no full parser needed).

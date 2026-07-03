@@ -64,6 +64,8 @@ kramli lists list
 kramli items list <LIST_ID> --open
 kramli items list <LIST_ID> --open --newest --limit 11
 kramli items add <LIST_ID> "Milk" --priority high
+kramli lists create "Notizzettel" --type note --note-content "# Ideen\n- [ ] Termin"
+kramli lists update <LIST_ID> --note-content "# Notiz\nAktualisiert"
 kramli search "dark mode"
 ```
 
