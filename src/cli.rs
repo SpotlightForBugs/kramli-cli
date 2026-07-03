@@ -5,7 +5,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use colored::control::set_override;
 use colored::Colorize;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::process::Command as TokioCommand;
 
@@ -15,6 +15,15 @@ use crate::i18n::{apply_profile_locale, current_locale_code, is_explicit_lang_se
 use crate::models::*;
 use crate::output;
 use crate::telemetry;
+
+mod list_commands;
+
+use list_commands::run_lists;
+#[cfg(test)]
+use list_commands::{
+    run_lists_create, run_lists_delete, run_lists_move, run_lists_update, CreateListArgs,
+    UpdateListArgs,
+};
 
 const NO_COLOR_ENV: &str = "NO_COLOR";
 const KRAMLI_DEVICE_LABEL_ENV: &str = "KRAMLI_DEVICE_LABEL";
@@ -38,6 +47,10 @@ pub(crate) struct Cli {
     /// Start a full-screen terminal UI
     #[arg(short = 'i', long)]
     pub(crate) interactive: bool,
+
+    /// Preview mutating API requests without sending them
+    #[arg(long, global = true)]
+    pub(crate) dry_run: bool,
 
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
@@ -692,6 +705,7 @@ mod tests {
         run_inner(Cli {
             json: false,
             interactive: false,
+            dry_run: false,
             command: None,
         })
         .await
@@ -700,6 +714,7 @@ mod tests {
         assert!(run_inner(Cli {
             json: true,
             interactive: true,
+            dry_run: false,
             command: None,
         })
         .await
@@ -708,6 +723,7 @@ mod tests {
         assert!(run_inner(Cli {
             json: false,
             interactive: true,
+            dry_run: false,
             command: Some(Commands::Status),
         })
         .await
@@ -716,6 +732,7 @@ mod tests {
         run_inner(Cli {
             json: false,
             interactive: true,
+            dry_run: false,
             command: None,
         })
         .await
@@ -724,6 +741,7 @@ mod tests {
         run_inner(Cli {
             json: false,
             interactive: false,
+            dry_run: false,
             command: Some(Commands::Config),
         })
         .await
@@ -732,6 +750,7 @@ mod tests {
         assert!(run(Cli {
             json: true,
             interactive: true,
+            dry_run: false,
             command: None,
         })
         .await
@@ -740,6 +759,7 @@ mod tests {
         run(Cli {
             json: true,
             interactive: false,
+            dry_run: false,
             command: Some(Commands::Config),
         })
         .await
@@ -1321,6 +1341,105 @@ mod tests {
         assert_eq!(requests[6], "PUT /api/lists/7 HTTP/1.1");
         assert_eq!(requests[7], "PUT /api/lists/7 HTTP/1.1");
         assert_eq!(requests[8], "PUT /api/lists/7 HTTP/1.1");
+    }
+
+    #[test]
+    fn dry_run_list_create_contract_is_stable() {
+        let command = Commands::Lists {
+            action: ListCmd::Create {
+                name: "Projektplan".to_string(),
+                icon: Some("journal-text".to_string()),
+                color: Some("#336699".to_string()),
+                folder: Some(12),
+                list_type: Some("notizzettel".to_string()),
+                note_content: Some("# Ziele".to_string()),
+                states: Some("Open,Done".to_string()),
+            },
+        };
+
+        let requests = dry_run_requests_for_command(&command)
+            .expect("dry-run preview should build")
+            .expect("lists create should be dry-runnable");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/api/lists");
+        let body = requests[0].body.as_ref().expect("body should exist");
+        assert_eq!(
+            body.get("name"),
+            Some(&Value::String("Projektplan".to_string()))
+        );
+        assert_eq!(
+            body.get("list_type"),
+            Some(&Value::String("note".to_string()))
+        );
+        assert_eq!(
+            body.get("note_content"),
+            Some(&Value::String("# Ziele".to_string()))
+        );
+        assert!(body.get("states").is_some_and(Value::is_array));
+    }
+
+    #[test]
+    fn dry_run_item_update_contract_is_stable() {
+        let command = Commands::Items {
+            action: Box::new(ItemCmd::Update {
+                id: 77,
+                text: Some("Milch".to_string()),
+                quantity: None,
+                due: None,
+                due_time: None,
+                planned: None,
+                planned_time: None,
+                reminder: None,
+                reminder_time: None,
+                reminder_days_before: None,
+                reminder_offsets: None,
+                travel_time_minutes: Some(15),
+                priority: Some("high".to_string()),
+                tags: Some("frisch,bio".to_string()),
+                notes: Some("2L".to_string()),
+                assign: Some("1,2".to_string()),
+                color: Some("#22aa66".to_string()),
+                progress: Some("in progress".to_string()),
+            }),
+        };
+
+        let requests = dry_run_requests_for_command(&command)
+            .expect("dry-run preview should build")
+            .expect("item update should be dry-runnable");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "PUT");
+        assert_eq!(requests[0].path, "/api/items/77");
+        let body = requests[0].body.as_ref().expect("body should exist");
+        assert_eq!(body.get("text"), Some(&Value::String("Milch".to_string())));
+        assert_eq!(body.get("travel_time_minutes"), Some(&Value::from(15)));
+        assert!(body.get("tags").is_some_and(Value::is_array));
+        assert!(body.get("assigned_to").is_some_and(Value::is_array));
+    }
+
+    #[tokio::test]
+    async fn dry_run_mutation_does_not_require_live_api() {
+        let result = with_env_vars_async(
+            &[
+                ("KRAMLI_URL", "http://127.0.0.1:9"),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_command_with_context(
+                    Commands::Lists {
+                        action: ListCmd::Delete { id: 9 },
+                    },
+                    CommandContext {
+                        as_json: true,
+                        dry_run: true,
+                    },
+                )
+                .await
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -3392,7 +3511,8 @@ async fn run_inner(cli: Cli) -> Result<(), String> {
         .command
         .as_ref()
         .is_some_and(command_supports_auto_update_check)
-        && !cli.json;
+        && !cli.json
+        && !cli.dry_run;
 
     let Some(command) = cli.command else {
         let mut cmd = Cli::command();
@@ -3403,7 +3523,11 @@ async fn run_inner(cli: Cli) -> Result<(), String> {
 
     maybe_apply_profile_locale(Some(&command)).await;
 
-    let result = run_command(command, cli.json).await;
+    let context = CommandContext {
+        as_json: cli.json,
+        dry_run: cli.dry_run,
+    };
+    let result = run_command_with_context(command, context).await;
     if result.is_ok() && should_auto_update_check {
         maybe_auto_update_notice().await;
     }
@@ -3438,7 +3562,44 @@ fn command_trace_name(command: &Commands) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CommandContext {
+    as_json: bool,
+    dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct DryRunRequest {
+    method: String,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<Value>,
+}
+
+#[cfg(test)]
 async fn run_command(command: Commands, as_json: bool) -> Result<(), String> {
+    run_command_with_context(
+        command,
+        CommandContext {
+            as_json,
+            dry_run: false,
+        },
+    )
+    .await
+}
+
+async fn run_command_with_context(
+    command: Commands,
+    context: CommandContext,
+) -> Result<(), String> {
+    if context.dry_run {
+        if let Some(requests) = dry_run_requests_for_command(&command)? {
+            print_dry_run_preview(command_trace_name(&command), &requests, context.as_json);
+            return Ok(());
+        }
+    }
+
+    let as_json = context.as_json;
     match command {
         Commands::Login { url } => run_login_command(url).await,
         Commands::Logout => run_logout_command(),
@@ -3467,6 +3628,451 @@ async fn run_command(command: Commands, as_json: bool) -> Result<(), String> {
             generate(shell, &mut cmd, "kramli", &mut std::io::stdout());
             Ok(())
         }
+    }
+}
+
+fn print_dry_run_preview(command: &str, requests: &[DryRunRequest], as_json: bool) {
+    if as_json {
+        let payload = json!({
+            "dry_run": true,
+            "command": command,
+            "requests": requests,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+        return;
+    }
+
+    println!("{} dry-run ({command})", "!".yellow());
+    for request in requests {
+        println!("  {} {}", request.method.bold(), request.path);
+        if let Some(body) = &request.body {
+            println!(
+                "    {}",
+                serde_json::to_string_pretty(body).unwrap_or_else(|_| body.to_string())
+            );
+        }
+    }
+}
+
+fn dry_run_request(method: &str, path: impl Into<String>, body: Option<Value>) -> DryRunRequest {
+    DryRunRequest {
+        method: method.to_string(),
+        path: path.into(),
+        body,
+    }
+}
+
+fn dry_run_requests_for_command(command: &Commands) -> Result<Option<Vec<DryRunRequest>>, String> {
+    match command {
+        Commands::Lists { action } => dry_run_requests_for_list_cmd(action),
+        Commands::Items { action } => dry_run_requests_for_item_cmd(action),
+        Commands::Folders { action } => dry_run_requests_for_folder_cmd(action),
+        Commands::Members { action } => Ok(dry_run_requests_for_member_cmd(action)),
+        Commands::Keys { action } => Ok(dry_run_requests_for_key_cmd(action)),
+        Commands::Undo { list_id } => Ok(Some(vec![dry_run_request(
+            "POST",
+            format!("/api/lists/{list_id}/undo"),
+            Some(empty_json_object()),
+        )])),
+        Commands::Redo { list_id } => Ok(Some(vec![dry_run_request(
+            "POST",
+            format!("/api/lists/{list_id}/redo"),
+            Some(empty_json_object()),
+        )])),
+        Commands::Security {
+            action: SecurityCmd::Ack { token },
+        } => {
+            let token = resolve_ack_token(token.as_deref())?;
+            Ok(Some(vec![dry_run_request(
+                "POST",
+                "/api/security/login-ack",
+                Some(json!({ "token": token })),
+            )]))
+        }
+        Commands::AcceptTerms { docs } => {
+            let body = build_accept_terms_body(docs.clone())?;
+            Ok(Some(vec![dry_run_request(
+                "POST",
+                "/api/accept-terms",
+                Some(body),
+            )]))
+        }
+        Commands::Handoff { action } => Ok(dry_run_requests_for_handoff_cmd(action)),
+        Commands::Privacy {
+            action: PrivacyCmd::Reset,
+        } => Ok(Some(vec![dry_run_request(
+            "LOCAL",
+            "config://privacy/reset",
+            None,
+        )])),
+        Commands::Logout => Ok(Some(vec![dry_run_request(
+            "LOCAL",
+            "config://logout",
+            None,
+        )])),
+        _ => Ok(None),
+    }
+}
+
+fn dry_run_requests_for_list_cmd(cmd: &ListCmd) -> Result<Option<Vec<DryRunRequest>>, String> {
+    match cmd {
+        ListCmd::Create {
+            name,
+            icon,
+            color,
+            folder,
+            list_type,
+            note_content,
+            states,
+        } => {
+            let body = build_list_create_payload(
+                name.clone(),
+                icon.clone(),
+                color.clone(),
+                *folder,
+                list_type.clone(),
+                note_content.clone(),
+                states.clone(),
+            )?;
+            Ok(Some(vec![dry_run_request(
+                "POST",
+                "/api/lists",
+                Some(body),
+            )]))
+        }
+        ListCmd::Update {
+            id,
+            name,
+            icon,
+            color,
+            list_type,
+            note_content,
+            states,
+        } => {
+            let body = Value::Object(update_list_body(
+                name.clone(),
+                icon.clone(),
+                color.clone(),
+                list_type.clone(),
+                note_content.clone(),
+                states.clone(),
+            )?);
+            Ok(Some(vec![dry_run_request(
+                "PUT",
+                format!("/api/lists/{id}"),
+                Some(body),
+            )]))
+        }
+        ListCmd::Delete { id } => Ok(Some(vec![dry_run_request(
+            "DELETE",
+            format!("/api/lists/{id}"),
+            None,
+        )])),
+        ListCmd::Move { id, folder_id } => Ok(Some(vec![dry_run_request(
+            "PUT",
+            format!("/api/lists/{id}"),
+            Some(json!({ "folder_id": folder_id })),
+        )])),
+        _ => Ok(None),
+    }
+}
+
+fn dry_run_requests_for_item_cmd(cmd: &ItemCmd) -> Result<Option<Vec<DryRunRequest>>, String> {
+    match cmd {
+        ItemCmd::Add {
+            list_id,
+            text,
+            quantity,
+            due,
+            due_time,
+            planned,
+            planned_time,
+            reminder,
+            reminder_time,
+            reminder_days_before,
+            reminder_offsets,
+            travel_time_minutes,
+            priority,
+            tags,
+            notes,
+            parent,
+            assign,
+            color,
+            progress,
+        } => {
+            let body = build_item_add_payload(ItemAddArgs {
+                list_id: *list_id,
+                text: text.clone(),
+                quantity: quantity.clone(),
+                due: due.clone(),
+                due_time: due_time.clone(),
+                planned: planned.clone(),
+                planned_time: planned_time.clone(),
+                reminder: *reminder,
+                reminder_time: reminder_time.clone(),
+                reminder_days_before: *reminder_days_before,
+                reminder_offsets: reminder_offsets.clone(),
+                travel_time_minutes: *travel_time_minutes,
+                priority: priority.clone(),
+                tags: tags.clone(),
+                notes: notes.clone(),
+                parent: *parent,
+                assign: assign.clone(),
+                color: color.clone(),
+                progress: progress.clone(),
+            })?;
+            Ok(Some(vec![dry_run_request(
+                "POST",
+                format!("/api/lists/{list_id}/items"),
+                Some(body),
+            )]))
+        }
+        ItemCmd::Update {
+            id,
+            text,
+            quantity,
+            due,
+            due_time,
+            planned,
+            planned_time,
+            reminder,
+            reminder_time,
+            reminder_days_before,
+            reminder_offsets,
+            travel_time_minutes,
+            priority,
+            tags,
+            notes,
+            assign,
+            color,
+            progress,
+        } => {
+            let body = build_item_update_payload(ItemUpdateArgs {
+                id: *id,
+                text: text.clone(),
+                quantity: quantity.clone(),
+                due: due.clone(),
+                due_time: due_time.clone(),
+                planned: planned.clone(),
+                planned_time: planned_time.clone(),
+                reminder: *reminder,
+                reminder_time: reminder_time.clone(),
+                reminder_days_before: *reminder_days_before,
+                reminder_offsets: reminder_offsets.clone(),
+                travel_time_minutes: *travel_time_minutes,
+                priority: priority.clone(),
+                tags: tags.clone(),
+                notes: notes.clone(),
+                assign: assign.clone(),
+                color: color.clone(),
+                progress: progress.clone(),
+            })?;
+            Ok(Some(vec![dry_run_request(
+                "PUT",
+                format!("/api/items/{id}"),
+                Some(Value::Object(body)),
+            )]))
+        }
+        ItemCmd::Done { id } => Ok(Some(vec![dry_run_request(
+            "PATCH",
+            format!("/api/items/{id}/done"),
+            Some(empty_json_object()),
+        )])),
+        ItemCmd::Vote { id } => Ok(Some(vec![dry_run_request(
+            "PATCH",
+            format!("/api/items/{id}/upvote"),
+            Some(empty_json_object()),
+        )])),
+        ItemCmd::Delete { id } => Ok(Some(vec![dry_run_request(
+            "DELETE",
+            format!("/api/items/{id}"),
+            None,
+        )])),
+        ItemCmd::Comment { id, text } => Ok(Some(vec![dry_run_request(
+            "POST",
+            format!("/api/items/{id}/comments"),
+            Some(json!({ "text": text })),
+        )])),
+        ItemCmd::CheckAll { list_id } => Ok(Some(vec![dry_run_request(
+            "POST",
+            format!("/api/lists/{list_id}/check-all"),
+            Some(empty_json_object()),
+        )])),
+        ItemCmd::ClearDone { list_id } => Ok(Some(vec![dry_run_request(
+            "POST",
+            format!("/api/lists/{list_id}/clear-done"),
+            Some(empty_json_object()),
+        )])),
+        _ => Ok(None),
+    }
+}
+
+fn dry_run_requests_for_folder_cmd(cmd: &FolderCmd) -> Result<Option<Vec<DryRunRequest>>, String> {
+    match cmd {
+        FolderCmd::Create {
+            name,
+            icon,
+            color,
+            parent,
+        } => {
+            let body = CreateFolder {
+                name: name.clone(),
+                icon: icon.clone(),
+                color: color.clone(),
+                parent_folder_id: *parent,
+            };
+            Ok(Some(vec![dry_run_request(
+                "POST",
+                "/api/folders",
+                Some(serde_json::to_value(body).unwrap_or_default()),
+            )]))
+        }
+        FolderCmd::Update {
+            id,
+            name,
+            icon,
+            color,
+            parent,
+        } => {
+            let mut body = serde_json::Map::new();
+            if let Some(value) = name {
+                body.insert("name".into(), Value::String(value.clone()));
+            }
+            if let Some(value) = icon {
+                body.insert("icon".into(), Value::String(value.clone()));
+            }
+            if let Some(value) = color {
+                body.insert("color".into(), Value::String(value.clone()));
+            }
+            if let Some(value) = parent {
+                body.insert("parent_folder_id".into(), Value::from(*value));
+            }
+            if body.is_empty() {
+                return Err(tr("cli-no-changes"));
+            }
+            Ok(Some(vec![dry_run_request(
+                "PUT",
+                format!("/api/folders/{id}"),
+                Some(Value::Object(body)),
+            )]))
+        }
+        FolderCmd::Delete { id } => Ok(Some(vec![dry_run_request(
+            "DELETE",
+            format!("/api/folders/{id}"),
+            None,
+        )])),
+        FolderCmd::List => Ok(None),
+    }
+}
+
+fn dry_run_requests_for_member_cmd(cmd: &MemberCmd) -> Option<Vec<DryRunRequest>> {
+    match cmd {
+        MemberCmd::Invite {
+            list_id,
+            email,
+            role,
+        } => Some(vec![dry_run_request(
+            "POST",
+            format!("/api/lists/{list_id}/invite"),
+            Some(json!({ "email": email, "role": role })),
+        )]),
+        MemberCmd::Remove { list_id, user_id } => Some(vec![dry_run_request(
+            "DELETE",
+            format!("/api/lists/{list_id}/members/{user_id}"),
+            None,
+        )]),
+        MemberCmd::Role {
+            list_id,
+            user_id,
+            role,
+        } => Some(vec![dry_run_request(
+            "PATCH",
+            format!("/api/lists/{list_id}/members/{user_id}"),
+            Some(json!({ "role": role })),
+        )]),
+        MemberCmd::InviteLink { list_id } => Some(vec![dry_run_request(
+            "POST",
+            format!("/api/lists/{list_id}/invite-link"),
+            Some(empty_json_object()),
+        )]),
+        MemberCmd::Unshare { list_id } => Some(vec![dry_run_request(
+            "DELETE",
+            format!("/api/lists/{list_id}/share"),
+            None,
+        )]),
+        MemberCmd::Leave { list_id } => Some(vec![dry_run_request(
+            "POST",
+            format!("/api/lists/{list_id}/leave"),
+            Some(empty_json_object()),
+        )]),
+        MemberCmd::List { .. } => None,
+    }
+}
+
+fn dry_run_requests_for_key_cmd(cmd: &KeyCmd) -> Option<Vec<DryRunRequest>> {
+    match cmd {
+        KeyCmd::Create { name, scopes } => {
+            let scope_list: Vec<String> = scopes.split(',').map(|s| s.trim().to_string()).collect();
+            Some(vec![dry_run_request(
+                "POST",
+                "/api/api-keys",
+                Some(json!({
+                    "name": name,
+                    "scopes": scope_list,
+                })),
+            )])
+        }
+        KeyCmd::Revoke { key_id } => Some(vec![dry_run_request(
+            "DELETE",
+            format!("/api/api-keys/{key_id}"),
+            None,
+        )]),
+        KeyCmd::List => None,
+    }
+}
+
+fn dry_run_requests_for_handoff_cmd(cmd: &HandoffCmd) -> Option<Vec<DryRunRequest>> {
+    match cmd {
+        HandoffCmd::Viewing {
+            list_id,
+            list_name,
+            device,
+        } => {
+            let body = handoff_body(
+                *list_id,
+                list_name.clone(),
+                default_handoff_device_label(device.clone()),
+            );
+            Some(vec![dry_run_request(
+                "POST",
+                "/api/activity/viewing",
+                Some(Value::Object(body)),
+            )])
+        }
+        HandoffCmd::Continue {
+            list_id,
+            list_name,
+            device,
+        } => {
+            let body = handoff_body(
+                *list_id,
+                list_name.clone(),
+                default_handoff_device_label(device.clone()),
+            );
+            Some(vec![dry_run_request(
+                "POST",
+                "/api/activity/continue-on-device",
+                Some(Value::Object(body)),
+            )])
+        }
+        HandoffCmd::Clear => Some(vec![dry_run_request(
+            "POST",
+            "/api/activity/clear",
+            Some(empty_json_object()),
+        )]),
     }
 }
 
@@ -4218,110 +4824,15 @@ macro_rules! json_or {
 
 // ─── Lists ───
 
-async fn run_lists(cmd: ListCmd, as_json: bool) -> Result<(), String> {
-    let api = get_api()?;
-    match cmd {
-        ListCmd::List => {
-            let lists: Vec<ShoppingList> = api.get("/lists").await?;
-            json_or!(as_json, lists, output::print_lists(&lists));
-        }
-        ListCmd::Resolve { reference } => {
-            let id = resolve_list_reference(&reference)?;
-            let payload = json!({
-                "reference": reference,
-                "list_id": id,
-                "canonical_path": format!("/lists/{id}"),
-            });
-            json_or!(as_json, payload, {
-                println!("{} {}", "✓".green(), tr("cli-list-reference-resolved"));
-                println!("  {}: {id}", tr("label-list-id"));
-                println!("  {}: /lists/{id}", tr("label-canonical"));
-            });
-        }
-        ListCmd::Show { id } => {
-            let payload: Value = api.get(&format!("/lists/{id}")).await?;
-            let list = list_from_payload(payload.clone())?;
-            if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_default()
-                );
-            } else {
-                output::print_list_detail(&list);
-                if is_note_list_type(list_type_value(&payload)) {
-                    output::print_note_content(list_note_content(&payload));
-                }
-            }
-            maybe_auto_handoff(&api, id, Some(&list.name), as_json).await;
-        }
-        ListCmd::Create {
-            name,
-            icon,
-            color,
-            folder,
-            list_type,
-            note_content,
-            states,
-        } => {
-            run_lists_create(
-                &api,
-                as_json,
-                CreateListArgs {
-                    name,
-                    icon,
-                    color,
-                    folder,
-                    list_type,
-                    note_content,
-                    states,
-                },
-            )
-            .await?
-        }
-        ListCmd::Update {
-            id,
-            name,
-            icon,
-            color,
-            list_type,
-            note_content,
-            states,
-        } => {
-            run_lists_update(
-                &api,
-                as_json,
-                UpdateListArgs {
-                    id,
-                    name,
-                    icon,
-                    color,
-                    list_type,
-                    note_content,
-                    states,
-                },
-            )
-            .await?
-        }
-        ListCmd::Delete { id } => run_lists_delete(&api, as_json, id).await?,
-        ListCmd::Move { id, folder_id } => run_lists_move(&api, as_json, id, folder_id).await?,
-    }
-    Ok(())
-}
-
-async fn run_lists_create(
-    api: &ApiClient,
-    as_json: bool,
-    args: CreateListArgs,
-) -> Result<(), String> {
-    let CreateListArgs {
-        name,
-        icon,
-        color,
-        folder,
-        list_type,
-        note_content,
-        states,
-    } = args;
+fn build_list_create_payload(
+    name: String,
+    icon: Option<String>,
+    color: Option<String>,
+    folder: Option<i64>,
+    list_type: Option<String>,
+    note_content: Option<String>,
+    states: Option<String>,
+) -> Result<Value, String> {
     let body = CreateList {
         name,
         icon,
@@ -4338,77 +4849,7 @@ async fn run_lists_create(
     if let Some(states_raw) = states {
         payload["states"] = parse_states_arg(&states_raw)?;
     }
-    let payload: Value = api.post("/lists", &payload).await?;
-    let list = list_from_payload(payload.clone())?;
-    if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload).unwrap_or_default()
-        );
-    } else {
-        println!(
-            "{} {}",
-            "✓".green(),
-            tr_args("cli-list-created", &[("id", list.id.to_string())])
-        );
-        output::print_list_detail(&list);
-        if is_note_list_type(list_type_value(&payload)) {
-            output::print_note_content(list_note_content(&payload));
-        }
-    }
-    Ok(())
-}
-
-async fn run_lists_update(
-    api: &ApiClient,
-    as_json: bool,
-    args: UpdateListArgs,
-) -> Result<(), String> {
-    let UpdateListArgs {
-        id,
-        name,
-        icon,
-        color,
-        list_type,
-        note_content,
-        states,
-    } = args;
-    let body = update_list_body(name, icon, color, list_type, note_content, states)?;
-    let payload: Value = api.put(&format!("/lists/{id}"), &body).await?;
-    let list = list_from_payload(payload.clone())?;
-    if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&payload).unwrap_or_default()
-        );
-    } else {
-        println!("{} {}", "✓".green(), tr("cli-list-updated"));
-        output::print_list_detail(&list);
-        if is_note_list_type(list_type_value(&payload)) {
-            output::print_note_content(list_note_content(&payload));
-        }
-    }
-    Ok(())
-}
-
-struct CreateListArgs {
-    name: String,
-    icon: Option<String>,
-    color: Option<String>,
-    folder: Option<i64>,
-    list_type: Option<String>,
-    note_content: Option<String>,
-    states: Option<String>,
-}
-
-struct UpdateListArgs {
-    id: i64,
-    name: Option<String>,
-    icon: Option<String>,
-    color: Option<String>,
-    list_type: Option<String>,
-    note_content: Option<String>,
-    states: Option<String>,
+    Ok(payload)
 }
 
 fn update_list_body(
@@ -4434,59 +4875,6 @@ fn update_list_body(
         return Err(tr("cli-no-changes"));
     }
     Ok(body)
-}
-
-async fn run_lists_delete(api: &ApiClient, as_json: bool, id: i64) -> Result<(), String> {
-    let resp: OkResponse = api.delete(&format!("/lists/{id}")).await?;
-    if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&resp).unwrap_or_default()
-        );
-    } else {
-        println!("{} {}", "✓".green(), tr("cli-list-deleted"));
-        if let Some(t) = resp.undo_token {
-            println!("  {}: {t}", tr("label-undo-token"));
-        }
-    }
-    Ok(())
-}
-
-async fn run_lists_move(
-    api: &ApiClient,
-    as_json: bool,
-    id: i64,
-    folder_id: Option<i64>,
-) -> Result<(), String> {
-    let body = json!({"folder_id": folder_id});
-    let list: ShoppingList = api.put(&format!("/lists/{id}"), &body).await?;
-    if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&list).unwrap_or_default()
-        );
-    } else {
-        print_list_move_result(id, folder_id);
-    }
-    Ok(())
-}
-
-fn print_list_move_result(id: i64, folder_id: Option<i64>) {
-    match folder_id {
-        Some(fid) => println!(
-            "{} {}",
-            "✓".green(),
-            tr_args(
-                "cli-list-moved-folder",
-                &[("id", id.to_string()), ("folder_id", fid.to_string())],
-            )
-        ),
-        None => println!(
-            "{} {}",
-            "✓".green(),
-            tr_args("cli-list-removed-folder", &[("id", id.to_string())])
-        ),
-    }
 }
 
 // ─── Items ───
@@ -4798,8 +5186,26 @@ struct ItemAddArgs {
 }
 
 async fn run_items_add(api: &ApiClient, as_json: bool, args: ItemAddArgs) -> Result<(), String> {
+    let list_id = args.list_id;
+    let val = build_item_add_payload(args)?;
+    let item: ListItem = api.post(&format!("/lists/{list_id}/items"), &val).await?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&item).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "{} {}",
+            "✓".green(),
+            tr_args("cli-item-created", &[("id", item.id.to_string())])
+        );
+    }
+    Ok(())
+}
+
+fn build_item_add_payload(args: ItemAddArgs) -> Result<Value, String> {
     let ItemAddArgs {
-        list_id,
         text,
         quantity,
         due,
@@ -4818,6 +5224,7 @@ async fn run_items_add(api: &ApiClient, as_json: bool, args: ItemAddArgs) -> Res
         assign,
         color,
         progress,
+        ..
     } = args;
     let tag_vec = tags.map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
     let reminder = effective_reminder_value(
@@ -4841,30 +5248,17 @@ async fn run_items_add(api: &ApiClient, as_json: bool, args: ItemAddArgs) -> Res
         tags: tag_vec,
         parent_item_id: parent,
     };
-    let mut val = serde_json::to_value(&body).map_err(|e| e.to_string())?;
+    let mut payload = serde_json::to_value(&body).map_err(|e| e.to_string())?;
     if let Some(a) = assign {
-        val["assigned_to"] = Value::Array(parse_id_values(&a));
+        payload["assigned_to"] = Value::Array(parse_id_values(&a));
     }
     if let Some(c) = color {
-        val["color"] = Value::String(c);
+        payload["color"] = Value::String(c);
     }
     if let Some(progress_value) = normalize_progress_value(progress) {
-        val["progress"] = progress_value;
+        payload["progress"] = progress_value;
     }
-    let item: ListItem = api.post(&format!("/lists/{list_id}/items"), &val).await?;
-    if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&item).unwrap_or_default()
-        );
-    } else {
-        println!(
-            "{} {}",
-            "✓".green(),
-            tr_args("cli-item-created", &[("id", item.id.to_string())])
-        );
-    }
-    Ok(())
+    Ok(payload)
 }
 
 struct ItemUpdateArgs {
@@ -4893,8 +5287,25 @@ async fn run_items_update(
     as_json: bool,
     args: ItemUpdateArgs,
 ) -> Result<(), String> {
+    let id = args.id;
+    let tags_provided = args.tags.is_some();
+    let body = build_item_update_payload(args)?;
+    let mut item: ListItem = api.put(&format!("/items/{id}"), &body).await?;
+    if !tags_provided {
+        enrich_item_tags_from_list(api, &mut item).await;
+    }
+    json_or!(
+        as_json,
+        item,
+        println!("{} {}", "✓".green(), tr("cli-item-updated"))
+    );
+    Ok(())
+}
+
+fn build_item_update_payload(
+    args: ItemUpdateArgs,
+) -> Result<serde_json::Map<String, Value>, String> {
     let ItemUpdateArgs {
-        id,
         text,
         quantity,
         due,
@@ -4912,8 +5323,8 @@ async fn run_items_update(
         assign,
         color,
         progress,
+        ..
     } = args;
-    let tags_provided = tags.is_some();
     let mut body = serde_json::Map::new();
     let reminder = effective_reminder_value(
         reminder,
@@ -4960,16 +5371,7 @@ async fn run_items_update(
     if body.is_empty() {
         return Err(tr("cli-no-changes"));
     }
-    let mut item: ListItem = api.put(&format!("/items/{id}"), &body).await?;
-    if !tags_provided {
-        enrich_item_tags_from_list(api, &mut item).await;
-    }
-    json_or!(
-        as_json,
-        item,
-        println!("{} {}", "✓".green(), tr("cli-item-updated"))
-    );
-    Ok(())
+    Ok(body)
 }
 
 fn insert_string(body: &mut serde_json::Map<String, Value>, key: &str, value: Option<String>) {
@@ -5876,6 +6278,41 @@ fn batch_child_args(line: &str) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
+fn resolve_ack_token(token: Option<&str>) -> Result<String, String> {
+    token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| std::env::var(KRAMLI_ACK_TOKEN_ENV).ok())
+        .ok_or_else(|| tr("cli-security-ack-token-missing"))
+}
+
+fn build_accept_terms_body(docs: Option<Vec<String>>) -> Result<Value, String> {
+    let normalized_docs = docs.map(|values| {
+        values
+            .into_iter()
+            .map(|value| value.trim().to_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+    });
+
+    if let Some(ref values) = normalized_docs {
+        for value in values {
+            if value != "agb" && value != "privacy" {
+                return Err(tr_args(
+                    "cli-invalid-doc-key",
+                    &[("value", value.to_string())],
+                ));
+            }
+        }
+    }
+
+    Ok(match normalized_docs {
+        Some(values) if !values.is_empty() => json!({ "docs": values }),
+        _ => Value::Object(serde_json::Map::new()),
+    })
+}
+
 async fn run_security(cmd: SecurityCmd, as_json: bool) -> Result<(), String> {
     let api = get_api()?;
     match cmd {
@@ -5926,15 +6363,7 @@ async fn run_security(cmd: SecurityCmd, as_json: bool) -> Result<(), String> {
             Ok(())
         }
         SecurityCmd::Ack { token } => {
-            let token = token
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .or_else(|| std::env::var(KRAMLI_ACK_TOKEN_ENV).ok());
-            let Some(token) = token else {
-                return Err(tr("cli-security-ack-token-missing"));
-            };
+            let token = resolve_ack_token(token.as_deref())?;
             let body = json!({ "token": token });
             let data: Value = api.post("/security/login-ack", &body).await?;
             if as_json {
@@ -6003,29 +6432,7 @@ async fn run_profile(as_json: bool) -> Result<(), String> {
 async fn run_accept_terms(docs: Option<Vec<String>>, as_json: bool) -> Result<(), String> {
     let api = get_api()?;
 
-    let normalized_docs = docs.map(|values| {
-        values
-            .into_iter()
-            .map(|value| value.trim().to_lowercase())
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>()
-    });
-
-    if let Some(ref values) = normalized_docs {
-        for value in values {
-            if value != "agb" && value != "privacy" {
-                return Err(tr_args(
-                    "cli-invalid-doc-key",
-                    &[("value", value.to_string())],
-                ));
-            }
-        }
-    }
-
-    let body = match normalized_docs {
-        Some(values) if !values.is_empty() => json!({ "docs": values }),
-        _ => Value::Object(serde_json::Map::new()),
-    };
+    let body = build_accept_terms_body(docs)?;
 
     let resp: Value = api.post("/accept-terms", &body).await?;
     if as_json {
