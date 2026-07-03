@@ -1238,52 +1238,60 @@ mod tests {
         run_lists_create(
             &api,
             false,
-            "Created".to_string(),
-            Some("cart".to_string()),
-            Some("#ffffff".to_string()),
-            Some(3),
-            Some("tasks".to_string()),
-            None,
-            Some("Open:#336699,Done".to_string()),
+            CreateListArgs {
+                name: "Created".to_string(),
+                icon: Some("cart".to_string()),
+                color: Some("#ffffff".to_string()),
+                folder: Some(3),
+                list_type: Some("tasks".to_string()),
+                note_content: None,
+                states: Some("Open:#336699,Done".to_string()),
+            },
         )
         .await
         .expect("create human should succeed");
         run_lists_create(
             &api,
             true,
-            "Created JSON".to_string(),
-            None,
-            None,
-            None,
-            Some("notizzettel".to_string()),
-            Some("# Einkauf\n- Milch".to_string()),
-            None,
+            CreateListArgs {
+                name: "Created JSON".to_string(),
+                icon: None,
+                color: None,
+                folder: None,
+                list_type: Some("notizzettel".to_string()),
+                note_content: Some("# Einkauf\n- Milch".to_string()),
+                states: None,
+            },
         )
         .await
         .expect("create json should succeed");
         run_lists_update(
             &api,
             false,
-            7,
-            Some("Updated".to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
+            UpdateListArgs {
+                id: 7,
+                name: Some("Updated".to_string()),
+                icon: None,
+                color: None,
+                list_type: None,
+                note_content: None,
+                states: None,
+            },
         )
         .await
         .expect("update human should succeed");
         run_lists_update(
             &api,
             true,
-            7,
-            None,
-            Some("list".to_string()),
-            None,
-            Some("note".to_string()),
-            Some("Updated note".to_string()),
-            None,
+            UpdateListArgs {
+                id: 7,
+                name: None,
+                icon: Some("list".to_string()),
+                color: None,
+                list_type: Some("note".to_string()),
+                note_content: Some("Updated note".to_string()),
+                states: None,
+            },
         )
         .await
         .expect("update json should succeed");
@@ -4258,13 +4266,15 @@ async fn run_lists(cmd: ListCmd, as_json: bool) -> Result<(), String> {
             run_lists_create(
                 &api,
                 as_json,
-                name,
-                icon,
-                color,
-                folder,
-                list_type,
-                note_content,
-                states,
+                CreateListArgs {
+                    name,
+                    icon,
+                    color,
+                    folder,
+                    list_type,
+                    note_content,
+                    states,
+                },
             )
             .await?
         }
@@ -4280,13 +4290,15 @@ async fn run_lists(cmd: ListCmd, as_json: bool) -> Result<(), String> {
             run_lists_update(
                 &api,
                 as_json,
-                id,
-                name,
-                icon,
-                color,
-                list_type,
-                note_content,
-                states,
+                UpdateListArgs {
+                    id,
+                    name,
+                    icon,
+                    color,
+                    list_type,
+                    note_content,
+                    states,
+                },
             )
             .await?
         }
@@ -4299,14 +4311,17 @@ async fn run_lists(cmd: ListCmd, as_json: bool) -> Result<(), String> {
 async fn run_lists_create(
     api: &ApiClient,
     as_json: bool,
-    name: String,
-    icon: Option<String>,
-    color: Option<String>,
-    folder: Option<i64>,
-    list_type: Option<String>,
-    note_content: Option<String>,
-    states: Option<String>,
+    args: CreateListArgs,
 ) -> Result<(), String> {
+    let CreateListArgs {
+        name,
+        icon,
+        color,
+        folder,
+        list_type,
+        note_content,
+        states,
+    } = args;
     let body = CreateList {
         name,
         icon,
@@ -4347,14 +4362,17 @@ async fn run_lists_create(
 async fn run_lists_update(
     api: &ApiClient,
     as_json: bool,
-    id: i64,
-    name: Option<String>,
-    icon: Option<String>,
-    color: Option<String>,
-    list_type: Option<String>,
-    note_content: Option<String>,
-    states: Option<String>,
+    args: UpdateListArgs,
 ) -> Result<(), String> {
+    let UpdateListArgs {
+        id,
+        name,
+        icon,
+        color,
+        list_type,
+        note_content,
+        states,
+    } = args;
     let body = update_list_body(name, icon, color, list_type, note_content, states)?;
     let payload: Value = api.put(&format!("/lists/{id}"), &body).await?;
     let list = list_from_payload(payload.clone())?;
@@ -4371,6 +4389,26 @@ async fn run_lists_update(
         }
     }
     Ok(())
+}
+
+struct CreateListArgs {
+    name: String,
+    icon: Option<String>,
+    color: Option<String>,
+    folder: Option<i64>,
+    list_type: Option<String>,
+    note_content: Option<String>,
+    states: Option<String>,
+}
+
+struct UpdateListArgs {
+    id: i64,
+    name: Option<String>,
+    icon: Option<String>,
+    color: Option<String>,
+    list_type: Option<String>,
+    note_content: Option<String>,
+    states: Option<String>,
 }
 
 fn update_list_body(
