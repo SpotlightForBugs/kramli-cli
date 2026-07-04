@@ -2273,12 +2273,20 @@ mod tests {
         ));
         std::fs::create_dir_all(&temp_config_root).expect("temp config dir should be created");
         with_env_vars_async(
-            &[(
-                "XDG_CONFIG_HOME",
-                temp_config_root
-                    .to_str()
-                    .expect("temp config dir should be valid utf-8"),
-            )],
+            &[
+                (
+                    "HOME",
+                    temp_config_root
+                        .to_str()
+                        .expect("temp config dir should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    temp_config_root
+                        .to_str()
+                        .expect("temp config dir should be valid utf-8"),
+                ),
+            ],
             || async {
                 run_privacy(PrivacyCmd::Reset, true).expect("privacy reset json should succeed");
                 run_privacy(PrivacyCmd::Reset, false).expect("privacy reset human should succeed");
@@ -2870,6 +2878,12 @@ mod tests {
         with_env_vars_async(
             &[
                 (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                (
                     "XDG_CONFIG_HOME",
                     config_root
                         .to_str()
@@ -2897,6 +2911,12 @@ mod tests {
         let deleted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         with_env_vars_async(
             &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
                 (
                     "XDG_CONFIG_HOME",
                     config_root
@@ -2944,12 +2964,20 @@ mod tests {
         std::fs::create_dir_all(&config_root).expect("temp config root should exist");
 
         with_env_vars_async(
-            &[(
-                "XDG_CONFIG_HOME",
-                config_root
-                    .to_str()
-                    .expect("temp config root should be valid utf-8"),
-            )],
+            &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+            ],
             || async {
                 assert!(run_login_with(
                     Some("http://127.0.0.1:65535".to_string()),
@@ -3012,6 +3040,12 @@ mod tests {
 
         with_env_vars_async(
             &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
                 (
                     "XDG_CONFIG_HOME",
                     config_root
