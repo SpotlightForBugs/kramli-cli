@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::i18n::{tr, tr_args};
 
 const DEFAULT_BASE_URL: &str = "https://kramli.de";
+pub(crate) const KRAMLI_CONFIG_PATH_ENV: &str = "KRAMLI_CONFIG_PATH";
 const KEYRING_SERVICE: &str = "kramli-cli";
 const KEYRING_API_KEY: &str = "api-key";
 const KRAMLI_URL_ENV: &str = "KRAMLI_URL";
@@ -54,6 +55,11 @@ pub(crate) struct Config {
 impl Config {
     /// Path to the config file: ~/.config/kramli/config.json
     pub(crate) fn path() -> PathBuf {
+        if let Ok(path) = std::env::var(KRAMLI_CONFIG_PATH_ENV) {
+            if !path.trim().is_empty() {
+                return PathBuf::from(path);
+            }
+        }
         let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
         base.join("kramli").join("config.json")
     }
@@ -369,7 +375,11 @@ mod tests {
     }
 
     fn with_clean_config_env<T>(f: impl FnOnce() -> T) -> T {
-        with_env_vars(
+        let path = std::env::temp_dir()
+            .join("kramli-clean-config-test")
+            .join(format!("{}-config.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let result = with_env_vars(
             &[
                 (KRAMLI_URL_ENV, ""),
                 (KRAMLI_API_KEY_ENV, ""),
@@ -379,10 +389,39 @@ mod tests {
                 (KRAMLI_BOOTSTRAP_ICONS_ENV, ""),
                 (KRAMLI_TUI_BOOTSTRAP_ICONS_ENV, ""),
                 (KRAMLI_LOAD_BOOTSTRAP_ICONS_ENV, ""),
+                (
+                    KRAMLI_CONFIG_PATH_ENV,
+                    path.to_str()
+                        .expect("temp config path should be valid utf-8"),
+                ),
                 (TEST_BOOL_ENV, ""),
             ],
             f,
-        )
+        );
+        let _ = fs::remove_file(path);
+        result
+    }
+
+    #[test]
+    fn explicit_config_path_is_used_without_touching_user_home() {
+        let path = std::env::temp_dir()
+            .join("kramli-explicit-config-test")
+            .join(format!("{}-config.json", std::process::id()));
+        with_env_vars(
+            &[(
+                KRAMLI_CONFIG_PATH_ENV,
+                path.to_str()
+                    .expect("temp config path should be valid utf-8"),
+            )],
+            || {
+                assert_eq!(Config::path(), path);
+                let mut cfg = Config::load();
+                cfg.set_base_url(Some("https://isolated.example".to_string()));
+                cfg.save().expect("isolated config should save");
+                assert_eq!(Config::load().base_url(), "https://isolated.example");
+            },
+        );
+        let _ = fs::remove_file(path);
     }
 
     fn config_file(
@@ -552,6 +591,12 @@ mod tests {
                 (KRAMLI_BOOTSTRAP_ICONS_ENV, ""),
                 (KRAMLI_TUI_BOOTSTRAP_ICONS_ENV, ""),
                 (KRAMLI_LOAD_BOOTSTRAP_ICONS_ENV, ""),
+                (
+                    KRAMLI_CONFIG_PATH_ENV,
+                    home.join("config.json")
+                        .to_str()
+                        .expect("temp config path should be valid utf-8"),
+                ),
                 (TEST_BOOL_ENV, ""),
             ],
             || {

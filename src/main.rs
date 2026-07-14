@@ -370,6 +370,13 @@ mod tests {
                         .to_str()
                         .expect("config root should be valid utf-8"),
                 ),
+                (
+                    crate::config::KRAMLI_CONFIG_PATH_ENV,
+                    config_root
+                        .join("config.json")
+                        .to_str()
+                        .expect("config path should be valid utf-8"),
+                ),
                 ("DO_NOT_TRACK", ""),
                 ("KRAMLI_NO_TELEMETRY", ""),
                 ("KRAMLI_TELEMETRY", ""),

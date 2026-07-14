@@ -13,6 +13,8 @@ use tokio::process::Command as TokioCommand;
 use crate::api::ApiClient;
 use crate::attachments::{upload_item_attachment, validate_image_path, AttachmentUpload};
 use crate::config::Config;
+#[cfg(test)]
+use crate::config::KRAMLI_CONFIG_PATH_ENV;
 use crate::i18n::{apply_profile_locale, current_locale_code, is_explicit_lang_set, tr, tr_args};
 use crate::models::*;
 use crate::output;
@@ -2857,7 +2859,22 @@ mod tests {
 
     #[test]
     fn run_logout_is_inert_without_credentials() {
-        run_logout().expect("logout should succeed even without stored key");
+        let config_path = std::env::temp_dir()
+            .join("kramli-cli-logout-test")
+            .join(format!("{}-config.json", std::process::id()));
+        crate::test_env::with_env_vars(
+            &[(
+                KRAMLI_CONFIG_PATH_ENV,
+                config_path
+                    .to_str()
+                    .expect("temp config path should be valid utf-8"),
+            )],
+            || {
+                let cfg = Config::load();
+                run_logout_with(&cfg, |_| Ok(()))
+                    .expect("logout should succeed without touching keychain");
+            },
+        );
     }
 
     #[tokio::test]
@@ -2979,6 +2996,13 @@ mod tests {
                         .to_str()
                         .expect("temp config root should be valid utf-8"),
                 ),
+                (
+                    KRAMLI_CONFIG_PATH_ENV,
+                    config_root
+                        .join("config.json")
+                        .to_str()
+                        .expect("temp config path should be valid utf-8"),
+                ),
             ],
             || async {
                 assert!(run_login_with(
@@ -3053,6 +3077,13 @@ mod tests {
                     config_root
                         .to_str()
                         .expect("temp config root should be valid utf-8"),
+                ),
+                (
+                    KRAMLI_CONFIG_PATH_ENV,
+                    config_root
+                        .join("config.json")
+                        .to_str()
+                        .expect("temp config path should be valid utf-8"),
                 ),
                 (KRAMLI_UPDATE_CHECK_URL_ENV, &format!("{ok_url}/latest")),
                 ("KRAMLI_AUTO_UPDATE_CHECK", "1"),
@@ -3136,18 +3167,31 @@ mod tests {
         let release = json!({"tag_name": "99.0.0", "html_url": null}).to_string();
         let (base_url, requests) = server_with_status(200, &release).await;
 
-        let mut cfg = Config::load();
-        cfg.set_update_check_state(0, None, None);
-        let _ = cfg.save();
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-cli-update-notice-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+        let config_path = config_root.join("config.json");
 
         with_env_vars_async(
             &[
+                (
+                    KRAMLI_CONFIG_PATH_ENV,
+                    config_path
+                        .to_str()
+                        .expect("temp config path should be valid utf-8"),
+                ),
                 (KRAMLI_UPDATE_CHECK_URL_ENV, &format!("{base_url}/latest")),
                 ("KRAMLI_AUTO_UPDATE_CHECK", "1"),
                 ("DO_NOT_TRACK", "0"),
                 ("KRAMLI_NO_TELEMETRY", "0"),
             ],
             || async {
+                let mut cfg = Config::load();
+                cfg.set_update_check_state(0, None, None);
+                cfg.save().expect("test config should save");
                 maybe_auto_update_notice().await;
             },
         )
@@ -4385,7 +4429,14 @@ where
 
 fn run_logout() -> Result<(), String> {
     let cfg = Config::load();
-    cfg.delete_api_key()?;
+    run_logout_with(&cfg, |config| config.delete_api_key())
+}
+
+fn run_logout_with<DeleteKey>(cfg: &Config, delete_api_key: DeleteKey) -> Result<(), String>
+where
+    DeleteKey: FnOnce(&Config) -> Result<(), String>,
+{
+    delete_api_key(cfg)?;
     println!("{} {}", "✓".green(), tr("cli-logged-out"));
     Ok(())
 }
