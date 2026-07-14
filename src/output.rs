@@ -1763,6 +1763,10 @@ mod tests {
             mime_type: Some("application/pdf".to_string()),
             file_size: Some(2048),
             url: Some("https://example.test/receipt.pdf".to_string()),
+            position: Some(0),
+            sensitive: Some(false),
+            context: Some("item".to_string()),
+            alt_text: None,
         }]);
         let comments = vec![ItemComment {
             id: 1,

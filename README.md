@@ -64,6 +64,7 @@ kramli lists list
 kramli items list <LIST_ID> --open
 kramli items list <LIST_ID> --open --newest --limit 11
 kramli items add <LIST_ID> "Milk" --priority high
+kramli items attach <ITEM_ID> photo.jpg receipt.png --sensitive
 kramli search "dark mode"
 ```
 
@@ -100,6 +101,7 @@ Notes:
 - Supported key values include single characters, `space`, `enter`, `esc`, `tab`, `f1`, and modifiers such as `ctrl+x`.
 - Viewing a list sends the cross-device handoff automatically. Manual handoff is also available with `kramli handoff`.
 - Image protocol detection runs automatically; no user setup is required.
+- Press `P` or choose `Attach` in the footer to upload an image to the selected item. Enter a local path in the attachment editor; the item list reloads after a successful upload.
 - Force a specific inline image protocol with `KRAMLI_TUI_IMAGE_PROTOCOL`:
   - `imgcat` / `iterm2`
   - `kitty`
@@ -160,6 +162,12 @@ KRAMLI_TELEMETRY=0 kramli status
 ```
 
 Boolean env vars accept `1`, `true`, `on`, or `yes` to enable and `0`, `false`, `off`, or `no` to disable. Bootstrap icons also support the aliases `KRAMLI_TUI_BOOTSTRAP_ICONS` and `KRAMLI_LOAD_BOOTSTRAP_ICONS`.
+
+## Image attachments
+
+`items attach` accepts PNG, JPG, JPEG, GIF, WebP, HEIC, and HEIF files. Every path is checked as a non-empty regular file before any network request. Use `--json` for an array of returned attachment metadata. The `upload` alias is also available.
+
+The MCP tool `upload_item_attachment` is disabled by default. Enable it explicitly with `KRAMLI_MCP_ALLOW_FILE_UPLOADS=1`. Upload paths must be inside the MCP process startup directory or a configured root listed in `KRAMLI_MCP_FILE_ROOTS` (colon-separated on Unix). The MCP response contains the same attachment metadata as the CLI and never returns the local path.
 
 ## License
 

@@ -577,7 +577,61 @@ impl ApiClient {
                     self.client
                         .post(&url)
                         .headers(headers.clone())
+                        .timeout(Duration::from_secs(300))
                         .json(&payload)
+                },
+                Some(&span),
+            )
+            .await;
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(error) => {
+                span.set_status(false);
+                span.finish();
+                return Err(error);
+            }
+        };
+        self.finish_response_span(&span, resp.status().as_u16());
+        let result = Self::handle(resp, Some(&span)).await;
+        span.set_status(result.is_ok());
+        span.finish();
+        result
+    }
+
+    /// Send an authenticated multipart upload and deserialize its JSON response.
+    pub(crate) async fn post_multipart<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        file_name: &str,
+        mime_type: &str,
+        bytes: Vec<u8>,
+        fields: &[(String, String)],
+    ) -> Result<T, String> {
+        let span = self.request_span("POST", path);
+        span.set_tag("api.upload", "image");
+        span.set_data_i64("api.request_bytes", metric_i64(bytes.len()));
+        let url = self.url(path);
+        let headers = self.headers();
+        let file_name = file_name.to_string();
+        let mime_type = mime_type.to_string();
+        let resp = self
+            .send_with_retry(
+                || {
+                    let mut form = reqwest::multipart::Form::new().part(
+                        "file",
+                        reqwest::multipart::Part::bytes(bytes.clone())
+                            .file_name(file_name.clone())
+                            .mime_str(&mime_type)
+                            .expect("validated image MIME type"),
+                    );
+                    for (name, value) in fields {
+                        form = form.text(name.clone(), value.clone());
+                    }
+                    self.client
+                        .post(&url)
+                        .headers(headers.clone())
+                        .timeout(Duration::from_secs(300))
+                        .multipart(form)
                 },
                 Some(&span),
             )

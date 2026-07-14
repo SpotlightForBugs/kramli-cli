@@ -30,6 +30,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::api::ApiClient;
+use crate::attachments::{upload_item_attachment, AttachmentUpload};
 use crate::config::Config;
 use crate::i18n::{tr, tr_args};
 use crate::models::{
@@ -147,6 +148,7 @@ enum FooterAction {
     ToggleDone,
     Delete,
     OpenImage,
+    Attach,
     Comment,
     Undo,
     Members,
@@ -167,6 +169,7 @@ impl FooterAction {
             Self::Refresh => "R",
             Self::Comment => "C",
             Self::OpenImage => "O",
+            Self::Attach => "P",
             Self::Members => "M",
             Self::Invite => "I",
             Self::Undo => "U",
@@ -185,6 +188,7 @@ impl FooterAction {
             Self::Refresh => tr("tui-footer-refresh"),
             Self::Comment => tr("tui-footer-comment"),
             Self::OpenImage => tr("tui-footer-image"),
+            Self::Attach => tr("tui-footer-attach"),
             Self::Members => tr("tui-footer-members"),
             Self::Invite => tr("tui-footer-invite"),
             Self::Undo => tr("tui-footer-undo"),
@@ -201,6 +205,7 @@ impl FooterAction {
             Self::ToggleDone => "KRAMLI_TUI_KEY_DONE",
             Self::Delete => "KRAMLI_TUI_KEY_DELETE",
             Self::OpenImage => "KRAMLI_TUI_KEY_IMAGE",
+            Self::Attach => "KRAMLI_TUI_KEY_ATTACH",
             Self::Comment => "KRAMLI_TUI_KEY_COMMENT",
             Self::Undo => "KRAMLI_TUI_KEY_UNDO",
             Self::Members => "KRAMLI_TUI_KEY_MEMBERS",
@@ -320,6 +325,10 @@ fn default_key_bindings() -> Vec<(FooterAction, KeyBinding)> {
         (
             FooterAction::OpenImage,
             KeyBinding::new(KeyCode::Char('o'), KeyModifiers::empty(), "O"),
+        ),
+        (
+            FooterAction::Attach,
+            KeyBinding::new(KeyCode::Char('p'), KeyModifiers::empty(), "P"),
         ),
         (
             FooterAction::Members,
@@ -490,6 +499,7 @@ enum EditorMode {
     Edit,
     Comment,
     Filter,
+    Attachment,
 }
 
 #[derive(Clone, Debug)]
@@ -1827,6 +1837,10 @@ impl App {
             self.failed_list_icons.insert(icon);
             return;
         };
+        if image.width() == 0 || image.height() == 0 {
+            self.failed_list_icons.insert(icon);
+            return;
+        }
         match self.picker.new_protocol(
             image,
             Size::new(2, 1),
@@ -2156,6 +2170,33 @@ impl App {
         Ok(())
     }
 
+    fn open_attachment_editor(&mut self) -> Result<(), String> {
+        let Some(item_id) = self.selected_item().map(|item| item.id) else {
+            self.status = Some(tr("output-no-items"));
+            return Ok(());
+        };
+        self.editor = Some(EditorState {
+            mode: EditorMode::Attachment,
+            item_id: Some(item_id),
+            text: String::default(),
+            quantity: String::default(),
+            due_date: String::default(),
+            due_time: String::default(),
+            planned_date: String::default(),
+            planned_time: String::default(),
+            reminder: String::default(),
+            reminder_time: String::default(),
+            reminder_offsets: String::default(),
+            travel_time_minutes: String::default(),
+            priority: String::default(),
+            tags: String::default(),
+            progress: String::default(),
+            notes: String::default(),
+            active_field: EditorField::Text,
+        });
+        Ok(())
+    }
+
     async fn save_editor(&mut self) -> Result<(), String> {
         let Some(editor) = self.editor.as_ref().cloned() else {
             return Ok(());
@@ -2163,6 +2204,43 @@ impl App {
 
         if editor.mode == EditorMode::Filter {
             return self.save_filter_editor(&editor);
+        }
+
+        if editor.mode == EditorMode::Attachment {
+            let Some(item_id) = editor.item_id else {
+                return Ok(());
+            };
+            let path = editor.text.trim();
+            if path.is_empty() {
+                self.status = Some(tr("attachment-path-required"));
+                return Ok(());
+            }
+            self.status = Some(tr("attachment-uploading"));
+            let attachment = match upload_item_attachment(
+                &self.api,
+                item_id,
+                &AttachmentUpload {
+                    path: PathBuf::from(path),
+                    sensitive: false,
+                    context: None,
+                    alt_text: None,
+                },
+            )
+            .await
+            {
+                Ok(attachment) => attachment,
+                Err(error) => {
+                    self.status = Some(error);
+                    return Ok(());
+                }
+            };
+            self.editor = None;
+            self.status = Some(tr_args(
+                "attachment-uploaded",
+                &[("filename", attachment.original_filename.unwrap_or_default())],
+            ));
+            self.reload_items_force_background();
+            return Ok(());
         }
 
         let text = editor.text.trim().to_string();
@@ -2477,6 +2555,7 @@ impl App {
                 | FooterAction::ToggleDone
                 | FooterAction::Delete
                 | FooterAction::OpenImage
+                | FooterAction::Attach
                 | FooterAction::Undo
                 | FooterAction::Members
                 | FooterAction::Invite
@@ -2498,6 +2577,7 @@ impl App {
             FooterAction::ToggleDone => self.toggle_selected_done().await,
             FooterAction::Delete => self.delete_selected_item().await,
             FooterAction::OpenImage => self.open_selected_image_background(),
+            FooterAction::Attach => self.open_attachment_editor(),
             FooterAction::Comment => self.open_comment_editor(),
             FooterAction::Undo => self.undo_selected_list().await,
             FooterAction::Members => self.show_members_summary().await,
@@ -2726,7 +2806,10 @@ impl App {
         let Some(mode) = self.editor.as_ref().map(|editor| editor.mode) else {
             return Ok(());
         };
-        let simple_text_dialog = matches!(mode, EditorMode::Comment | EditorMode::Filter);
+        let simple_text_dialog = matches!(
+            mode,
+            EditorMode::Comment | EditorMode::Filter | EditorMode::Attachment
+        );
 
         match key.code {
             KeyCode::Esc => {
@@ -4750,7 +4833,7 @@ fn auto_handoff_enabled_from_value(raw: Option<&str>) -> bool {
 fn editor_fields(mode: EditorMode) -> &'static [EditorField] {
     match mode {
         EditorMode::Create | EditorMode::Edit => &ITEM_EDITOR_FIELDS,
-        EditorMode::Comment | EditorMode::Filter => &SIMPLE_EDITOR_FIELDS,
+        EditorMode::Comment | EditorMode::Filter | EditorMode::Attachment => &SIMPLE_EDITOR_FIELDS,
     }
 }
 
@@ -4781,6 +4864,7 @@ fn editor_field_hint(field: EditorField, mode: EditorMode) -> String {
     match mode {
         EditorMode::Filter => tr("label-text"),
         EditorMode::Comment => tr("label-comments"),
+        EditorMode::Attachment => tr("attachment-path"),
         EditorMode::Create | EditorMode::Edit => field.label(),
     }
 }
@@ -4884,6 +4968,7 @@ fn footer_buttons(area: Rect, key_bindings: &KeyBindings) -> Vec<(FooterAction, 
         FooterAction::Refresh,
         FooterAction::Comment,
         FooterAction::OpenImage,
+        FooterAction::Attach,
         FooterAction::Members,
         FooterAction::Invite,
         FooterAction::Undo,
@@ -5997,6 +6082,7 @@ fn draw_editor(frame: &mut Frame<'_>, editor: &EditorState) {
         EditorMode::Edit => tr("label-changes"),
         EditorMode::Comment => tr("label-comments"),
         EditorMode::Filter => tr("label-text"),
+        EditorMode::Attachment => tr("attachment-path"),
     };
     frame.render_widget(
         Block::default().borders(Borders::ALL).title(format!(
@@ -7968,6 +8054,10 @@ mod tests {
             mime_type: mime_type.map(str::to_string),
             file_size: None,
             url: Some(format!("/uploads/{id}")),
+            position: None,
+            sensitive: None,
+            context: None,
+            alt_text: None,
         }
     }
 

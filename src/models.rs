@@ -94,6 +94,14 @@ pub(crate) struct Attachment {
     pub(crate) mime_type: Option<String>,
     pub(crate) file_size: Option<i64>,
     pub(crate) url: Option<String>,
+    #[serde(default)]
+    pub(crate) position: Option<i64>,
+    #[serde(default)]
+    pub(crate) sensitive: Option<bool>,
+    #[serde(default)]
+    pub(crate) context: Option<String>,
+    #[serde(default)]
+    pub(crate) alt_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

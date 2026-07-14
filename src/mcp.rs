@@ -1,7 +1,12 @@
 use serde_json::{json, Map, Value};
+use std::path::PathBuf;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::api::ApiClient;
+use crate::attachments::{
+    ensure_mcp_upload_allowed, initialize_mcp_file_policy, mcp_file_uploads_enabled,
+    upload_item_attachment, AttachmentUpload,
+};
 use crate::config::Config;
 use crate::i18n::{tr, tr_args};
 use crate::models::{ListItem, ShoppingList};
@@ -26,6 +31,7 @@ struct IncomingMessage {
 
 /// Run the MCP server over standard input and output.
 pub(crate) async fn run_stdio() -> Result<(), String> {
+    initialize_mcp_file_policy();
     let mut stdin = io::stdin();
     let mut stdout = io::stdout();
     run_with_io(&mut stdin, &mut stdout).await
@@ -89,6 +95,7 @@ async fn handle_message(message: Value) -> Option<Value> {
 }
 
 async fn handle_tool_call(params: &Value) -> Result<Value, String> {
+    initialize_mcp_file_policy();
     let config = Config::load();
     let api = ApiClient::new(&config)?;
     let name = params
@@ -101,6 +108,10 @@ async fn handle_tool_call(params: &Value) -> Result<Value, String> {
         .cloned()
         .unwrap_or_default();
 
+    if name == "upload_item_attachment" && !mcp_file_uploads_enabled() {
+        return Err(tr("mcp-file-uploads-disabled"));
+    }
+
     let span = telemetry::TraceSpan::child("mcp.tool", "mcp.tool");
     span.set_tag("action", mcp_tool_trace_name(name));
     span.set_data_i64("argument.count", args.len() as i64);
@@ -112,6 +123,7 @@ async fn handle_tool_call(params: &Value) -> Result<Value, String> {
         "update_item" => update_item(&api, &args).await,
         "toggle_item_done" => toggle_item_done(&api, &args).await,
         "delete_item" => delete_item(&api, &args).await,
+        "upload_item_attachment" => upload_item_attachment_tool(&api, &args).await,
         _ => Err(tr_args("mcp-unknown-tool", &[("name", name.to_string())])),
     };
 
@@ -141,6 +153,7 @@ fn mcp_tool_trace_name(name: &str) -> &'static str {
         "update_item" => "update_item",
         "toggle_item_done" => "toggle_item_done",
         "delete_item" => "delete_item",
+        "upload_item_attachment" => "upload_item_attachment",
         _ => "unknown",
     }
 }
@@ -267,6 +280,27 @@ async fn toggle_item_done(api: &ApiClient, args: &Map<String, Value>) -> Result<
 async fn delete_item(api: &ApiClient, args: &Map<String, Value>) -> Result<Value, String> {
     let id = required_i64(args, "id")?;
     api.delete(&format!("/items/{id}")).await
+}
+
+async fn upload_item_attachment_tool(
+    api: &ApiClient,
+    args: &Map<String, Value>,
+) -> Result<Value, String> {
+    let id = required_i64(args, "id")?;
+    let path = PathBuf::from(required_string(args, "path")?);
+    ensure_mcp_upload_allowed(&path)?;
+    let attachment = upload_item_attachment(
+        api,
+        id,
+        &AttachmentUpload {
+            path,
+            sensitive: optional_bool(args, "sensitive")?.unwrap_or(false),
+            context: optional_string(args, "context")?,
+            alt_text: optional_string(args, "alt_text")?,
+        },
+    )
+    .await?;
+    serde_json::to_value(attachment).map_err(|error| error.to_string())
 }
 
 fn insert_reminder_fields(
@@ -681,6 +715,22 @@ fn tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {"id": {"type": "integer"}},
                 "required": ["id"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "upload_item_attachment",
+            "description": tr("mcp-tool-upload-attachment"),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "path": {"type": "string"},
+                    "sensitive": {"type": "boolean"},
+                    "context": {"type": "string"},
+                    "alt_text": {"type": "string"}
+                },
+                "required": ["id", "path"],
                 "additionalProperties": false
             }
         }),

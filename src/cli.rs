@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -10,6 +11,7 @@ use serde_json::{json, Value};
 use tokio::process::Command as TokioCommand;
 
 use crate::api::ApiClient;
+use crate::attachments::{upload_item_attachment, validate_image_path, AttachmentUpload};
 use crate::config::Config;
 use crate::i18n::{apply_profile_locale, current_locale_code, is_explicit_lang_set, tr, tr_args};
 use crate::models::*;
@@ -3089,6 +3091,15 @@ pub(crate) enum ItemCmd {
     },
     /// Add a comment to an item
     Comment { id: i64, text: String },
+    /// Upload one or more image attachments to an item
+    #[command(alias = "upload")]
+    Attach {
+        id: i64,
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        #[arg(long)]
+        sensitive: bool,
+    },
     /// Mark all items as done
     #[command(name = "check-all")]
     CheckAll {
@@ -4393,6 +4404,11 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
         ItemCmd::Delete { id } => run_items_delete(&api, as_json, id).await?,
         ItemCmd::DoneList { list_id } => run_items_done_list(&api, as_json, list_id).await?,
         ItemCmd::Comment { id, text } => run_items_comment(&api, as_json, id, text).await?,
+        ItemCmd::Attach {
+            id,
+            files,
+            sensitive,
+        } => run_items_attach(&api, as_json, id, files, sensitive).await?,
         ItemCmd::CheckAll { list_id } => run_items_check_all(&api, as_json, list_id).await?,
         ItemCmd::ClearDone { list_id } => run_items_clear_done(&api, as_json, list_id).await?,
     }
@@ -4860,6 +4876,55 @@ async fn run_items_comment(
         );
     } else {
         println!("{} {}", "✓".green(), tr("cli-comment-added"));
+    }
+    Ok(())
+}
+
+async fn run_items_attach(
+    api: &ApiClient,
+    as_json: bool,
+    id: i64,
+    files: Vec<PathBuf>,
+    sensitive: bool,
+) -> Result<(), String> {
+    // Validate every path before the first request so a bad later path cannot
+    // leave a partial upload behind.
+    for path in &files {
+        validate_image_path(path)?;
+    }
+    let mut uploaded = Vec::with_capacity(files.len());
+    for path in files {
+        uploaded.push(
+            upload_item_attachment(
+                api,
+                id,
+                &AttachmentUpload {
+                    path,
+                    sensitive,
+                    context: None,
+                    alt_text: None,
+                },
+            )
+            .await?,
+        );
+    }
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&uploaded).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "{} {}",
+            "✓".green(),
+            tr_args(
+                "cli-attachments-uploaded",
+                &[
+                    ("count", uploaded.len().to_string()),
+                    ("id", id.to_string())
+                ],
+            )
+        );
     }
     Ok(())
 }

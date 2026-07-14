@@ -1,6 +1,7 @@
 //! Command-line client for Kramli shopping and todo lists.
 
 mod api;
+mod attachments;
 mod cli;
 mod config;
 mod i18n;
