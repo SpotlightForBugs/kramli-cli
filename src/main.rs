@@ -196,6 +196,7 @@ mod tests {
         Cli {
             json: false,
             interactive: false,
+            dry_run: false,
             command,
         }
     }
