@@ -248,16 +248,17 @@ async fn update_item(api: &ApiClient, args: &Map<String, Value>) -> Result<Value
     let id = required_i64(args, "id")?;
     let mut body = Map::new();
     insert_optional_string(args, &mut body, "text", "text")?;
-    insert_optional_string(args, &mut body, "quantity", "quantity")?;
-    insert_optional_string(args, &mut body, "notes", "notes")?;
-    insert_optional_string(args, &mut body, "due_date", "due_date")?;
-    insert_optional_string(args, &mut body, "due_time", "due_time")?;
-    insert_optional_string(args, &mut body, "planned_date", "planned_date")?;
-    insert_optional_string(args, &mut body, "planned_time", "planned_time")?;
+    insert_clearable_string(args, &mut body, "quantity", "quantity")?;
+    insert_clearable_string(args, &mut body, "notes", "notes")?;
+    insert_clearable_string(args, &mut body, "due_date", "due_date")?;
+    insert_clearable_string(args, &mut body, "due_time", "due_time")?;
+    insert_clearable_string(args, &mut body, "planned_date", "planned_date")?;
+    insert_clearable_string(args, &mut body, "planned_time", "planned_time")?;
     insert_reminder_fields(args, &mut body)?;
-    insert_optional_string(args, &mut body, "priority", "priority")?;
-    insert_optional_string(args, &mut body, "color", "color")?;
-    insert_optional_string(args, &mut body, "progress", "progress")?;
+    insert_clearable_string(args, &mut body, "reminder_time", "reminder_time")?;
+    insert_clearable_string(args, &mut body, "priority", "priority")?;
+    insert_clearable_string(args, &mut body, "color", "color")?;
+    insert_clearable_string(args, &mut body, "progress", "progress")?;
     if let Some(tags) = optional_string_array(args, "tags")? {
         body.insert("tags".to_string(), Value::Array(tags));
     }
@@ -373,6 +374,20 @@ fn optional_string(args: &Map<String, Value>, name: &str) -> Result<Option<Strin
     }
 }
 
+fn optional_clearable_string(
+    args: &Map<String, Value>,
+    name: &str,
+) -> Result<Option<String>, String> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.trim().to_string())),
+        _ => Err(tr_args(
+            "mcp-argument-must-string",
+            &[("name", name.into())],
+        )),
+    }
+}
+
 fn optional_bool(args: &Map<String, Value>, name: &str) -> Result<Option<bool>, String> {
     match args.get(name) {
         None | Some(Value::Null) => Ok(None),
@@ -440,6 +455,18 @@ fn insert_optional_string(
     body_name: &str,
 ) -> Result<(), String> {
     if let Some(value) = optional_string(args, arg_name)? {
+        body.insert(body_name.to_string(), Value::String(value));
+    }
+    Ok(())
+}
+
+fn insert_clearable_string(
+    args: &Map<String, Value>,
+    body: &mut Map<String, Value>,
+    arg_name: &str,
+    body_name: &str,
+) -> Result<(), String> {
+    if let Some(value) = optional_clearable_string(args, arg_name)? {
         body.insert(body_name.to_string(), Value::String(value));
     }
     Ok(())
@@ -677,20 +704,20 @@ fn tools() -> Vec<Value> {
                 "properties": {
                     "id": {"type": "integer"},
                     "text": {"type": "string"},
-                    "quantity": {"type": "string"},
-                    "notes": {"type": "string"},
-                    "due_date": {"type": "string", "description": "Due date (YYYY-MM-DD or localized text)."},
-                    "due_time": {"type": "string", "description": "Due time (HH:MM)."},
-                    "planned_date": {"type": "string", "description": "Planned date (YYYY-MM-DD or localized text)."},
-                    "planned_time": {"type": "string", "description": "Planned time (HH:MM)."},
+                    "quantity": {"type": "string", "description": "Quantity. Send an empty string to clear it."},
+                    "notes": {"type": "string", "description": "Notes. Send an empty string to clear them."},
+                    "due_date": {"type": "string", "description": "Due date (YYYY-MM-DD or localized text). Send an empty string to clear it."},
+                    "due_time": {"type": "string", "description": "Due time (HH:MM). Send an empty string to clear it."},
+                    "planned_date": {"type": "string", "description": "Planned date (YYYY-MM-DD or localized text). Send an empty string to clear it."},
+                    "planned_time": {"type": "string", "description": "Planned time (HH:MM). Send an empty string to clear it."},
                     "reminder": {"type": "boolean", "description": "Enable additional reminders."},
-                    "reminder_time": {"type": "string", "description": "Reminder time (HH:MM)."},
+                    "reminder_time": {"type": "string", "description": "Reminder time (HH:MM). Send an empty string to clear it."},
                     "reminder_days_before": {"type": "integer", "description": "Days before due date for reminder."},
                     "reminder_offsets": {"type": "array", "items": {"type": "integer"}, "description": "Additional reminder offsets in minutes."},
                     "travel_time_minutes": {"type": "integer", "description": "Travel time in minutes (independent from reminders)."},
-                    "priority": {"type": "string"},
-                    "color": {"type": "string"},
-                    "progress": {"type": "string"},
+                    "priority": {"type": "string", "description": "Priority. Send an empty string to clear it."},
+                    "color": {"type": "string", "description": "Color. Send an empty string to clear it."},
+                    "progress": {"type": "string", "description": "Custom state. Send an empty string to clear it."},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "assigned_to": {"type": "array", "items": {"type": "integer"}}
                 },
@@ -741,11 +768,11 @@ fn tools() -> Vec<Value> {
 mod tests {
     use super::{
         content_length, create_item, delete_item, error_response, handle_message, handle_tool_call,
-        insert_optional_string, insert_reminder_fields, list_items, mcp_method_trace_name,
-        mcp_tool_trace_name, optional_bool, optional_i64, optional_i64_array, optional_string,
-        optional_string_array, read_message, required_i64, required_string, run_stdio, run_with_io,
-        toggle_item_done, tool_result, tool_text_result, tools, try_parse_message, update_item,
-        write_message, MessageFraming,
+        insert_clearable_string, insert_optional_string, insert_reminder_fields, list_items,
+        mcp_method_trace_name, mcp_tool_trace_name, optional_bool, optional_clearable_string,
+        optional_i64, optional_i64_array, optional_string, optional_string_array, read_message,
+        required_i64, required_string, run_stdio, run_with_io, toggle_item_done, tool_result,
+        tool_text_result, tools, try_parse_message, update_item, write_message, MessageFraming,
     };
     use crate::api::ApiClient;
     use serde_json::{json, Map, Value};
@@ -1086,12 +1113,18 @@ mod tests {
             .and_then(Value::as_object)
             .and_then(|entry| entry.get("description"))
             .and_then(Value::as_str);
+        let notes = properties
+            .get("notes")
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("description"))
+            .and_then(Value::as_str);
 
         assert_eq!(reminder, Some("Enable additional reminders."));
         assert_eq!(
             planned_date,
-            Some("Planned date (YYYY-MM-DD or localized text).")
+            Some("Planned date (YYYY-MM-DD or localized text). Send an empty string to clear it.")
         );
+        assert_eq!(notes, Some("Notes. Send an empty string to clear them."));
         assert_eq!(
             travel_time_minutes,
             Some("Travel time in minutes (independent from reminders).")
@@ -1154,6 +1187,10 @@ mod tests {
 
         assert_eq!(required_string(&args, "text").unwrap(), "hello");
         assert_eq!(optional_string(&args, "blank").unwrap(), None);
+        assert_eq!(
+            optional_clearable_string(&args, "blank").unwrap(),
+            Some(String::new())
+        );
         assert_eq!(optional_string(&args, "null").unwrap(), None);
         assert!(optional_string(&json!({"text": 1}).as_object().unwrap().clone(), "text").is_err());
         assert!(required_string(&args, "missing").is_err());
@@ -1201,7 +1238,7 @@ mod tests {
 
     #[test]
     fn optional_body_helpers_cover_insert_and_reminder_errors() {
-        let args = json!({"name": " Kramli ", "bad_reminder": "yes"})
+        let args = json!({"name": " Kramli ", "clear": "   ", "bad_reminder": "yes"})
             .as_object()
             .cloned()
             .unwrap();
@@ -1209,8 +1246,10 @@ mod tests {
 
         insert_optional_string(&args, &mut body, "name", "title").unwrap();
         insert_optional_string(&args, &mut body, "missing", "missing").unwrap();
+        insert_clearable_string(&args, &mut body, "clear", "notes").unwrap();
 
         assert_eq!(body.get("title"), Some(&Value::String("Kramli".into())));
+        assert_eq!(body.get("notes"), Some(&Value::String(String::new())));
         assert!(!body.contains_key("missing"));
 
         let bad = json!({"reminder": "yes"}).as_object().cloned().unwrap();
@@ -1479,7 +1518,11 @@ mod tests {
         let update_args = json!({
             "id": 99,
             "text": "Updated",
-            "color": "#fff",
+            "quantity": "",
+            "notes": "   ",
+            "due_date": "",
+            "reminder_time": "",
+            "color": "",
             "assigned_to": [1, 2],
             "reminder": false
         })
@@ -1526,6 +1569,11 @@ mod tests {
         assert!(requests[2].contains("\"reminder\":true"));
         assert!(requests[3].contains("\"assigned_to\":[1,2]"));
         assert!(requests[3].contains("\"reminder\":false"));
+        assert!(requests[3].contains("\"quantity\":\"\""));
+        assert!(requests[3].contains("\"notes\":\"\""));
+        assert!(requests[3].contains("\"due_date\":\"\""));
+        assert!(requests[3].contains("\"reminder_time\":\"\""));
+        assert!(requests[3].contains("\"color\":\"\""));
     }
 
     #[tokio::test]
