@@ -85,6 +85,17 @@ pub(crate) struct ListItem {
     pub(crate) attachments: Option<Vec<Attachment>>,
 }
 
+impl ListItem {
+    pub(crate) fn contains_text_or_notes(&self, query: &str) -> bool {
+        let query = query.to_lowercase();
+        self.text.to_lowercase().contains(&query)
+            || self
+                .notes
+                .as_deref()
+                .is_some_and(|notes| notes.to_lowercase().contains(&query))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// File attachment metadata for a list item.
 pub(crate) struct Attachment {

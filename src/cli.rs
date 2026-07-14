@@ -962,6 +962,14 @@ mod tests {
             Some("open"),
             Some("milk")
         ));
+        item.notes = Some("Frische ÄPFEL aus dem Hofladen".to_string());
+        assert!(item_matches_filters(
+            &item,
+            false,
+            false,
+            None,
+            Some("äpfel")
+        ));
         assert!(!item_matches_filters(&item, false, true, None, None));
         assert!(!item_matches_filters(
             &item,
@@ -3260,7 +3268,7 @@ pub(crate) enum ItemCmd {
         /// Filter by custom state
         #[arg(long)]
         state: Option<String>,
-        /// Filter by title text (case-insensitive)
+        /// Filter by title or notes text (case-insensitive)
         #[arg(long)]
         contains: Option<String>,
         /// Sort by creation date (newest first)
@@ -5168,7 +5176,7 @@ async fn run_items_list(api: &ApiClient, as_json: bool, args: ItemListArgs) -> R
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty());
     let contains_filter = contains
-        .map(|value| value.trim().to_ascii_lowercase())
+        .map(|value| value.trim().to_lowercase())
         .filter(|value| !value.is_empty());
     let mut filtered: Vec<ListItem> = items
         .into_iter()
@@ -5236,8 +5244,7 @@ fn item_matches_filters(
     }
 
     if let Some(query) = contains_filter {
-        let text = item.text.to_ascii_lowercase();
-        if !text.contains(query) {
+        if !item.contains_text_or_notes(query) {
             return false;
         }
     }

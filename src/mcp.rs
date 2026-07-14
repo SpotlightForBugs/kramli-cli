@@ -169,7 +169,7 @@ async fn list_items(api: &ApiClient, args: &Map<String, Value>) -> Result<Value,
     let open = optional_bool(args, "open")?.unwrap_or(false);
     let completed = optional_bool(args, "completed")?.unwrap_or(false);
     let state = optional_string(args, "state")?.map(|value| value.to_ascii_lowercase());
-    let contains = optional_string(args, "contains")?.map(|value| value.to_ascii_lowercase());
+    let contains = optional_string(args, "contains")?.map(|value| value.to_lowercase());
     let newest = optional_bool(args, "newest")?.unwrap_or(false);
     let oldest = optional_bool(args, "oldest")?.unwrap_or(false);
     let limit = optional_i64(args, "limit")?
@@ -198,7 +198,7 @@ async fn list_items(api: &ApiClient, args: &Map<String, Value>) -> Result<Value,
                 }
             }
             if let Some(query) = contains.as_deref() {
-                if !item.text.to_ascii_lowercase().contains(query) {
+                if !item.contains_text_or_notes(query) {
                     return false;
                 }
             }
@@ -1411,7 +1411,8 @@ mod tests {
                 {
                     "id": 1,
                     "list_id": 7,
-                    "text": "Milk",
+                    "text": "Tea",
+                    "notes": "Milk from the farm",
                     "is_done": false,
                     "progress": "Todo",
                     "created_at": "2026-01-03"
