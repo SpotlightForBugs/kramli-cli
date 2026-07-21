@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 
 use crate::i18n::{tr, tr_args};
+use crate::internal_links::{LinkPreview, LinkPreviewActionKind};
 use crate::models::{
     ActivityEntry, Folder, ItemComment, ListItem, Member, SearchResults, ShoppingList,
 };
@@ -823,6 +824,50 @@ fn print_item_attachments(item: &ListItem) {
             .map_or_else(String::default, human_size);
         let url = attachment.url.as_deref().unwrap_or("");
         println!("    • {name}  {size}  {}", url.dimmed());
+        if let Some(context) = attachment
+            .context
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            println!("      {}: {context}", tr("label-context").dimmed());
+        }
+        if let Some(alt_text) = attachment
+            .alt_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            println!("      {}: {alt_text}", tr("label-alt-text").dimmed());
+        }
+    }
+}
+
+/// Print resolved internal-link previews after their owning human-readable content.
+pub(crate) fn print_link_previews(previews: &[LinkPreview]) {
+    if previews.is_empty() {
+        return;
+    }
+    println!();
+    println!("{}", tr("link-preview-section").bold());
+    for preview in previews {
+        let title = preview
+            .item_text
+            .as_deref()
+            .or(preview.list_name.as_deref())
+            .or(preview.folder_name.as_deref())
+            .unwrap_or(&preview.display_url);
+        println!("  ┌─ {title}");
+        println!("  │ {}", preview.display_url.dimmed());
+        if let Some(invited_by) = preview.invited_by.as_deref() {
+            println!("  │ {}: {invited_by}", tr("link-preview-invited-by"));
+        }
+        let action = match preview.action.as_ref().map(|action| action.kind) {
+            Some(LinkPreviewActionKind::Open) => tr("link-preview-open"),
+            Some(LinkPreviewActionKind::Accept) => tr("link-preview-accept"),
+            None => tr("link-preview-unresolved"),
+        };
+        println!("  └─ {action}");
     }
 }
 
@@ -1002,6 +1047,7 @@ mod wrap_and_icon_tests {
             archive_mode: None,
             view_mode: None,
             role: None,
+            list_type: None,
             item_count: None,
             done_count: None,
             state_config: None,
@@ -1119,7 +1165,7 @@ pub(crate) fn print_search(results: &SearchResults) {
 
 // ── Activity ──
 
-fn activity_detail_text(detail: Option<&serde_json::Value>) -> String {
+pub(crate) fn activity_detail_text(detail: Option<&serde_json::Value>) -> String {
     let Some(detail) = detail else {
         return String::default();
     };
@@ -1275,6 +1321,7 @@ mod tests {
             archive_mode: None,
             view_mode: Some("board".to_string()),
             role: Some("editor".to_string()),
+            list_type: Some("tasks".to_string()),
             item_count: Some(5),
             done_count: Some(2),
             state_config: None,

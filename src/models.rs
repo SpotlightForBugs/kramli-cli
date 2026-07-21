@@ -4,7 +4,7 @@ use crate::i18n::{tr, tr_args};
 
 // ── List ──
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 /// Shopping list returned by the Kramli API.
 pub(crate) struct ShoppingList {
     pub(crate) id: i64,
@@ -17,11 +17,22 @@ pub(crate) struct ShoppingList {
     pub(crate) archive_mode: Option<String>,
     pub(crate) view_mode: Option<String>,
     pub(crate) role: Option<String>,
+    #[serde(default)]
+    pub(crate) list_type: Option<String>,
     pub(crate) item_count: Option<i64>,
     pub(crate) done_count: Option<i64>,
     pub(crate) state_config: Option<String>,
     pub(crate) states: Option<Vec<ListState>>,
     pub(crate) created_at: Option<String>,
+}
+
+impl ShoppingList {
+    pub(crate) fn is_note(&self) -> bool {
+        matches!(
+            self.list_type.as_deref(),
+            Some("note" | "notes" | "notizzettel")
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

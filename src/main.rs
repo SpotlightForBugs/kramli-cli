@@ -5,13 +5,15 @@ mod attachments;
 mod cli;
 mod config;
 mod i18n;
+mod internal_links;
 mod mcp;
 mod models;
+mod note;
 mod output;
 mod telemetry;
-mod tui;
 #[cfg(test)]
 mod test_env;
+mod tui;
 
 #[cfg(not(test))]
 use clap::Parser;
@@ -35,16 +37,12 @@ fn main() -> ExitCode {
 }
 
 fn run_with_cli(cli: Cli) -> ExitCode {
-    run_with_cli_hooks(
-        cli,
-        ensure_first_run_preferences,
-        || {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())
-        },
-    )
+    run_with_cli_hooks(cli, ensure_first_run_preferences, || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())
+    })
 }
 
 fn run_with_cli_hooks<F, G>(cli: Cli, ensure_prefs: F, build_runtime: G) -> ExitCode
@@ -150,16 +148,20 @@ where
         println!("{}", tr("main-consent-telemetry-change"));
         let enabled = ask_confirm(&tr("main-consent-telemetry-prompt"), true)?;
         cfg.set_telemetry_enabled(enabled);
-        changed = true; }
+        changed = true;
+    }
 
     if !cfg.bootstrap_icons_preference_set() {
         println!();
         println!("{}", tr("main-consent-bootstrap-body"));
         let enabled = ask_confirm(&tr("main-consent-bootstrap-prompt"), true)?;
         cfg.set_bootstrap_icons_enabled(enabled);
-        changed = true; }
+        changed = true;
+    }
 
-    if changed { cfg.save()?; }
+    if changed {
+        cfg.save()?;
+    }
     Ok(())
 }
 
@@ -203,46 +205,53 @@ mod tests {
 
     #[test]
     fn run_with_cli_hooks_handles_preference_and_runtime_failures() {
-        fn runtime_error() -> Result<tokio::runtime::Runtime, String> {
-            Err("runtime failed".to_string())
-        }
+        crate::test_env::with_env_vars(&[("KRAMLI_URL", ""), ("KRAMLI_API_KEY", "")], || {
+            fn runtime_error() -> Result<tokio::runtime::Runtime, String> {
+                Err("runtime failed".to_string())
+            }
 
-        let cli = cli_for(Some(Commands::Status));
+            let cli = cli_for(Some(Commands::Status));
 
-        let preference_failure = run_with_cli_hooks(
-            cli_for(Some(Commands::Status)),
-            |_| Err("pref failed".to_string()),
-            runtime_error,
-        );
-        assert_eq!(preference_failure, ExitCode::FAILURE);
+            let preference_failure = run_with_cli_hooks(
+                cli_for(Some(Commands::Status)),
+                |_| Err("pref failed".to_string()),
+                runtime_error,
+            );
+            assert_eq!(preference_failure, ExitCode::FAILURE);
 
-        let runtime_failure = run_with_cli_hooks(cli, |_| Ok(()), runtime_error);
-        assert_eq!(runtime_failure, ExitCode::FAILURE);
+            let runtime_failure = run_with_cli_hooks(cli, |_| Ok(()), runtime_error);
+            assert_eq!(runtime_failure, ExitCode::FAILURE);
 
-        let runtime_success = run_with_cli_hooks(
-            cli_for(Some(Commands::Status)),
-            |_| Ok(()),
-            || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| error.to_string())
-            },
-        );
-        assert_eq!(runtime_success, ExitCode::SUCCESS);
+            let runtime_success = run_with_cli_hooks(
+                cli_for(Some(Commands::Status)),
+                |_| Ok(()),
+                || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| error.to_string())
+                },
+            );
+            assert_eq!(runtime_success, ExitCode::SUCCESS);
+        });
     }
 
     #[test]
     fn run_with_cli_covers_success_and_error_outcomes() {
-        assert_eq!(run_with_cli(cli_for(Some(Commands::Status))), ExitCode::SUCCESS);
-        assert_eq!(
-            run_with_cli(cli_for(Some(Commands::Lists {
-                action: ListCmd::Resolve {
-                    reference: " ".to_string()
-                }
-            }))),
-            ExitCode::FAILURE
-        );
+        crate::test_env::with_env_vars(&[("KRAMLI_URL", ""), ("KRAMLI_API_KEY", "")], || {
+            assert_eq!(
+                run_with_cli(cli_for(Some(Commands::Status))),
+                ExitCode::SUCCESS
+            );
+            assert_eq!(
+                run_with_cli(cli_for(Some(Commands::Lists {
+                    action: ListCmd::Resolve {
+                        reference: " ".to_string()
+                    }
+                }))),
+                ExitCode::FAILURE
+            );
+        });
     }
 
     #[test]
@@ -333,7 +342,10 @@ mod tests {
     #[test]
     fn run_with_cli_can_capture_errors_when_enabled() {
         crate::test_env::with_env_vars(
-            &[("KRAMLI_TELEMETRY", "1"), ("KRAMLI_CAPTURE_COMMAND_ERRORS", "1")],
+            &[
+                ("KRAMLI_TELEMETRY", "1"),
+                ("KRAMLI_CAPTURE_COMMAND_ERRORS", "1"),
+            ],
             || {
                 let exit = run_with_cli(cli_for(Some(Commands::Lists {
                     action: ListCmd::Resolve {

@@ -26,6 +26,7 @@ use ratatui_image::{
 };
 use sentry::{Hub, SentryFutureExt};
 use serde_json::{Map, Value};
+#[cfg(not(test))]
 use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -33,9 +34,11 @@ use crate::api::ApiClient;
 use crate::attachments::{upload_item_attachment, AttachmentUpload};
 use crate::config::Config;
 use crate::i18n::{tr, tr_args};
+use crate::internal_links::{LinkPreview, LinkPreviewActionKind, LinkPreviewResolver};
 use crate::models::{
     Attachment, ItemComment, ListItem, ListState as ApiListState, Profile, ShoppingList,
 };
+use crate::note::{note_content, safe_update_payload, validate_plain_note};
 
 const ACCENT: Color = Color::Rgb(126, 200, 255);
 const STATUS_COLOR: Color = Color::Rgb(126, 231, 155);
@@ -497,6 +500,7 @@ impl EditorField {
 enum EditorMode {
     Create,
     Edit,
+    Note,
     Comment,
     Filter,
     Attachment,
@@ -534,6 +538,19 @@ struct DetailImageState {
     protocol: StatefulProtocol,
 }
 
+#[derive(Clone, Debug)]
+struct PendingInviteAcceptance {
+    token: String,
+    list_id: Option<i64>,
+    list_name: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreviewRequestIdentity {
+    generation: u64,
+    fingerprint: u64,
+}
+
 enum LoadMessage {
     Profile(Result<Profile, String>),
     Lists(Result<Vec<ShoppingList>, String>),
@@ -544,6 +561,19 @@ enum LoadMessage {
     Comments {
         item_id: i64,
         result: Result<Vec<ItemComment>, String>,
+    },
+    NoteDetail {
+        list_id: i64,
+        result: Result<Value, String>,
+    },
+    LinkPreviews {
+        owner: String,
+        identity: PreviewRequestIdentity,
+        previews: Vec<LinkPreview>,
+    },
+    AcceptInvite {
+        list_id: Option<i64>,
+        result: Result<Value, String>,
     },
     DetailImage {
         source: String,
@@ -580,6 +610,17 @@ struct App {
     items: Vec<ListItem>,
     items_cache: HashMap<i64, Vec<ListItem>>,
     comments_cache: HashMap<i64, Vec<ItemComment>>,
+    note_detail_cache: HashMap<i64, Value>,
+    link_previews: HashMap<String, Vec<LinkPreview>>,
+    link_preview_fingerprints: HashMap<String, u64>,
+    pending_link_previews: HashMap<String, PreviewRequestIdentity>,
+    preview_generation: u64,
+    selected_link_preview: usize,
+    detail_scroll: u16,
+    invite_confirmation: Option<PendingInviteAcceptance>,
+    accepting_invite: bool,
+    pending_open_list_id: Option<i64>,
+    pending_open_item_id: Option<i64>,
     selected_list: usize,
     selected_item: usize,
     list_scroll: usize,
@@ -1075,6 +1116,17 @@ impl App {
             items: Vec::new(),
             items_cache: HashMap::new(),
             comments_cache: HashMap::new(),
+            note_detail_cache: HashMap::new(),
+            link_previews: HashMap::new(),
+            link_preview_fingerprints: HashMap::new(),
+            pending_link_previews: HashMap::new(),
+            preview_generation: 0,
+            selected_link_preview: 0,
+            detail_scroll: 0,
+            invite_confirmation: None,
+            accepting_invite: false,
+            pending_open_list_id: None,
+            pending_open_item_id: None,
             selected_list: 0,
             selected_item: 0,
             list_scroll: 0,
@@ -1302,6 +1354,28 @@ impl App {
                 LoadMessage::Comments { item_id, result } => {
                     self.apply_comments_result(item_id, result)
                 }
+                LoadMessage::NoteDetail { list_id, result } => {
+                    self.apply_note_detail_result(list_id, result)
+                }
+                LoadMessage::LinkPreviews {
+                    owner,
+                    identity,
+                    previews,
+                } => {
+                    if self.pending_link_previews.get(&owner) != Some(&identity) {
+                        continue;
+                    }
+                    self.pending_link_previews.remove(&owner);
+                    if previews.iter().all(|preview| preview.resolved) {
+                        self.link_preview_fingerprints
+                            .insert(owner.clone(), identity.fingerprint);
+                        self.link_previews.insert(owner, previews);
+                        self.selected_link_preview = 0;
+                    }
+                }
+                LoadMessage::AcceptInvite { list_id, result } => {
+                    self.apply_accept_invite_result(list_id, result)
+                }
                 LoadMessage::DetailImage { source, result } => {
                     self.apply_detail_image_result(source, result)
                 }
@@ -1391,6 +1465,14 @@ impl App {
         self.selected_list().map(|list| list.id)
     }
 
+    fn task_mutation_allowed(&mut self) -> bool {
+        if self.selected_list().is_some_and(ShoppingList::is_note) {
+            self.status = Some(tr("note-task-mutation-blocked"));
+            return false;
+        }
+        true
+    }
+
     fn selected_list_name(&self) -> String {
         self.selected_list()
             .map_or_else(|| tr("common-unknown"), |list| list.name.clone())
@@ -1451,7 +1533,8 @@ impl App {
         self.items_cache.clear();
         self.lists = lists;
 
-        self.selected_list = previous_list_id
+        let target_list_id = self.pending_open_list_id.take().or(previous_list_id);
+        self.selected_list = target_list_id
             .and_then(|id| self.lists.iter().position(|list| list.id == id))
             .unwrap_or(0);
 
@@ -1467,6 +1550,7 @@ impl App {
         let Some(list_id) = self.selected_list_id() else {
             return;
         };
+
         let list_name = self.selected_list_name();
         self.pending_auto_handoff_list_id = Some(list_id);
         self.spawn_load(async move {
@@ -1599,10 +1683,21 @@ impl App {
             return;
         };
 
+        if self.selected_list().is_some_and(ShoppingList::is_note) {
+            self.items.clear();
+            self.selected_item = 0;
+            self.pending_open_item_id = None;
+            self.detail_scroll = 0;
+            self.loading_items_for = Some(list_id);
+            self.load_note_detail_background(list_id);
+            return;
+        }
+
         if let Some(cached) = self.items_cache.get(&list_id) {
             self.items.clone_from(cached);
             self.loading_items_for = None;
-            self.apply_item_selection(previous_item_id);
+            let target_item_id = self.pending_open_item_id.take().or(previous_item_id);
+            self.apply_item_selection(target_item_id);
             self.status = Some(format!(
                 "{} | {} {}",
                 self.selected_list_display_name(),
@@ -1611,6 +1706,7 @@ impl App {
             ));
             self.refresh_selected_image_background();
             self.load_comments_for_selected_item();
+            self.load_link_previews_for_selected_item();
             return;
         }
 
@@ -1659,7 +1755,10 @@ impl App {
         self.loading_items_for = None;
         match result {
             Ok(mut items) => {
-                let previous_item_id = self.selected_item().map(|item| item.id);
+                let previous_item_id = self
+                    .pending_open_item_id
+                    .take()
+                    .or_else(|| self.selected_item().map(|item| item.id));
                 apply_item_depths(&mut items);
                 self.items = items;
                 self.items_cache.insert(list_id, self.items.clone());
@@ -1672,6 +1771,7 @@ impl App {
                 ));
                 self.refresh_selected_image_background();
                 self.load_comments_for_selected_item();
+                self.load_link_previews_for_selected_item();
             }
             Err(error) => {
                 self.items.clear();
@@ -1700,6 +1800,8 @@ impl App {
     fn refresh_lists_force_background(&mut self) {
         self.items_cache.clear();
         self.comments_cache.clear();
+        self.note_detail_cache.clear();
+        self.invalidate_all_link_previews();
         self.reload_lists_background();
     }
 
@@ -1734,6 +1836,255 @@ impl App {
     fn apply_comments_result(&mut self, item_id: i64, result: Result<Vec<ItemComment>, String>) {
         if let Ok(comments) = result {
             self.comments_cache.insert(item_id, comments);
+            self.invalidate_item_link_previews(item_id);
+            if self.selected_item().is_some_and(|item| item.id == item_id) {
+                self.load_link_previews_for_selected_item();
+            }
+        }
+    }
+
+    fn load_note_detail_background(&mut self, list_id: i64) {
+        if self.note_detail_cache.contains_key(&list_id) {
+            self.loading_items_for = None;
+            self.load_link_previews_for_note(list_id);
+            return;
+        }
+        let api = self.api.clone();
+        self.spawn_load(async move {
+            LoadMessage::NoteDetail {
+                list_id,
+                result: api.get(&format!("/lists/{list_id}")).await,
+            }
+        });
+    }
+
+    fn apply_note_detail_result(&mut self, list_id: i64, result: Result<Value, String>) {
+        if self.selected_list_id() == Some(list_id) {
+            self.loading_items_for = None;
+        }
+        match result {
+            Ok(value) => {
+                self.note_detail_cache.insert(list_id, value);
+                if self.selected_list_id() == Some(list_id) {
+                    self.status = Some(self.selected_list_display_name());
+                    self.load_link_previews_for_note(list_id);
+                }
+            }
+            Err(error) if self.selected_list_id() == Some(list_id) => self.status = Some(error),
+            Err(_) => {}
+        }
+    }
+
+    fn load_link_previews(&mut self, owner: String, texts: Vec<String>) {
+        let fingerprint = preview_content_fingerprint(&texts);
+        if self.link_preview_fingerprints.get(&owner) == Some(&fingerprint) {
+            return;
+        }
+        let identity = PreviewRequestIdentity {
+            generation: self.preview_generation,
+            fingerprint,
+        };
+        if self.pending_link_previews.get(&owner) == Some(&identity) {
+            return;
+        }
+        self.link_previews.remove(&owner);
+        self.link_preview_fingerprints.remove(&owner);
+        self.pending_link_previews.insert(owner.clone(), identity);
+        let api = self.api.clone();
+        self.spawn_load(async move {
+            let mut resolver = LinkPreviewResolver::new(api);
+            let previews = resolver
+                .resolve_texts(texts.iter().map(String::as_str))
+                .await;
+            LoadMessage::LinkPreviews {
+                owner,
+                identity,
+                previews,
+            }
+        });
+    }
+
+    fn invalidate_link_preview_owner(&mut self, owner: &str) {
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        self.pending_link_previews.clear();
+        self.link_previews.remove(owner);
+        self.link_preview_fingerprints.remove(owner);
+    }
+
+    fn invalidate_item_link_previews(&mut self, item_id: i64) {
+        self.invalidate_link_preview_owner(&item_preview_owner(item_id));
+    }
+
+    fn invalidate_all_link_previews(&mut self) {
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        self.pending_link_previews.clear();
+        self.link_previews.clear();
+        self.link_preview_fingerprints.clear();
+    }
+
+    fn load_link_previews_for_note(&mut self, list_id: i64) {
+        let mut texts = Vec::new();
+        if let Some(list) = self.lists.iter().find(|list| list.id == list_id) {
+            texts.push(list.name.clone());
+        }
+        if let Some(content) = self.note_detail_cache.get(&list_id).and_then(note_content) {
+            texts.push(content.to_string());
+        }
+        self.load_link_previews(note_preview_owner(list_id), texts);
+    }
+
+    fn load_link_previews_for_selected_item(&mut self) {
+        let Some(item) = self.selected_item().cloned() else {
+            return;
+        };
+        let mut texts = vec![item.text];
+        if let Some(notes) = item.notes {
+            texts.push(notes);
+        }
+        if let Some(tldr) = item.tldr {
+            texts.push(tldr);
+        }
+        if let Some(attachments) = item.attachments {
+            for attachment in attachments {
+                if let Some(context) = attachment.context {
+                    texts.push(context);
+                }
+                if let Some(alt_text) = attachment.alt_text {
+                    texts.push(alt_text);
+                }
+            }
+        }
+        if let Some(comments) = self.comments_cache.get(&item.id) {
+            texts.extend(comments.iter().filter_map(|comment| comment.text.clone()));
+        }
+        self.load_link_previews(item_preview_owner(item.id), texts);
+    }
+
+    fn current_link_previews(&self) -> &[LinkPreview] {
+        let owner = if self.selected_list().is_some_and(ShoppingList::is_note) {
+            self.selected_list_id().map(note_preview_owner)
+        } else {
+            self.selected_item().map(|item| item_preview_owner(item.id))
+        };
+        owner
+            .as_deref()
+            .and_then(|owner| self.link_previews.get(owner))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    fn cycle_link_preview(&mut self) {
+        let count = self.current_link_previews().len();
+        if count > 0 {
+            self.selected_link_preview = (self.selected_link_preview + 1) % count;
+            self.status = Some(tr_args(
+                "tui-link-preview-selected",
+                &[
+                    ("index", (self.selected_link_preview + 1).to_string()),
+                    ("count", count.to_string()),
+                ],
+            ));
+        }
+    }
+
+    async fn activate_link_preview(&mut self) -> Result<(), String> {
+        let Some(preview) = self
+            .current_link_previews()
+            .get(self.selected_link_preview)
+            .cloned()
+        else {
+            self.status = Some(tr("link-preview-unresolved"));
+            return Ok(());
+        };
+        let Some(action) = preview.action else {
+            self.status = Some(tr("link-preview-unresolved"));
+            return Ok(());
+        };
+        if !preview.resolved {
+            self.status = Some(tr("link-preview-unresolved"));
+            return Ok(());
+        }
+        match action.kind {
+            LinkPreviewActionKind::Open => {
+                if let Some(list_id) = preview.list_id.and_then(|id| i64::try_from(id).ok()) {
+                    self.open_list_from_preview(
+                        list_id,
+                        preview.item_id.and_then(|id| i64::try_from(id).ok()),
+                    );
+                } else {
+                    open_url(&action.target_url).await?;
+                    self.status = Some(tr("link-preview-open"));
+                }
+            }
+            LinkPreviewActionKind::Accept => {
+                let token =
+                    crate::internal_links::parse_internal_kramli_url(&preview.canonical_url)
+                        .and_then(|link| link.token)
+                        .ok_or_else(|| tr("cli-invite-link-invalid"))?;
+                self.invite_confirmation = Some(PendingInviteAcceptance {
+                    token,
+                    list_id: preview.list_id.and_then(|id| i64::try_from(id).ok()),
+                    list_name: preview.list_name,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn open_list_from_preview(&mut self, list_id: i64, item_id: Option<i64>) {
+        self.pending_open_item_id = item_id;
+        if let Some(index) = self.lists.iter().position(|list| list.id == list_id) {
+            self.selected_list = index;
+            self.focus = FocusPane::Items;
+            self.load_items_for_selected_list(false);
+            self.send_auto_handoff_viewing_background();
+        } else {
+            self.pending_open_list_id = Some(list_id);
+            self.reload_lists_background();
+        }
+    }
+
+    fn handle_invite_confirmation_key(&mut self, key: KeyEvent) -> bool {
+        if self.invite_confirmation.is_none() {
+            return false;
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') if !self.accepting_invite => {
+                self.accept_pending_invite();
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') if !self.accepting_invite => {
+                self.invite_confirmation = None;
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn accept_pending_invite(&mut self) {
+        let Some(pending) = self.invite_confirmation.clone() else {
+            return;
+        };
+        self.accepting_invite = true;
+        let api = self.api.clone();
+        self.spawn_load(async move {
+            LoadMessage::AcceptInvite {
+                list_id: pending.list_id,
+                result: api.accept_invite_link(&pending.token).await,
+            }
+        });
+    }
+
+    fn apply_accept_invite_result(&mut self, list_id: Option<i64>, result: Result<Value, String>) {
+        self.accepting_invite = false;
+        match result {
+            Ok(value) => {
+                self.invite_confirmation = None;
+                self.pending_open_list_id =
+                    value.get("list_id").and_then(Value::as_i64).or(list_id);
+                self.status = Some(tr("cli-invite-accepted"));
+                self.refresh_lists_force_background();
+            }
+            Err(error) => self.status = Some(error),
         }
     }
 
@@ -2045,6 +2396,12 @@ impl App {
     }
 
     fn open_editor(&mut self) -> Result<(), String> {
+        if self.selected_list().is_some_and(ShoppingList::is_note) {
+            return self.open_note_editor();
+        }
+        if !self.task_mutation_allowed() {
+            return Ok(());
+        }
         let Some(item) = self.selected_item() else {
             self.status = Some(tr("output-no-items"));
             return Ok(());
@@ -2086,7 +2443,47 @@ impl App {
         Ok(())
     }
 
+    fn open_note_editor(&mut self) -> Result<(), String> {
+        let Some(list_id) = self.selected_list_id() else {
+            return Ok(());
+        };
+        let Some(detail) = self.note_detail_cache.get(&list_id) else {
+            self.status = Some(tr("tui-note-loading"));
+            return Ok(());
+        };
+        let plain = match validate_plain_note(detail) {
+            Ok(plain) => plain,
+            Err(_) => {
+                self.status = Some(tr("tui-note-rich-read-only"));
+                return Ok(());
+            }
+        };
+        self.editor = Some(EditorState {
+            mode: EditorMode::Note,
+            item_id: Some(list_id),
+            text: plain.content,
+            quantity: String::default(),
+            due_date: String::default(),
+            due_time: String::default(),
+            planned_date: String::default(),
+            planned_time: String::default(),
+            reminder: String::default(),
+            reminder_time: String::default(),
+            reminder_offsets: String::default(),
+            travel_time_minutes: String::default(),
+            priority: String::default(),
+            tags: String::default(),
+            progress: String::default(),
+            notes: String::default(),
+            active_field: EditorField::Text,
+        });
+        Ok(())
+    }
+
     fn open_add_editor(&mut self) -> Result<(), String> {
+        if !self.task_mutation_allowed() {
+            return Ok(());
+        }
         if self.selected_list_id().is_none() {
             self.status = Some(tr("output-no-lists"));
             return Ok(());
@@ -2121,6 +2518,9 @@ impl App {
     }
 
     fn open_comment_editor(&mut self) -> Result<(), String> {
+        if !self.task_mutation_allowed() {
+            return Ok(());
+        }
         let Some(item_id) = self.selected_item().map(|item| item.id) else {
             self.status = Some(tr("output-no-items"));
             return Ok(());
@@ -2171,6 +2571,9 @@ impl App {
     }
 
     fn open_attachment_editor(&mut self) -> Result<(), String> {
+        if !self.task_mutation_allowed() {
+            return Ok(());
+        }
         let Some(item_id) = self.selected_item().map(|item| item.id) else {
             self.status = Some(tr("output-no-items"));
             return Ok(());
@@ -2206,6 +2609,15 @@ impl App {
             return self.save_filter_editor(&editor);
         }
 
+        if editor.mode == EditorMode::Note {
+            return self.save_note_editor(&editor).await;
+        }
+
+        if !self.task_mutation_allowed() {
+            self.editor = None;
+            return Ok(());
+        }
+
         if editor.mode == EditorMode::Attachment {
             let Some(item_id) = editor.item_id else {
                 return Ok(());
@@ -2239,6 +2651,7 @@ impl App {
                 "attachment-uploaded",
                 &[("filename", attachment.original_filename.unwrap_or_default())],
             ));
+            self.invalidate_item_link_previews(item_id);
             self.reload_items_force_background();
             return Ok(());
         }
@@ -2369,6 +2782,7 @@ impl App {
         if let Some(list_id) = self.selected_list_id() {
             self.items_cache.insert(list_id, self.items.clone());
         }
+        self.invalidate_item_link_previews(updated_id);
 
         self.editor = None;
         self.status = Some(if editor.mode == EditorMode::Create {
@@ -2378,6 +2792,37 @@ impl App {
         });
         self.refresh_selected_image_background();
         self.load_comments_for_selected_item();
+        self.load_link_previews_for_selected_item();
+        Ok(())
+    }
+
+    async fn save_note_editor(&mut self, editor: &EditorState) -> Result<(), String> {
+        let Some(list_id) = editor.item_id else {
+            return Ok(());
+        };
+        let Some(current) = self.note_detail_cache.get(&list_id) else {
+            self.status = Some(tr("tui-note-loading"));
+            return Ok(());
+        };
+        let payload = match safe_update_payload(current, &editor.text, Map::new()) {
+            Ok(payload) => payload,
+            Err(_) => {
+                self.status = Some(tr("tui-note-rich-read-only"));
+                return Ok(());
+            }
+        };
+        let updated: Value = match self.api.put(&format!("/lists/{list_id}"), &payload).await {
+            Ok(updated) => updated,
+            Err(error) => {
+                self.status = Some(error);
+                return Ok(());
+            }
+        };
+        self.note_detail_cache.insert(list_id, updated);
+        self.editor = None;
+        self.status = Some(tr("tui-note-saved"));
+        self.invalidate_link_preview_owner(&note_preview_owner(list_id));
+        self.load_link_previews_for_note(list_id);
         Ok(())
     }
 
@@ -2421,12 +2866,17 @@ impl App {
             .entry(item_id)
             .or_default()
             .push(comment);
+        self.invalidate_item_link_previews(item_id);
         self.editor = None;
         self.status = Some(tr("label-comments"));
+        self.load_link_previews_for_selected_item();
         Ok(())
     }
 
     async fn toggle_selected_done(&mut self) -> Result<(), String> {
+        if !self.task_mutation_allowed() {
+            return Ok(());
+        }
         let Some(item_id) = self.selected_item().map(|item| item.id) else {
             return Ok(());
         };
@@ -2444,17 +2894,23 @@ impl App {
         if let Some(list_id) = self.selected_list_id() {
             self.items_cache.insert(list_id, self.items.clone());
         }
+        self.invalidate_item_link_previews(item_id);
         self.set_selected_item_by_id(item_id);
         self.status = Some(tr("cli-item-toggled"));
+        self.load_link_previews_for_selected_item();
         Ok(())
     }
 
     async fn delete_selected_item(&mut self) -> Result<(), String> {
+        if !self.task_mutation_allowed() {
+            return Ok(());
+        }
         let Some(item_id) = self.selected_item().map(|item| item.id) else {
             return Ok(());
         };
 
         let _: Value = self.api.delete(&format!("/items/{item_id}")).await?;
+        self.invalidate_item_link_previews(item_id);
         if let Some(index) = self.items.iter().position(|item| item.id == item_id) {
             self.items.remove(index);
             self.selected_item = index.min(self.items.len().saturating_sub(1));
@@ -2467,6 +2923,7 @@ impl App {
         }
         self.refresh_selected_image_background();
         self.status = Some(tr("cli-item-deleted"));
+        self.load_link_previews_for_selected_item();
         Ok(())
     }
 
@@ -2544,6 +3001,7 @@ impl App {
             )
             .await?;
         self.status = Some(tr("cli-undo-done"));
+        self.invalidate_all_link_previews();
         self.reload_items_force_background();
         Ok(())
     }
@@ -2594,8 +3052,39 @@ impl App {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<(), String> {
+        if self.handle_invite_confirmation_key(key) {
+            return Ok(());
+        }
         if self.handle_help_key(key) {
             return Ok(());
+        }
+
+        if self.editor.is_none()
+            && !self.current_link_previews().is_empty()
+            && matches!(key.code, KeyCode::Char('v'))
+        {
+            self.activate_link_preview().await?;
+            return Ok(());
+        }
+        if self.editor.is_none()
+            && !self.current_link_previews().is_empty()
+            && matches!(key.code, KeyCode::Char('V'))
+        {
+            self.cycle_link_preview();
+            return Ok(());
+        }
+        if self.editor.is_none() && key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Up => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
 
         if let Some(action) = self.key_bindings.action_for_key(key) {
@@ -2790,11 +3279,16 @@ impl App {
             self.calendar_visible_month = None;
             self.reload_items();
             self.send_auto_handoff_viewing_background();
-        } else if item_changed && self.mode == ViewMode::List {
-            self.refresh_selected_image_background();
+        } else if item_changed {
+            self.detail_scroll = 0;
+            if self.mode == ViewMode::List {
+                self.refresh_selected_image_background();
+            }
+            if self.mode == ViewMode::Calendar {
+                self.sync_calendar_date_to_selected_item();
+            }
             self.load_comments_for_selected_item();
-        } else if item_changed && self.mode == ViewMode::Calendar {
-            self.sync_calendar_date_to_selected_item();
+            self.load_link_previews_for_selected_item();
         }
     }
 
@@ -2808,7 +3302,7 @@ impl App {
         };
         let simple_text_dialog = matches!(
             mode,
-            EditorMode::Comment | EditorMode::Filter | EditorMode::Attachment
+            EditorMode::Note | EditorMode::Comment | EditorMode::Filter | EditorMode::Attachment
         );
 
         match key.code {
@@ -2821,6 +3315,7 @@ impl App {
             KeyCode::Down => self.move_editor_with_suggestion(simple_text_dialog, 1),
             KeyCode::Left => self.move_editor_prev_if_form(simple_text_dialog),
             KeyCode::Right => self.move_editor_next_if_form(simple_text_dialog),
+            KeyCode::Enter if mode == EditorMode::Note => self.push_editor_char('\n'),
             KeyCode::Enter => {
                 return self.handle_editor_enter(simple_text_dialog).await;
             }
@@ -2985,9 +3480,13 @@ impl App {
             self.clear_drag_state();
         }
 
-        if self.selected_item != previous_item && self.mode == ViewMode::List {
-            self.refresh_selected_image_background();
+        if self.selected_item != previous_item {
+            self.detail_scroll = 0;
+            if self.mode == ViewMode::List {
+                self.refresh_selected_image_background();
+            }
             self.load_comments_for_selected_item();
+            self.load_link_previews_for_selected_item();
         }
 
         Ok(())
@@ -3812,6 +4311,9 @@ impl App {
         item_index: usize,
         target_column: usize,
     ) -> Result<(), String> {
+        if !self.task_mutation_allowed() {
+            return Ok(());
+        }
         let (columns, _) = self.kanban_buckets();
         let Some(column) = columns.get(target_column) else {
             return Ok(());
@@ -3854,11 +4356,13 @@ impl App {
         if let Some(list_id) = self.selected_list_id() {
             self.items_cache.insert(list_id, self.items.clone());
         }
+        self.invalidate_item_link_previews(item.id);
         self.status = Some(tr("cli-item-updated"));
         if self.mode == ViewMode::List {
             self.refresh_selected_image_background();
             self.load_comments_for_selected_item();
         }
+        self.load_link_previews_for_selected_item();
         Ok(())
     }
 
@@ -3909,6 +4413,9 @@ impl App {
         item_index: usize,
         due_date: String,
     ) -> Result<(), String> {
+        if !self.task_mutation_allowed() {
+            return Ok(());
+        }
         let Some(item) = self.items.get(item_index).cloned() else {
             return Ok(());
         };
@@ -3940,7 +4447,9 @@ impl App {
         if let Some(list_id) = self.selected_list_id() {
             self.items_cache.insert(list_id, self.items.clone());
         }
+        self.invalidate_item_link_previews(item.id);
         self.status = Some(tr("cli-item-updated"));
+        self.load_link_previews_for_selected_item();
         Ok(())
     }
 
@@ -4833,7 +5342,9 @@ fn auto_handoff_enabled_from_value(raw: Option<&str>) -> bool {
 fn editor_fields(mode: EditorMode) -> &'static [EditorField] {
     match mode {
         EditorMode::Create | EditorMode::Edit => &ITEM_EDITOR_FIELDS,
-        EditorMode::Comment | EditorMode::Filter | EditorMode::Attachment => &SIMPLE_EDITOR_FIELDS,
+        EditorMode::Note | EditorMode::Comment | EditorMode::Filter | EditorMode::Attachment => {
+            &SIMPLE_EDITOR_FIELDS
+        }
     }
 }
 
@@ -4863,6 +5374,7 @@ fn editor_move_prev(editor: &mut EditorState) {
 fn editor_field_hint(field: EditorField, mode: EditorMode) -> String {
     match mode {
         EditorMode::Filter => tr("label-text"),
+        EditorMode::Note => tr("label-notes"),
         EditorMode::Comment => tr("label-comments"),
         EditorMode::Attachment => tr("attachment-path"),
         EditorMode::Create | EditorMode::Edit => field.label(),
@@ -5112,10 +5624,22 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
 
     draw_lists_panel(frame, app, layout.lists);
 
-    match app.mode {
-        ViewMode::List => draw_list_mode(frame, app, layout.content),
-        ViewMode::Kanban => draw_kanban_mode(frame, app, layout.content),
-        ViewMode::Calendar => draw_calendar_mode(frame, app, layout.content),
+    if app.selected_list().is_some_and(ShoppingList::is_note) {
+        draw_note_mode(frame, app, layout.content);
+    } else {
+        match app.mode {
+            ViewMode::List => draw_list_mode(frame, app, layout.content),
+            ViewMode::Kanban => {
+                let areas = selected_detail_layout(layout.content);
+                draw_kanban_mode(frame, app, areas[0]);
+                draw_item_detail(frame, app, areas[1]);
+            }
+            ViewMode::Calendar => {
+                let areas = selected_detail_layout(layout.content);
+                draw_calendar_mode(frame, app, areas[0]);
+                draw_item_detail(frame, app, areas[1]);
+            }
+        }
     }
 
     draw_footer(frame, app, layout.footer);
@@ -5134,9 +5658,135 @@ fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
         draw_editor(frame, editor);
     }
 
+    if app.invite_confirmation.is_some() {
+        draw_invite_confirmation_overlay(frame, app);
+    }
+
     if app.show_help {
         draw_help_overlay(frame);
     }
+}
+
+fn selected_detail_layout(area: Rect) -> std::rc::Rc<[Rect]> {
+    let detail_height = if area.height < 10 {
+        area.height.saturating_div(2).max(3)
+    } else {
+        (area.height / 3).clamp(5, 12)
+    };
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(detail_height)])
+        .split(area)
+}
+
+fn item_preview_owner(item_id: i64) -> String {
+    format!("item:{item_id}")
+}
+
+fn note_preview_owner(list_id: i64) -> String {
+    format!("note:{list_id}")
+}
+
+fn preview_content_fingerprint(texts: &[String]) -> u64 {
+    let mut hasher = DefaultHasher::default();
+    texts.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn link_preview_lines(previews: &[LinkPreview], selected: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (index, preview) in previews.iter().enumerate() {
+        let marker = if index == selected { ">" } else { " " };
+        let title = preview
+            .item_text
+            .as_deref()
+            .or(preview.list_name.as_deref())
+            .or(preview.folder_name.as_deref())
+            .unwrap_or(&preview.display_url);
+        lines.push(Line::styled(
+            format!("{marker} ┌─ {title}"),
+            if index == selected {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            },
+        ));
+        lines.push(Line::from(format!("  │ {}", preview.display_url)));
+        let action = match preview.action.as_ref().map(|action| action.kind) {
+            Some(LinkPreviewActionKind::Open) => tr("link-preview-open"),
+            Some(LinkPreviewActionKind::Accept) => tr("link-preview-accept"),
+            None => tr("link-preview-unresolved"),
+        };
+        lines.push(Line::from(format!("  └─ {action}")));
+    }
+    lines
+}
+
+fn draw_note_mode(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let list_id = app.selected_list_id();
+    let mut lines = Vec::new();
+    if let Some(content) = list_id
+        .and_then(|id| app.note_detail_cache.get(&id))
+        .and_then(note_content)
+    {
+        lines.extend(content.lines().map(|line| Line::from(line.to_string())));
+    } else {
+        lines.push(Line::from(tr("tui-note-loading")));
+    }
+    if let Some(previews) = list_id
+        .map(note_preview_owner)
+        .as_deref()
+        .and_then(|owner| app.link_previews.get(owner))
+    {
+        if !previews.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                tr("link-preview-section"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            lines.extend(link_preview_lines(previews, app.selected_link_preview));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(app.selected_list_display_name()),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((app.detail_scroll, 0)),
+        area,
+    );
+}
+
+fn draw_invite_confirmation_overlay(frame: &mut Frame<'_>, app: &App) {
+    let Some(pending) = app.invite_confirmation.as_ref() else {
+        return;
+    };
+    let (outer, inner) = centered_popup(frame.area(), 28, 64, 7, 11);
+    frame.render_widget(Clear, outer);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(tr("tui-invite-confirm-title")),
+        outer,
+    );
+    let list = pending.list_name.as_deref().unwrap_or("?");
+    let state = if app.accepting_invite {
+        tr("tui-invite-accepting")
+    } else {
+        tr_args("tui-invite-confirm-body", &[("list", list.to_string())])
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(state),
+            Line::from(""),
+            Line::from(tr("tui-invite-confirm-hint")),
+        ])
+        .wrap(Wrap { trim: true }),
+        inner,
+    );
 }
 
 fn draw_mode_tabs(frame: &mut Frame<'_>, app: &App, layout: &UiLayout) {
@@ -5681,6 +6331,16 @@ fn draw_item_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 lines.push(Line::from(format!("- {author}: {text}")));
             }
         }
+        if let Some(previews) = app.link_previews.get(&item_preview_owner(item.id)) {
+            if !previews.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::styled(
+                    tr("link-preview-section"),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+                lines.extend(link_preview_lines(previews, app.selected_link_preview));
+            }
+        }
     } else {
         lines.push(Line::from(item_placeholder(app)));
     }
@@ -5691,7 +6351,8 @@ fn draw_item_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .borders(Borders::ALL)
                 .title(tr("label-details")),
         )
-        .wrap(Wrap { trim: true });
+        .wrap(Wrap { trim: true })
+        .scroll((app.detail_scroll, 0));
     frame.render_widget(widget, detail_areas.1);
 }
 
@@ -6080,6 +6741,7 @@ fn draw_editor(frame: &mut Frame<'_>, editor: &EditorState) {
     let title = match editor.mode {
         EditorMode::Create => tr("label-items"),
         EditorMode::Edit => tr("label-changes"),
+        EditorMode::Note => tr("label-notes"),
         EditorMode::Comment => tr("label-comments"),
         EditorMode::Filter => tr("label-text"),
         EditorMode::Attachment => tr("attachment-path"),
@@ -6119,12 +6781,16 @@ fn draw_editor(frame: &mut Frame<'_>, editor: &EditorState) {
         layout.progress,
     );
     render_editor_field(frame, layout.field, editor.active_field, editor);
-    frame.render_widget(
-        Paragraph::new(format!(
+    let hint = if editor.mode == EditorMode::Note {
+        tr("tui-note-editor-hint")
+    } else {
+        format!(
             "{}  ·  ← →  ·  [^S]  ·  [⎋]",
             editor_field_hint(editor.active_field, editor.mode).trim_end_matches(':')
-        ))
-        .style(Style::default().fg(MUTED_TEXT)),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().fg(MUTED_TEXT)),
         layout.hint,
     );
 
@@ -6177,6 +6843,7 @@ fn draw_help_overlay(frame: &mut Frame<'_>) {
         Line::from(tr("tui-help-actions-2")),
         Line::from(tr("tui-help-actions-3")),
         Line::from(tr("tui-help-actions-4")),
+        Line::from(tr("tui-help-actions-5")),
         Line::from(""),
         Line::from(vec![Span::styled(
             tr("tui-help-editor"),
@@ -6246,7 +6913,9 @@ fn render_editor_field(
                 .border_style(border_style)
                 .title(label.trim_end_matches(':')),
         )
-        .wrap(Wrap { trim: true });
+        .wrap(Wrap {
+            trim: editor.mode != EditorMode::Note,
+        });
     frame.render_widget(widget, rect);
 }
 
@@ -7586,11 +8255,13 @@ async fn fetch_bootstrap_icon_image(icon: &str) -> Result<DynamicImage, String> 
     }
 
     let url = format!("{}/{}.svg", bootstrap_icon_base_url(), icon);
+    #[cfg(test)]
+    crate::test_env::notify_mock_server_ready(&url);
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(6))
         .build()
         .map_err(|error| error.to_string())?
-        .get(url)
+        .get(&url)
         .send()
         .await
         .map_err(|error| error.to_string())?;
@@ -7918,6 +8589,12 @@ fn image_extension_from_source(source: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
+async fn open_path(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(test))]
 async fn open_path(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let mut command = {
@@ -7946,9 +8623,42 @@ async fn open_path(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
+async fn open_url(_url: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+async fn open_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = TokioCommand::new("open");
+        command.arg(url);
+        command
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = TokioCommand::new("cmd");
+        command.args(["/C", "start", "", url]);
+        command
+    };
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut command = {
+        let mut command = TokioCommand::new("xdg-open");
+        command.arg(url);
+        command
+    };
+
+    command.spawn().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::ApiClient;
+    use serde_json::json;
 
     fn sample_item(id: i64, text: &str) -> ListItem {
         ListItem {
@@ -8002,7 +8712,13 @@ mod tests {
             .await
             .expect("test server should bind");
         let addr = listener.local_addr().expect("test server should have addr");
+        let base_url = format!("http://{addr}");
+        let ready = (!responses.is_empty())
+            .then(|| crate::test_env::register_mock_server(base_url.clone()));
         let handle = tokio::spawn(async move {
+            if let Some(ready) = ready {
+                let _ = ready.await;
+            }
             let mut requests = Vec::new();
             for body in responses {
                 let (mut stream, _) =
@@ -8030,7 +8746,7 @@ mod tests {
             requests
         });
 
-        (ApiClient::for_tests(&format!("http://{addr}")), handle)
+        (ApiClient::for_tests(&base_url), handle)
     }
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -8044,6 +8760,488 @@ mod tests {
 
     fn test_list() -> ShoppingList {
         test_shopping_list(1, "Groceries", None, None, None, false)
+    }
+
+    fn test_link_preview(
+        url: &str,
+        action_kind: Option<LinkPreviewActionKind>,
+        list_id: Option<u64>,
+    ) -> LinkPreview {
+        LinkPreview {
+            kind: crate::internal_links::InternalLinkKind::Invite,
+            canonical_url: url.to_string(),
+            display_url: url.to_string(),
+            resolved: action_kind.is_some(),
+            list_id,
+            item_id: None,
+            list_name: Some("Shared list".to_string()),
+            list_icon: None,
+            list_color: None,
+            list_type: Some("tasks".to_string()),
+            item_text: None,
+            folder_name: None,
+            folder_icon: None,
+            folder_color: None,
+            role: Some("editor".to_string()),
+            invited_by: Some("Ada".to_string()),
+            action: action_kind.map(|kind| crate::internal_links::LinkPreviewAction {
+                kind,
+                target_url: url.to_string(),
+                requires_confirmation: matches!(kind, LinkPreviewActionKind::Accept),
+            }),
+        }
+    }
+
+    fn terminal_text(terminal: &Terminal<ratatui::backend::TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let mut output = String::new();
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                output.push_str(buffer.cell((x, y)).map_or(" ", |cell| cell.symbol()));
+            }
+            output.push('\n');
+        }
+        output
+    }
+
+    #[tokio::test]
+    async fn note_lists_block_task_editors() {
+        let (api, _) = api_with_responses(Vec::new()).await;
+        let mut app = App::new(api, false);
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+
+        app.open_add_editor().expect("guard should not fail");
+        assert!(app.editor.is_none());
+        assert_eq!(app.status, Some(tr("note-task-mutation-blocked")));
+    }
+
+    #[test]
+    fn preview_cards_render_multiple_actions_and_unresolved_fallback() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Links")];
+        app.link_previews.insert(
+            item_preview_owner(1),
+            vec![
+                test_link_preview(
+                    "https://kram.li/i/InviteToken_1",
+                    Some(LinkPreviewActionKind::Accept),
+                    Some(7),
+                ),
+                test_link_preview(
+                    "https://kram.li/i/MemberToken_1",
+                    Some(LinkPreviewActionKind::Open),
+                    Some(8),
+                ),
+                test_link_preview("https://kram.li/i/UnknownToken_1", None, None),
+            ],
+        );
+        app.detail_scroll = 8;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 36)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        let text = terminal_text(&terminal);
+        assert!(text.contains(&tr("link-preview-accept")));
+        assert!(text.contains(&tr("link-preview-open")));
+        assert!(text.contains(&tr("link-preview-unresolved")));
+
+        for (width, height) in [(34, 9), (24, 7)] {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn note_detail_retains_content_and_renders_link_cards() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.apply_note_detail_result(
+            1,
+            Ok(json!({"note_content": "Plan https://kramli.de/privacy"})),
+        );
+        app.link_previews.insert(
+            note_preview_owner(1),
+            vec![test_link_preview(
+                "https://kramli.de/privacy",
+                Some(LinkPreviewActionKind::Open),
+                None,
+            )],
+        );
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        let text = terminal_text(&terminal);
+        assert!(text.contains("Plan https://kramli.de/privacy"));
+        assert!(text.contains(&tr("link-preview-open")));
+        assert!(app.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invite_preview_selection_is_get_only_until_confirmation() {
+        let (api, requests) = api_with_responses(Vec::new()).await;
+        let mut app = App::new(api, false);
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Invite")];
+        app.link_previews.insert(
+            item_preview_owner(1),
+            vec![test_link_preview(
+                "https://kramli.de/lists/join/InviteToken_1",
+                Some(LinkPreviewActionKind::Accept),
+                Some(7),
+            )],
+        );
+
+        app.activate_link_preview().await.unwrap();
+        assert!(app.invite_confirmation.is_some());
+        assert!(!app.accepting_invite);
+        assert!(requests.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn confirmed_invite_acceptance_posts_and_refreshes_target_list() {
+        let (api, requests) = api_with_responses(vec![json!({
+            "ok": true,
+            "list_id": 7,
+            "already_member": false
+        })
+        .to_string()])
+        .await;
+        let mut app = App::new(api, false);
+        app.invite_confirmation = Some(PendingInviteAcceptance {
+            token: "InviteToken_1".to_string(),
+            list_id: Some(7),
+            list_name: Some("Shared".to_string()),
+        });
+        app.accept_pending_invite();
+        let message = app.rx.recv().await.unwrap();
+        let LoadMessage::AcceptInvite { list_id, result } = message else {
+            panic!("acceptance message expected");
+        };
+        app.apply_accept_invite_result(list_id, result);
+        assert_eq!(app.pending_open_list_id, Some(7));
+        assert!(app.invite_confirmation.is_none());
+        let requests = requests.await.unwrap();
+        assert_eq!(
+            requests[0].lines().next().unwrap_or_default(),
+            "POST /api/invite-links/InviteToken_1/accept HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn comments_refresh_replaces_item_previews_without_breaking_item_state() {
+        let (api, requests) = api_with_responses(vec![
+            json!({"resolved": true, "list_name": "Comment link"}).to_string(),
+        ])
+        .await;
+        let mut app = App::new(api, false);
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Item")];
+        app.link_previews.insert(
+            item_preview_owner(1),
+            vec![test_link_preview(
+                "https://kramli.de/privacy",
+                Some(LinkPreviewActionKind::Open),
+                None,
+            )],
+        );
+        app.apply_comments_result(
+            1,
+            Ok(vec![ItemComment {
+                id: 2,
+                text: Some("See https://kramli.de/lists/42".to_string()),
+                user_id: None,
+                user_name: Some("Ada".to_string()),
+                user_email: None,
+                created_at: None,
+            }]),
+        );
+        let message = app.rx.recv().await.unwrap();
+        let LoadMessage::LinkPreviews {
+            owner, previews, ..
+        } = message
+        else {
+            panic!("preview message expected");
+        };
+        assert_eq!(owner, item_preview_owner(1));
+        assert_eq!(previews.len(), 1);
+        assert_eq!(app.items[0].text, "Item");
+        assert!(requests.await.unwrap()[0].starts_with("GET /api/internal-links/preview?"));
+    }
+
+    #[test]
+    fn stale_preview_responses_are_discarded_by_generation_and_fingerprint() {
+        let mut app = test_app();
+        let owner = item_preview_owner(1);
+        let stale = PreviewRequestIdentity {
+            generation: 1,
+            fingerprint: 11,
+        };
+        let current = PreviewRequestIdentity {
+            generation: 2,
+            fingerprint: 22,
+        };
+        app.preview_generation = current.generation;
+        app.pending_link_previews.insert(owner.clone(), current);
+        app.tx
+            .send(LoadMessage::LinkPreviews {
+                owner: owner.clone(),
+                identity: stale,
+                previews: vec![test_link_preview(
+                    "https://kramli.de/privacy",
+                    Some(LinkPreviewActionKind::Open),
+                    None,
+                )],
+            })
+            .unwrap();
+        app.drain_load_messages();
+        assert!(!app.link_previews.contains_key(&owner));
+        assert_eq!(app.pending_link_previews.get(&owner), Some(&current));
+
+        app.tx
+            .send(LoadMessage::LinkPreviews {
+                owner: owner.clone(),
+                identity: current,
+                previews: vec![test_link_preview(
+                    "https://kramli.de/privacy",
+                    Some(LinkPreviewActionKind::Open),
+                    None,
+                )],
+            })
+            .unwrap();
+        app.drain_load_messages();
+        assert_eq!(app.link_preview_fingerprints.get(&owner), Some(&22));
+        assert_eq!(app.link_previews[&owner].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_preview_results_are_retryable_and_content_changes_replace_pending_work() {
+        let mut app = test_app();
+        let owner = item_preview_owner(1);
+        let texts = vec!["https://kramli.de/lists/42".to_string()];
+        let fingerprint = preview_content_fingerprint(&texts);
+        let identity = PreviewRequestIdentity {
+            generation: app.preview_generation,
+            fingerprint,
+        };
+        app.pending_link_previews.insert(owner.clone(), identity);
+        app.tx
+            .send(LoadMessage::LinkPreviews {
+                owner: owner.clone(),
+                identity,
+                previews: vec![test_link_preview(
+                    "https://kramli.de/lists/42",
+                    None,
+                    Some(42),
+                )],
+            })
+            .unwrap();
+        app.drain_load_messages();
+        assert!(!app.link_previews.contains_key(&owner));
+        assert!(!app.pending_link_previews.contains_key(&owner));
+
+        app.load_link_previews(owner.clone(), texts);
+        assert!(app.pending_link_previews.contains_key(&owner));
+        let first_retry = app.pending_link_previews[&owner];
+        app.load_link_previews(
+            owner.clone(),
+            vec!["https://kramli.de/lists/43".to_string()],
+        );
+        assert_ne!(app.pending_link_previews[&owner], first_retry);
+    }
+
+    #[tokio::test]
+    async fn preview_target_item_is_selected_after_target_list_items_load() {
+        let mut app = test_app();
+        app.pending_open_list_id = Some(7);
+        app.pending_open_item_id = Some(55);
+        app.apply_lists_result(Ok(vec![test_shopping_list(
+            7, "Target", None, None, None, false,
+        )]));
+        app.apply_items_result(
+            7,
+            Ok(vec![
+                sample_item(54, "First"),
+                sample_item(55, "Target item"),
+            ]),
+        );
+        assert_eq!(app.selected_list_id(), Some(7));
+        assert_eq!(app.selected_item().map(|item| item.id), Some(55));
+        assert_eq!(app.pending_open_item_id, None);
+    }
+
+    #[tokio::test]
+    async fn configured_v_binding_runs_when_no_preview_is_available() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Item")];
+        app.key_bindings = KeyBindings::from_sources(|action| {
+            (action == FooterAction::Edit).then(|| "v".to_string())
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(app.editor.is_some());
+    }
+
+    #[tokio::test]
+    async fn selecting_note_list_loads_detail_instead_of_items() {
+        let (api, requests) = api_with_responses(vec![
+            json!({"id": 1, "list_type": "note", "note_content": "Saved note"}).to_string(),
+        ])
+        .await;
+        let mut app = App::new(api, false);
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.load_items_for_selected_list(false);
+        let (list_id, result) = loop {
+            match app.rx.recv().await.unwrap() {
+                LoadMessage::NoteDetail { list_id, result } => break (list_id, result),
+                _ => continue,
+            }
+        };
+        app.apply_note_detail_result(list_id, result);
+        assert_eq!(
+            app.note_detail_cache.get(&1).and_then(note_content),
+            Some("Saved note")
+        );
+        assert!(app.items.is_empty());
+        assert_eq!(
+            requests.await.unwrap()[0].lines().next().unwrap(),
+            "GET /api/lists/1 HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_invite_acceptance_keeps_confirmation_open() {
+        let (api, requests) = api_with_responses(vec!["not-json".to_string()]).await;
+        let mut app = App::new(api, false);
+        app.invite_confirmation = Some(PendingInviteAcceptance {
+            token: "InviteToken_1".to_string(),
+            list_id: Some(7),
+            list_name: Some("Shared".to_string()),
+        });
+        app.accept_pending_invite();
+        let message = app.rx.recv().await.unwrap();
+        let LoadMessage::AcceptInvite { list_id, result } = message else {
+            panic!("acceptance message expected");
+        };
+        assert!(result.is_err());
+        app.apply_accept_invite_result(list_id, result);
+        assert!(app.invite_confirmation.is_some());
+        assert!(!app.accepting_invite);
+        assert_eq!(requests.await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rich_note_stays_read_only_with_explanation() {
+        let mut app = test_app();
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.note_detail_cache.insert(
+            1,
+            json!({
+                "id": 1,
+                "list_type": "note",
+                "note_content": "Bold",
+                "note_delta": "[{\"insert\":\"Bold\",\"attributes\":{\"bold\":true}}]",
+                "note_version": 3
+            }),
+        );
+
+        app.open_editor().expect("read-only check should not fail");
+
+        assert!(app.editor.is_none());
+        assert_eq!(app.status, Some(tr("tui-note-rich-read-only")));
+    }
+
+    #[tokio::test]
+    async fn plain_note_editor_saves_versioned_delta() {
+        let updated = json!({
+            "id": 1,
+            "name": "Notes",
+            "list_type": "note",
+            "note_content": "First\nSecond",
+            "note_delta": "[{\"insert\":\"First\\nSecond\\n\"}]",
+            "note_version": 5
+        });
+        let (api, requests) = api_with_responses(vec![updated.to_string()]).await;
+        let mut app = App::new(api, false);
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.note_detail_cache.insert(
+            1,
+            json!({
+                "id": 1,
+                "list_type": "note",
+                "note_content": "First",
+                "note_delta": "[{\"insert\":\"First\\n\"}]",
+                "note_version": 4
+            }),
+        );
+        app.open_editor().expect("plain note should open");
+        app.handle_editor_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .await
+            .expect("Enter should add a line");
+        for ch in "Second".chars() {
+            app.handle_editor_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()))
+                .await
+                .expect("typing should update the note");
+        }
+        app.handle_editor_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await
+            .expect("Ctrl+S should save");
+
+        assert!(app.editor.is_none());
+        assert_eq!(app.status, Some(tr("tui-note-saved")));
+        assert_eq!(
+            app.note_detail_cache.get(&1).and_then(note_content),
+            Some("First\nSecond")
+        );
+        let requests = requests.await.unwrap();
+        assert!(requests[0].starts_with("PUT /api/lists/1 HTTP/1.1"));
+    }
+
+    #[tokio::test]
+    async fn failed_note_save_preserves_unsaved_text() {
+        let (api, requests) = api_with_responses(vec!["not-json".to_string()]).await;
+        let mut app = App::new(api, false);
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.note_detail_cache.insert(
+            1,
+            json!({
+                "id": 1,
+                "list_type": "note",
+                "note_content": "Saved",
+                "note_delta": "[{\"insert\":\"Saved\\n\"}]",
+                "note_version": 4
+            }),
+        );
+        app.open_editor().unwrap();
+        app.editor.as_mut().unwrap().text = "Unsaved\ntext".to_string();
+
+        app.save_editor().await.unwrap();
+
+        assert_eq!(
+            app.editor.as_ref().map(|editor| editor.text.as_str()),
+            Some("Unsaved\ntext")
+        );
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| !status.is_empty()));
+        assert_eq!(requests.await.unwrap().len(), 1);
     }
 
     fn test_attachment(id: i64, filename: Option<&str>, mime_type: Option<&str>) -> Attachment {
@@ -8682,7 +9880,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_external_image_loader_path_is_reachable() {
+    async fn external_image_loader_fetches_without_launching_os_app_in_tests() {
         let (api, requests) = api_with_responses(vec!["bytes".to_string()]).await;
         let mut app = App::new(api, true);
         app.lists = vec![test_list()];
@@ -8705,8 +9903,25 @@ mod tests {
 
         assert!(app.pending_open_image.is_none());
 
+        let downloaded_path = app
+            .status
+            .as_deref()
+            .and_then(|status| status.strip_prefix(&format!("{}: ", tr("label-image"))))
+            .map(PathBuf::from)
+            .expect("successful image load should report its temporary path");
+        assert!(downloaded_path.exists());
+        tokio::fs::remove_file(&downloaded_path)
+            .await
+            .expect("temporary test image should be removable");
+
         let requests = requests.await.expect("test server should finish");
         assert_eq!(requests, vec!["GET /img/open.png HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn test_build_external_openers_never_launch_desktop_apps() {
+        assert!(open_path(Path::new("/does/not/exist.png")).await.is_ok());
+        assert!(open_url("https://example.test/").await.is_ok());
     }
 
     #[tokio::test]
@@ -9034,8 +10249,11 @@ mod tests {
                     .await
                     .expect("test server should bind");
                 let addr = listener.local_addr().expect("test server should have addr");
+                let base_url = format!("http://{addr}");
+                let ready = crate::test_env::register_mock_server(base_url.clone());
                 let body = body.to_string();
                 let handle = tokio::spawn(async move {
+                    let _ = ready.await;
                     let mut requests = Vec::new();
                     let (mut stream, _) = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
@@ -9062,7 +10280,7 @@ mod tests {
                         .expect("response body should write");
                     requests
                 });
-                (format!("http://{addr}"), handle)
+                (base_url, handle)
             }
 
             let svg = r#"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path fill='currentColor' d='M0 0h16v16H0z'/></svg>"#;
@@ -9256,6 +10474,7 @@ mod tests {
             archive_mode: None,
             view_mode: None,
             role: None,
+            list_type: Some("tasks".to_string()),
             item_count: None,
             done_count: None,
             state_config: None,
@@ -9812,13 +11031,12 @@ mod tests {
         while app.rx.try_recv().is_ok() {}
         app.send_auto_handoff_viewing_background();
         loop {
-            match app.rx.recv().await.expect("handoff should be scheduled") {
-                LoadMessage::AutoHandoffDue { list_id, list_name } => {
-                    assert_eq!(list_id, 1);
-                    assert_eq!(list_name, "Groceries");
-                    break;
-                }
-                _ => {}
+            if let LoadMessage::AutoHandoffDue { list_id, list_name } =
+                app.rx.recv().await.expect("handoff should be scheduled")
+            {
+                assert_eq!(list_id, 1);
+                assert_eq!(list_name, "Groceries");
+                break;
             }
         }
 
@@ -10499,7 +11717,12 @@ mod tests {
         );
 
         app.editor.as_mut().unwrap().active_field = EditorField::Progress;
-        app.editor.as_mut().unwrap().progress = "O".to_string();
+        let progress_seed = app
+            .progress_suggestions()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "Open".to_string());
+        app.editor.as_mut().unwrap().progress = progress_seed;
         app.handle_editor_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
             .await
             .unwrap();
@@ -12048,7 +13271,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_tui_entrypoint_is_reachable_under_cfg_test() {
-        let _ = run_tui().await;
+        crate::test_env::with_env_lock_async(|| async {
+            let _ = run_tui().await;
+        })
+        .await;
     }
 
     #[test]

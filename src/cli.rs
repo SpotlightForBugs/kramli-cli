@@ -16,7 +16,16 @@ use crate::config::Config;
 #[cfg(test)]
 use crate::config::KRAMLI_CONFIG_PATH_ENV;
 use crate::i18n::{apply_profile_locale, current_locale_code, is_explicit_lang_set, tr, tr_args};
+use crate::internal_links::{
+    parse_internal_kramli_url, LinkPreviewActionKind, LinkPreviewResolver,
+};
 use crate::models::*;
+use crate::note::{
+    ensure_task_list, is_note_list_type, normalize_list_type as normalize_list_type_arg,
+    safe_update_payload,
+};
+#[cfg(test)]
+use crate::note::{plain_text_delta as plain_note_delta, validate_plain_note};
 use crate::output;
 use crate::telemetry;
 
@@ -25,8 +34,8 @@ mod list_commands;
 use list_commands::run_lists;
 #[cfg(test)]
 use list_commands::{
-    run_lists_create, run_lists_delete, run_lists_move, run_lists_update, CreateListArgs,
-    UpdateListArgs,
+    run_lists_create, run_lists_delete, run_lists_move, run_lists_show, run_lists_update,
+    CreateListArgs, UpdateListArgs,
 };
 
 const NO_COLOR_ENV: &str = "NO_COLOR";
@@ -114,6 +123,11 @@ pub(crate) enum Commands {
         /// Number of entries
         #[arg(short, long, default_value = "20")]
         limit: u32,
+    },
+    /// Inspect or accept a Kramli invite link
+    Invite {
+        #[command(subcommand)]
+        action: InviteCmd,
     },
     /// Undo the last action on a list
     Undo {
@@ -236,9 +250,6 @@ pub(crate) enum ListCmd {
         icon: Option<String>,
         #[arg(short, long)]
         color: Option<String>,
-        /// List type: tasks or note (aliases like todo/notizzettel are accepted)
-        #[arg(long = "type")]
-        list_type: Option<String>,
         /// Full note content (for note lists)
         #[arg(long)]
         note_content: Option<String>,
@@ -706,68 +717,74 @@ mod tests {
 
     #[tokio::test]
     async fn run_entrypoint_covers_help_and_conflict_paths() {
-        run_inner(Cli {
-            json: false,
-            interactive: false,
-            dry_run: false,
-            command: None,
-        })
-        .await
-        .expect("missing command should print help");
+        with_env_vars_async(
+            &[("KRAMLI_URL", ""), (TEST_KRAMLI_API_KEY_ENV, "")],
+            || async {
+                run_inner(Cli {
+                    json: false,
+                    interactive: false,
+                    dry_run: false,
+                    command: None,
+                })
+                .await
+                .expect("missing command should print help");
 
-        assert!(run_inner(Cli {
-            json: true,
-            interactive: true,
-            dry_run: false,
-            command: None,
-        })
-        .await
-        .is_err());
+                assert!(run_inner(Cli {
+                    json: true,
+                    interactive: true,
+                    dry_run: false,
+                    command: None,
+                })
+                .await
+                .is_err());
 
-        assert!(run_inner(Cli {
-            json: false,
-            interactive: true,
-            dry_run: false,
-            command: Some(Commands::Status),
-        })
-        .await
-        .is_err());
+                assert!(run_inner(Cli {
+                    json: false,
+                    interactive: true,
+                    dry_run: false,
+                    command: Some(Commands::Status),
+                })
+                .await
+                .is_err());
 
-        run_inner(Cli {
-            json: false,
-            interactive: true,
-            dry_run: false,
-            command: None,
-        })
-        .await
-        .expect("test TUI wrapper should be inert");
+                run_inner(Cli {
+                    json: false,
+                    interactive: true,
+                    dry_run: false,
+                    command: None,
+                })
+                .await
+                .expect("test TUI wrapper should be inert");
 
-        run_inner(Cli {
-            json: false,
-            interactive: false,
-            dry_run: false,
-            command: Some(Commands::Config),
-        })
-        .await
-        .expect("human config should trigger auto-update notice guard");
+                run_inner(Cli {
+                    json: false,
+                    interactive: false,
+                    dry_run: false,
+                    command: Some(Commands::Config),
+                })
+                .await
+                .expect("human config should trigger auto-update notice guard");
 
-        assert!(run(Cli {
-            json: true,
-            interactive: true,
-            dry_run: false,
-            command: None,
-        })
-        .await
-        .is_err());
+                assert!(run(Cli {
+                    json: true,
+                    interactive: true,
+                    dry_run: false,
+                    command: None,
+                })
+                .await
+                .is_err());
 
-        run(Cli {
-            json: true,
-            interactive: false,
-            dry_run: false,
-            command: Some(Commands::Config),
-        })
-        .await
-        .expect("config command should run through traced entrypoint");
+                run(Cli {
+                    json: true,
+                    interactive: false,
+                    dry_run: false,
+                    command: Some(Commands::Config),
+                })
+                .await
+                .expect("config command should run through traced entrypoint");
+            },
+        )
+        .await;
     }
 
     #[test]
@@ -1049,7 +1066,13 @@ mod tests {
             .await
             .expect("test server should bind");
         let addr = listener.local_addr().expect("test server should have addr");
+        let base_url = format!("http://{addr}");
+        let ready = (!responses.is_empty())
+            .then(|| crate::test_env::register_mock_server(base_url.clone()));
         let handle = tokio::spawn(async move {
+            if let Some(ready) = ready {
+                let _ = ready.await;
+            }
             let mut requests = Vec::new();
             for body in responses {
                 let (mut stream, _) =
@@ -1077,7 +1100,7 @@ mod tests {
             requests
         });
 
-        (ApiClient::for_tests(&format!("http://{addr}")), handle)
+        (ApiClient::for_tests(&base_url), handle)
     }
 
     async fn server_with_base_url(
@@ -1097,8 +1120,11 @@ mod tests {
             .await
             .expect("test server should bind");
         let addr = listener.local_addr().expect("test server should have addr");
+        let base_url = format!("http://{addr}");
+        let ready = crate::test_env::register_mock_server(base_url.clone());
         let body = body.to_string();
         let handle = tokio::spawn(async move {
+            let _ = ready.await;
             let mut requests = Vec::new();
             let (mut stream, _) =
                 tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
@@ -1124,7 +1150,7 @@ mod tests {
             requests
         });
 
-        (format!("http://{addr}"), handle)
+        (base_url, handle)
     }
 
     async fn with_env_vars_async<T, Fut>(vars: &[(&str, &str)], f: impl FnOnce() -> Fut) -> T
@@ -1193,12 +1219,58 @@ mod tests {
     const TEST_KRAMLI_AUTO_HANDOFF_ENV: &str = "KRAMLI_AUTO_HANDOFF";
 
     #[test]
+    fn list_update_cannot_convert_note_and_task_types() {
+        let body = update_list_body(
+            Some("Renamed".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("metadata-only update should build");
+        assert!(!body.contains_key("list_type"));
+
+        // Clap no longer exposes --type on lists update (create-only).
+        let rejected = Cli::try_parse_from([
+            "kramli",
+            "lists",
+            "update",
+            "7",
+            "--type",
+            "note",
+        ]);
+        assert!(rejected.is_err());
+
+        let fields = safe_update_payload(
+            &json!({
+                "list_type": "note",
+                "note_content": "Old",
+                "note_delta": "[{\"insert\":\"Old\\n\"}]",
+                "note_version": 1
+            }),
+            "New",
+            {
+                let mut map = serde_json::Map::new();
+                map.insert(
+                    "list_type".to_string(),
+                    Value::String("tasks".to_string()),
+                );
+                map
+            },
+        )
+        .expect("plain note update should succeed");
+        assert!(
+            fields.get("list_type").is_none(),
+            "safe note updates must strip attempted type conversion"
+        );
+    }
+
+    #[test]
     fn list_update_and_batch_helpers_cover_branch_variants() {
         let body = update_list_body(
             Some("Groceries".to_string()),
             Some("cart".to_string()),
             Some("#ffffff".to_string()),
-            Some("notizzettel".to_string()),
             Some("# Notiz".to_string()),
             Some("Open:#336699,Done".to_string()),
         )
@@ -1212,16 +1284,13 @@ mod tests {
             body.get("color"),
             Some(&Value::String("#ffffff".to_string()))
         );
-        assert_eq!(
-            body.get("list_type"),
-            Some(&Value::String("note".to_string()))
-        );
+        assert!(!body.contains_key("list_type"));
         assert_eq!(
             body.get("note_content"),
             Some(&Value::String("# Notiz".to_string()))
         );
         assert!(body.get("states").is_some_and(Value::is_array));
-        assert!(update_list_body(None, None, None, None, None, None).is_err());
+        assert!(update_list_body(None, None, None, None, None).is_err());
 
         assert_eq!(
             normalize_list_type_arg(Some("Notizzettel".to_string())).as_deref(),
@@ -1250,6 +1319,56 @@ mod tests {
         ));
         assert_eq!(failed, 2);
         assert_eq!(first_error.as_deref(), Some("line 1: bad"));
+
+        let plain = json!({
+            "list_type": "note",
+            "note_content": "literal ** marker",
+            "note_delta": "[{\"insert\":\"literal ** marker\\n\"}]",
+            "note_version": 7
+        });
+        assert_eq!(validate_plain_note(&plain).unwrap().version, 7);
+        assert_eq!(
+            plain_note_delta("literal ** marker").unwrap(),
+            "[{\"insert\":\"literal ** marker\\n\"}]"
+        );
+        let empty = json!({
+            "list_type": "note",
+            "note_content": "",
+            "note_delta": "[{\"insert\":\"\\n\"}]",
+            "note_version": 8
+        });
+        assert!(validate_plain_note(&empty).is_ok());
+        assert_eq!(plain_note_delta("").unwrap(), "[{\"insert\":\"\\n\"}]");
+        let formatted = json!({
+            "note_content": "bold",
+            "note_delta": "[{\"insert\":\"bold\",\"attributes\":{\"bold\":true}}]",
+            "note_version": 8
+        });
+        assert!(validate_plain_note(&formatted).is_err());
+        let embedded = json!({
+            "note_content": "",
+            "note_delta": "[{\"insert\":{\"_type\":\"horizontal-rule\"}},{\"insert\":\"\\n\"}]",
+            "note_version": 9
+        });
+        assert!(validate_plain_note(&embedded).is_err());
+        let whitespace_ambiguous = json!({
+            "note_content": "Old",
+            "note_delta": "[{\"insert\":\"Old \\n\"}]",
+            "note_version": 10
+        });
+        assert!(validate_plain_note(&whitespace_ambiguous).is_err());
+        let duplicate_terminal_newline = json!({
+            "note_content": "Old\n",
+            "note_delta": "[{\"insert\":\"Old\\n\\n\"}]",
+            "note_version": 11
+        });
+        assert!(validate_plain_note(&duplicate_terminal_newline).is_err());
+
+        let mut first = serde_json::Map::new();
+        apply_safe_note_update(&mut first, &plain, "first").unwrap();
+        let mut second = serde_json::Map::new();
+        apply_safe_note_update(&mut second, &plain, "second").unwrap();
+        assert_ne!(first["client_mutation_id"], second["client_mutation_id"]);
     }
 
     #[tokio::test]
@@ -1258,7 +1377,6 @@ mod tests {
             list_response(7, "Created"),
             list_response(8, "Created JSON"),
             list_response(7, "Updated"),
-            list_response(7, "Updated JSON"),
             json!({"ok": true, "undo_token": "undo-1"}).to_string(),
             json!({"ok": true}).to_string(),
             list_response(7, "Moved"),
@@ -1305,28 +1423,12 @@ mod tests {
                 name: Some("Updated".to_string()),
                 icon: None,
                 color: None,
-                list_type: None,
                 note_content: None,
                 states: None,
             },
         )
         .await
         .expect("update human should succeed");
-        run_lists_update(
-            &api,
-            true,
-            UpdateListArgs {
-                id: 7,
-                name: None,
-                icon: Some("list".to_string()),
-                color: None,
-                list_type: Some("note".to_string()),
-                note_content: Some("Updated note".to_string()),
-                states: None,
-            },
-        )
-        .await
-        .expect("update json should succeed");
         run_lists_delete(&api, false, 7)
             .await
             .expect("delete human should succeed");
@@ -1347,16 +1449,14 @@ mod tests {
         assert_eq!(requests[0], "POST /api/lists HTTP/1.1");
         assert_eq!(requests[1], "POST /api/lists HTTP/1.1");
         assert_eq!(requests[2], "PUT /api/lists/7 HTTP/1.1");
-        assert_eq!(requests[3], "PUT /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[3], "DELETE /api/lists/7 HTTP/1.1");
         assert_eq!(requests[4], "DELETE /api/lists/7 HTTP/1.1");
-        assert_eq!(requests[5], "DELETE /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[5], "PUT /api/lists/7 HTTP/1.1");
         assert_eq!(requests[6], "PUT /api/lists/7 HTTP/1.1");
-        assert_eq!(requests[7], "PUT /api/lists/7 HTTP/1.1");
-        assert_eq!(requests[8], "PUT /api/lists/7 HTTP/1.1");
     }
 
-    #[test]
-    fn dry_run_list_create_contract_is_stable() {
+    #[tokio::test]
+    async fn dry_run_list_create_contract_is_stable() {
         let command = Commands::Lists {
             action: ListCmd::Create {
                 name: "Projektplan".to_string(),
@@ -1370,6 +1470,7 @@ mod tests {
         };
 
         let requests = dry_run_requests_for_command(&command)
+            .await
             .expect("dry-run preview should build")
             .expect("lists create should be dry-runnable");
         assert_eq!(requests.len(), 1);
@@ -1391,8 +1492,8 @@ mod tests {
         assert!(body.get("states").is_some_and(Value::is_array));
     }
 
-    #[test]
-    fn dry_run_item_update_contract_is_stable() {
+    #[tokio::test]
+    async fn dry_run_item_update_contract_is_stable() {
         let command = Commands::Items {
             action: Box::new(ItemCmd::Update {
                 id: 77,
@@ -1417,6 +1518,7 @@ mod tests {
         };
 
         let requests = dry_run_requests_for_command(&command)
+            .await
             .expect("dry-run preview should build")
             .expect("item update should be dry-runnable");
         assert_eq!(requests.len(), 1);
@@ -1427,6 +1529,102 @@ mod tests {
         assert_eq!(body.get("travel_time_minutes"), Some(&Value::from(15)));
         assert!(body.get("tags").is_some_and(Value::is_array));
         assert!(body.get("assigned_to").is_some_and(Value::is_array));
+    }
+
+    #[tokio::test]
+    async fn dry_run_note_update_uses_current_safe_delta_contract() {
+        let current = json!({
+            "id": 7,
+            "name": "Notes",
+            "list_type": "note",
+            "note_content": "Old",
+            "note_delta": "[{\"insert\":\"Old\\n\"}]",
+            "note_version": 4
+        });
+        let (base_url, requests) = server_with_base_url(vec![current.to_string()]).await;
+        let command = Commands::Lists {
+            action: ListCmd::Update {
+                id: 7,
+                name: None,
+                icon: None,
+                color: None,
+                note_content: Some("New".to_string()),
+                states: None,
+            },
+        };
+
+        let preview = with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                dry_run_requests_for_command(&command)
+                    .await
+                    .expect("dry-run preview should build")
+                    .expect("note update should be dry-runnable")
+            },
+        )
+        .await;
+
+        assert_eq!(preview.len(), 2);
+        assert_eq!(preview[0].method, "GET");
+        assert_eq!(preview[0].path, "/api/lists/7");
+        let body = preview[1].body.as_ref().expect("body should exist");
+        assert_eq!(body["note_delta"], "[{\"insert\":\"New\\n\"}]");
+        assert_eq!(body["base_delta"], "[{\"insert\":\"Old\\n\"}]");
+        assert_eq!(body["base_version"], 4);
+        assert!(body["client_mutation_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("cli-")));
+        assert_eq!(
+            requests.await.expect("test server should finish"),
+            vec!["GET /api/lists/7 HTTP/1.1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_cli_note_clear_sends_versioned_empty_delta() {
+        let current = json!({
+            "id": 7,
+            "name": "Notes",
+            "list_type": "note",
+            "note_content": "Old",
+            "note_delta": "[{\"insert\":\"Old\\n\"}]",
+            "note_version": 4
+        });
+        let (base_url, requests) = server_with_base_url(vec![current.to_string()]).await;
+        let command = Commands::Lists {
+            action: ListCmd::Update {
+                id: 7,
+                name: None,
+                icon: None,
+                color: None,
+                note_content: Some(String::new()),
+                states: None,
+            },
+        };
+
+        let preview = with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                dry_run_requests_for_command(&command)
+                    .await
+                    .expect("dry-run preview should build")
+                    .expect("note clear should be dry-runnable")
+            },
+        )
+        .await;
+
+        assert_eq!(preview.len(), 2);
+        assert_eq!(preview[0].method, "GET");
+        let body = preview[1].body.as_ref().expect("PUT body should exist");
+        assert_eq!(body["note_delta"], "[{\"insert\":\"\\n\"}]");
+        assert_eq!(body["base_version"], 4);
+        assert_eq!(requests.await.unwrap(), vec!["GET /api/lists/7 HTTP/1.1"]);
     }
 
     #[tokio::test]
@@ -1455,6 +1653,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invite_dry_run_requires_confirmation_and_reports_inspection_read() {
+        let link = "https://kram.li/i/InviteToken_1".to_string();
+        let rejected = dry_run_requests_for_command(&Commands::Invite {
+            action: InviteCmd::Accept {
+                link: link.clone(),
+                confirm: false,
+            },
+        })
+        .await;
+        assert!(rejected.is_err());
+
+        let requests = dry_run_requests_for_command(&Commands::Invite {
+            action: InviteCmd::Accept {
+                link,
+                confirm: true,
+            },
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/api/invite-links/InviteToken_1");
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].path, "/api/invite-links/InviteToken_1/accept");
+    }
+
+    #[tokio::test]
+    async fn explicit_invite_inspection_propagates_server_failures() {
+        let (base_url, requests) = server_with_status(410, r#"{"error":"expired"}"#).await;
+        let result = with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_invite(
+                    InviteCmd::Inspect {
+                        link: "https://kram.li/i/InviteToken_1".to_string(),
+                    },
+                    true,
+                )
+                .await
+            },
+        )
+        .await;
+        let error = result.expect_err("explicit inspection must not hide an expired invite");
+        assert!(error.contains("expired") || error.contains("410"));
+        assert_eq!(
+            requests.await.unwrap(),
+            vec!["GET /api/invite-links/InviteToken_1 HTTP/1.1"]
+        );
+    }
+
+    #[tokio::test]
     async fn item_command_helpers_cover_api_paths_and_outputs() {
         let responses = vec![
             json!([{"id": 1, "text": "Nice"}]).to_string(),
@@ -1465,6 +1718,7 @@ mod tests {
                 {"id": 6, "list_id": 7, "text": "Bread", "is_done": true, "created_at": "2026-01-01"}
             ])
             .to_string(),
+            list_response(7, "Groceries"),
             item_response(9, "Created"),
             item_response(9, "Updated"),
             json!({"id": 9, "list_id": 7, "text": "Done", "tags": ["fresh"]}).to_string(),
@@ -1608,16 +1862,17 @@ mod tests {
         assert_eq!(requests[1], "GET /api/lists HTTP/1.1");
         assert_eq!(requests[2], "GET /api/lists/7/items HTTP/1.1");
         assert_eq!(requests[3], "GET /api/lists/7/items HTTP/1.1");
-        assert_eq!(requests[4], "POST /api/lists/7/items HTTP/1.1");
-        assert_eq!(requests[5], "PUT /api/items/9 HTTP/1.1");
-        assert_eq!(requests[6], "PATCH /api/items/9/done HTTP/1.1");
-        assert_eq!(requests[7], "GET /api/lists/7/items HTTP/1.1");
-        assert_eq!(requests[8], "PATCH /api/items/9/upvote HTTP/1.1");
-        assert_eq!(requests[9], "DELETE /api/items/9 HTTP/1.1");
-        assert_eq!(requests[10], "GET /api/lists/7/items HTTP/1.1");
-        assert_eq!(requests[11], "POST /api/items/9/comments HTTP/1.1");
-        assert_eq!(requests[12], "POST /api/lists/7/check-all HTTP/1.1");
-        assert_eq!(requests[13], "POST /api/lists/7/clear-done HTTP/1.1");
+        assert_eq!(requests[4], "GET /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[5], "POST /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[6], "PUT /api/items/9 HTTP/1.1");
+        assert_eq!(requests[7], "PATCH /api/items/9/done HTTP/1.1");
+        assert_eq!(requests[8], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[9], "PATCH /api/items/9/upvote HTTP/1.1");
+        assert_eq!(requests[10], "DELETE /api/items/9 HTTP/1.1");
+        assert_eq!(requests[11], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[12], "POST /api/items/9/comments HTTP/1.1");
+        assert_eq!(requests[13], "POST /api/lists/7/check-all HTTP/1.1");
+        assert_eq!(requests[14], "POST /api/lists/7/clear-done HTTP/1.1");
     }
 
     #[tokio::test]
@@ -1626,6 +1881,7 @@ mod tests {
             json!([{"id": 1, "text": "Nice"}]).to_string(),
             json!([{"id": 7, "name": "Groceries"}]).to_string(),
             json!([{"id": 5, "text": "Milk", "is_done": false}]).to_string(),
+            list_response(7, "Groceries"),
             item_response(10, "Created Human"),
             item_response(11, "Updated Without Tags"),
             json!([{"id": 11, "list_id": 7, "text": "Updated Without Tags", "is_done": false, "tags": ["kept"]}]).to_string(),
@@ -1770,20 +2026,21 @@ mod tests {
         assert_eq!(requests[0], "GET /api/items/5/comments HTTP/1.1");
         assert_eq!(requests[1], "GET /api/lists HTTP/1.1");
         assert_eq!(requests[2], "GET /api/lists/7/items HTTP/1.1");
-        assert_eq!(requests[3], "POST /api/lists/7/items HTTP/1.1");
-        assert_eq!(requests[4], "PUT /api/items/11 HTTP/1.1");
-        assert_eq!(requests[5], "GET /api/lists/7/items HTTP/1.1");
-        assert_eq!(requests[6], "PATCH /api/items/12/done HTTP/1.1");
-        assert_eq!(requests[7], "PATCH /api/items/12/upvote HTTP/1.1");
-        assert_eq!(requests[8], "DELETE /api/items/12 HTTP/1.1");
-        assert_eq!(requests[9], "GET /api/lists/7 HTTP/1.1");
-        assert_eq!(requests[10], "GET /api/lists/7/items HTTP/1.1");
-        assert_eq!(requests[11], "POST /api/items/12/comments HTTP/1.1");
-        assert_eq!(requests[12], "POST /api/lists/7/check-all HTTP/1.1");
-        assert_eq!(requests[13], "POST /api/lists/7/clear-done HTTP/1.1");
-        assert_eq!(requests[14], "GET /api/lists/7/items HTTP/1.1");
-        assert_eq!(requests[15], "GET /api/lists/7 HTTP/1.1");
-        assert_eq!(requests[16], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[3], "GET /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[4], "POST /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[5], "PUT /api/items/11 HTTP/1.1");
+        assert_eq!(requests[6], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[7], "PATCH /api/items/12/done HTTP/1.1");
+        assert_eq!(requests[8], "PATCH /api/items/12/upvote HTTP/1.1");
+        assert_eq!(requests[9], "DELETE /api/items/12 HTTP/1.1");
+        assert_eq!(requests[10], "GET /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[11], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[12], "POST /api/items/12/comments HTTP/1.1");
+        assert_eq!(requests[13], "POST /api/lists/7/check-all HTTP/1.1");
+        assert_eq!(requests[14], "POST /api/lists/7/clear-done HTTP/1.1");
+        assert_eq!(requests[15], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[16], "GET /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[17], "GET /api/lists/7/items HTTP/1.1");
     }
 
     #[tokio::test]
@@ -1822,12 +2079,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_cli_blocks_item_creation_in_note_lists() {
+        let (api, requests) = api_with_responses(vec![
+            json!({"id": 7, "name": "Notes", "list_type": "note"}).to_string(),
+        ])
+        .await;
+
+        let result = run_items_add(
+            &api,
+            true,
+            ItemAddArgs {
+                list_id: 7,
+                text: "Not a note item".to_string(),
+                quantity: None,
+                due: None,
+                due_time: None,
+                planned: None,
+                planned_time: None,
+                reminder: None,
+                reminder_time: None,
+                reminder_days_before: None,
+                reminder_offsets: None,
+                travel_time_minutes: None,
+                priority: None,
+                tags: None,
+                notes: None,
+                parent: None,
+                assign: None,
+                color: None,
+                progress: None,
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err(tr("note-task-mutation-blocked")));
+        assert_eq!(requests.await.unwrap(), vec!["GET /api/lists/7 HTTP/1.1"]);
+    }
+
+    #[tokio::test]
     async fn run_items_dispatches_all_subcommands() {
         let responses = vec![
             json!([{"id": 1, "list_id": 7, "text": "Milk", "is_done": false}]).to_string(),
             json!([]).to_string(),
             json!([{"id": 7, "name": "Groceries"}]).to_string(),
             json!([{"id": 5, "list_id": 7, "text": "Shown", "is_done": false}]).to_string(),
+            list_response(7, "Groceries"),
             item_response(9, "Created"),
             item_response(9, "Updated"),
             json!({"id": 9, "text": "Done", "is_done": true}).to_string(),
@@ -1952,15 +2248,16 @@ mod tests {
         assert_eq!(requests[1], "GET /api/items/5/comments HTTP/1.1");
         assert_eq!(requests[2], "GET /api/lists HTTP/1.1");
         assert_eq!(requests[3], "GET /api/lists/7/items HTTP/1.1");
-        assert_eq!(requests[4], "POST /api/lists/7/items HTTP/1.1");
-        assert_eq!(requests[5], "PUT /api/items/9 HTTP/1.1");
-        assert_eq!(requests[6], "PATCH /api/items/9/done HTTP/1.1");
-        assert_eq!(requests[7], "PATCH /api/items/9/upvote HTTP/1.1");
-        assert_eq!(requests[8], "DELETE /api/items/9 HTTP/1.1");
-        assert_eq!(requests[9], "GET /api/lists/7/items HTTP/1.1");
-        assert_eq!(requests[10], "POST /api/items/9/comments HTTP/1.1");
-        assert_eq!(requests[11], "POST /api/lists/7/check-all HTTP/1.1");
-        assert_eq!(requests[12], "POST /api/lists/7/clear-done HTTP/1.1");
+        assert_eq!(requests[4], "GET /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[5], "POST /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[6], "PUT /api/items/9 HTTP/1.1");
+        assert_eq!(requests[7], "PATCH /api/items/9/done HTTP/1.1");
+        assert_eq!(requests[8], "PATCH /api/items/9/upvote HTTP/1.1");
+        assert_eq!(requests[9], "DELETE /api/items/9 HTTP/1.1");
+        assert_eq!(requests[10], "GET /api/lists/7/items HTTP/1.1");
+        assert_eq!(requests[11], "POST /api/items/9/comments HTTP/1.1");
+        assert_eq!(requests[12], "POST /api/lists/7/check-all HTTP/1.1");
+        assert_eq!(requests[13], "POST /api/lists/7/clear-done HTTP/1.1");
     }
 
     #[tokio::test]
@@ -2554,6 +2851,7 @@ mod tests {
 
     #[tokio::test]
     async fn env_var_helper_restores_existing_values() {
+        let original = std::env::var(TEST_KRAMLI_API_KEY_ENV).ok();
         with_env_vars_async(&[(TEST_KRAMLI_API_KEY_ENV, "before")], || async {
             with_env_vars_async_unlocked(&[(TEST_KRAMLI_API_KEY_ENV, "during")], || async {
                 assert_eq!(
@@ -2570,7 +2868,7 @@ mod tests {
         })
         .await;
 
-        assert!(std::env::var(TEST_KRAMLI_API_KEY_ENV).is_err());
+        assert_eq!(std::env::var(TEST_KRAMLI_API_KEY_ENV).ok(), original);
     }
 
     #[tokio::test]
@@ -2606,7 +2904,6 @@ mod tests {
                         name: Some("Updated".to_string()),
                         icon: None,
                         color: None,
-                        list_type: Some("tasks".to_string()),
                         note_content: None,
                         states: None,
                     },
@@ -2674,7 +2971,12 @@ mod tests {
         assert!(run_batch_json(&parse_break, false).await.is_err());
 
         let child_failure = temp_batch_file("json-batch-child", "status\n");
-        assert!(run_batch_json(&child_failure, false).await.is_err());
+        // Clear a sibling test's custom batch executable so `status` cannot
+        // succeed via a stub script under parallel execution.
+        with_env_vars_async(&[(KRAMLI_BATCH_EXECUTABLE_ENV, "")], || async {
+            assert!(run_batch_json(&child_failure, false).await.is_err());
+        })
+        .await;
 
         let empty = temp_batch_file("json-batch-empty", "# comment\n\n");
         run_batch_json(&empty, false)
@@ -2978,7 +3280,13 @@ mod tests {
 
     #[tokio::test]
     async fn run_login_wrapper_is_reachable_under_cfg_test() {
-        assert!(run_login(None).await.is_err());
+        with_env_vars_async(
+            &[("KRAMLI_URL", ""), (TEST_KRAMLI_API_KEY_ENV, "")],
+            || async {
+                assert!(run_login(None).await.is_err());
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3137,7 +3445,10 @@ mod tests {
             .await
             .expect("test server should bind");
         let addr = listener.local_addr().expect("test server should have addr");
+        let base_url = format!("http://{addr}");
+        let ready = crate::test_env::register_mock_server(base_url.clone());
         let handle = tokio::spawn(async move {
+            let _ = ready.await;
             let (mut stream, _) =
                 tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
                     .await
@@ -3158,10 +3469,7 @@ mod tests {
         });
 
         with_env_vars_async(
-            &[(
-                KRAMLI_UPDATE_CHECK_URL_ENV,
-                &format!("http://{addr}/latest"),
-            )],
+            &[(KRAMLI_UPDATE_CHECK_URL_ENV, &format!("{base_url}/latest"))],
             || async {
                 assert!(fetch_latest_release().await.is_err());
             },
@@ -3216,25 +3524,17 @@ mod tests {
             json!([{"id": 9, "list_id": 7, "text": "Milk", "is_done": false, "tags": ["fresh"]}])
                 .to_string(),
         ];
-        let (base_url, requests) = server_with_base_url(responses).await;
+        let (api, requests) = api_with_responses(responses).await;
 
-        with_env_vars_async(
-            &[
-                ("KRAMLI_URL", base_url.as_str()),
-                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
-                (TEST_KRAMLI_AUTO_HANDOFF_ENV, "1"),
-            ],
-            || async {
-                run_lists(ListCmd::Show { id: 7 }, false)
-                    .await
-                    .expect("list show should render human output and auto-handoff");
+        with_env_vars_async(&[(TEST_KRAMLI_AUTO_HANDOFF_ENV, "1")], || async {
+            run_lists_show(&api, 7, false)
+                .await
+                .expect("list show should render human output and auto-handoff");
 
-                let api = get_api().expect("api should be available from env");
-                let mut done_response = json!({"list_id": 7});
-                enrich_done_response_tags(&api, 9, &mut done_response).await;
-                assert_eq!(done_response["tags"], json!(["fresh"]));
-            },
-        )
+            let mut done_response = json!({"list_id": 7});
+            enrich_done_response_tags(&api, 9, &mut done_response).await;
+            assert_eq!(done_response["tags"], json!(["fresh"]));
+        })
         .await;
 
         let requests = requests.await.expect("test server should finish");
@@ -3248,6 +3548,205 @@ mod tests {
         let bad = temp_batch_file("batch-parse-error", "items add \"unterminated\n");
         assert!(run_batch(&bad, false, false).await.is_err());
         assert!(run_batch_json(&bad, false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn human_item_list_resolves_displayed_links_with_get_only_requests() {
+        let responses = vec![
+            json!({"id": 7, "name": "Tasks", "list_type": "tasks"}).to_string(),
+            json!([
+                {
+                    "id": 1,
+                    "list_id": 7,
+                    "text": "Open https://kramli.de/lists/42",
+                    "is_done": false
+                },
+                {
+                    "id": 2,
+                    "list_id": 7,
+                    "text": "Invite https://kram.li/i/InviteToken_1",
+                    "is_done": false
+                }
+            ])
+            .to_string(),
+            json!({"resolved": true, "list_name": "Linked"}).to_string(),
+            json!({
+                "list_id": 42,
+                "list_name": "Shared",
+                "already_member": false,
+                "invite_url": "https://kram.li/i/InviteToken_1"
+            })
+            .to_string(),
+        ];
+        let (base_url, requests) = server_with_base_url(responses).await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+                (TEST_KRAMLI_AUTO_HANDOFF_ENV, "0"),
+            ],
+            || async {
+                run_items(
+                    ItemCmd::List {
+                        list_id: 7,
+                        open: false,
+                        completed: false,
+                        state: None,
+                        contains: None,
+                        newest: false,
+                        oldest: false,
+                        limit: None,
+                    },
+                    false,
+                )
+                .await
+                .unwrap();
+            },
+        )
+        .await;
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests.iter().all(|request| request.starts_with("GET ")));
+        assert!(requests[2].starts_with("GET /api/internal-links/preview?"));
+        assert_eq!(requests[3], "GET /api/invite-links/InviteToken_1 HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn json_item_list_does_not_resolve_or_change_payload_requests() {
+        let responses = vec![json!([{
+            "id": 1,
+            "list_id": 7,
+            "text": "https://kramli.de/lists/42",
+            "is_done": false
+        }])
+        .to_string()];
+        let (base_url, requests) = server_with_base_url(responses).await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+                (TEST_KRAMLI_AUTO_HANDOFF_ENV, "0"),
+            ],
+            || async {
+                run_items(
+                    ItemCmd::List {
+                        list_id: 7,
+                        open: false,
+                        completed: false,
+                        state: None,
+                        contains: None,
+                        newest: false,
+                        oldest: false,
+                        limit: None,
+                    },
+                    true,
+                )
+                .await
+                .unwrap();
+            },
+        )
+        .await;
+        assert_eq!(
+            requests.await.unwrap(),
+            vec!["GET /api/lists/7/items HTTP/1.1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn human_preview_surfaces_resolve_only_rendered_user_text() {
+        let linked = "https://kramli.de/lists/42";
+        let list_payload = |id: i64, name: &str| {
+            json!({
+                "id": id,
+                "name": name,
+                "list_type": "note",
+                "note_content": format!("Note {linked}")
+            })
+            .to_string()
+        };
+        let preview = || json!({"resolved": true, "list_name": "Linked"}).to_string();
+        let responses = vec![
+            list_payload(7, "Shown"),
+            preview(),
+            list_payload(8, "Created"),
+            list_payload(7, "Updated"),
+            json!([{"id": 1, "text": format!("Comment {linked}")}]).to_string(),
+            json!([{"id": 7, "name": "Tasks", "list_type": "tasks"}]).to_string(),
+            json!([{
+                "id": 5,
+                "list_id": 7,
+                "text": format!("Item {linked}"),
+                "notes": format!("Notes {linked}"),
+                "tldr": format!("TLDR {linked}"),
+                "attachments": [{
+                    "id": 9,
+                    "context": format!("Context {linked}"),
+                    "alt_text": format!("Alt {linked}")
+                }]
+            }])
+            .to_string(),
+            preview(),
+            json!({"items": [{"id": 5, "text": format!("Search {linked}")}]}).to_string(),
+            preview(),
+            json!([{"id": 3, "detail": {"text": format!("Activity {linked}")}}]).to_string(),
+            preview(),
+        ];
+        let (base_url, requests) = server_with_base_url(responses).await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+                (TEST_KRAMLI_AUTO_HANDOFF_ENV, "0"),
+            ],
+            || async {
+                run_lists(ListCmd::Show { id: 7 }, false).await.unwrap();
+                let api = get_api().unwrap();
+                run_lists_create(
+                    &api,
+                    false,
+                    CreateListArgs {
+                        name: "Created".to_string(),
+                        icon: None,
+                        color: None,
+                        folder: None,
+                        list_type: Some("note".to_string()),
+                        note_content: Some(format!("Note {linked}")),
+                        states: None,
+                    },
+                )
+                .await
+                .unwrap();
+                run_lists_update(
+                    &api,
+                    false,
+                    UpdateListArgs {
+                        id: 7,
+                        name: Some("Updated".to_string()),
+                        icon: None,
+                        color: None,
+                        note_content: None,
+                        states: None,
+                    },
+                )
+                .await
+                .unwrap();
+                run_items_show(&api, false, 5).await.unwrap();
+                run_search("link", false).await.unwrap();
+                run_activity(7, 20, false).await.unwrap();
+            },
+        )
+        .await;
+        let requests = requests.await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("GET /api/internal-links/preview?"))
+                .count(),
+            4
+        );
+        assert!(requests
+            .iter()
+            .all(|request| !request.starts_with("POST /api/invite-links/")));
     }
 }
 
@@ -3551,6 +4050,20 @@ pub(crate) enum HandoffCmd {
     Clear,
 }
 
+#[derive(Subcommand)]
+/// Invite-link subcommands.
+pub(crate) enum InviteCmd {
+    /// Inspect an invite without accepting it
+    Inspect { link: String },
+    /// Accept an invite after explicit confirmation
+    Accept {
+        link: String,
+        /// Confirm acceptance in non-interactive use
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
 // ─── Dispatch ───
 
 /// Execute a parsed CLI invocation.
@@ -3643,6 +4156,7 @@ fn command_trace_name(command: &Commands) -> &'static str {
         Commands::Keys { .. } => "keys",
         Commands::Search { .. } => "search",
         Commands::Activity { .. } => "activity",
+        Commands::Invite { .. } => "invite",
         Commands::Undo { .. } => "undo",
         Commands::Redo { .. } => "redo",
         Commands::Profile => "profile",
@@ -3690,7 +4204,7 @@ async fn run_command_with_context(
     context: CommandContext,
 ) -> Result<(), String> {
     if context.dry_run {
-        if let Some(requests) = dry_run_requests_for_command(&command)? {
+        if let Some(requests) = dry_run_requests_for_command(&command).await? {
             print_dry_run_preview(command_trace_name(&command), &requests, context.as_json);
             return Ok(());
         }
@@ -3708,6 +4222,7 @@ async fn run_command_with_context(
         Commands::Keys { action } => run_keys(action, as_json).await,
         Commands::Search { query } => run_search(&query, as_json).await,
         Commands::Activity { list_id, limit } => run_activity(list_id, limit, as_json).await,
+        Commands::Invite { action } => run_invite(action, as_json).await,
         Commands::Undo { list_id } => run_undo(list_id).await,
         Commands::Redo { list_id } => run_redo(list_id).await,
         Commands::Profile => run_profile(as_json).await,
@@ -3762,9 +4277,11 @@ fn dry_run_request(method: &str, path: impl Into<String>, body: Option<Value>) -
     }
 }
 
-fn dry_run_requests_for_command(command: &Commands) -> Result<Option<Vec<DryRunRequest>>, String> {
+async fn dry_run_requests_for_command(
+    command: &Commands,
+) -> Result<Option<Vec<DryRunRequest>>, String> {
     match command {
-        Commands::Lists { action } => dry_run_requests_for_list_cmd(action),
+        Commands::Lists { action } => dry_run_requests_for_list_cmd(action).await,
         Commands::Items { action } => dry_run_requests_for_item_cmd(action),
         Commands::Folders { action } => dry_run_requests_for_folder_cmd(action),
         Commands::Members { action } => Ok(dry_run_requests_for_member_cmd(action)),
@@ -3798,6 +4315,22 @@ fn dry_run_requests_for_command(command: &Commands) -> Result<Option<Vec<DryRunR
             )]))
         }
         Commands::Handoff { action } => Ok(dry_run_requests_for_handoff_cmd(action)),
+        Commands::Invite {
+            action: InviteCmd::Accept { link, confirm },
+        } => {
+            if !confirm {
+                return Err(tr("cli-invite-confirmation-required"));
+            }
+            let token = invite_token(link)?;
+            Ok(Some(vec![
+                dry_run_request("GET", format!("/api/invite-links/{token}"), None),
+                dry_run_request(
+                    "POST",
+                    format!("/api/invite-links/{token}/accept"),
+                    Some(empty_json_object()),
+                ),
+            ]))
+        }
         Commands::Privacy {
             action: PrivacyCmd::Reset,
         } => Ok(Some(vec![dry_run_request(
@@ -3814,7 +4347,9 @@ fn dry_run_requests_for_command(command: &Commands) -> Result<Option<Vec<DryRunR
     }
 }
 
-fn dry_run_requests_for_list_cmd(cmd: &ListCmd) -> Result<Option<Vec<DryRunRequest>>, String> {
+async fn dry_run_requests_for_list_cmd(
+    cmd: &ListCmd,
+) -> Result<Option<Vec<DryRunRequest>>, String> {
     match cmd {
         ListCmd::Create {
             name,
@@ -3845,22 +4380,30 @@ fn dry_run_requests_for_list_cmd(cmd: &ListCmd) -> Result<Option<Vec<DryRunReque
             name,
             icon,
             color,
-            list_type,
             note_content,
             states,
         } => {
-            let body = Value::Object(update_list_body(
+            let mut body = update_list_body(
                 name.clone(),
                 icon.clone(),
                 color.clone(),
-                list_type.clone(),
                 note_content.clone(),
                 states.clone(),
-            )?);
+            )?;
+            body.remove("note_content");
+            if let Some(note_content) = note_content {
+                let api = get_api()?;
+                let current: Value = api.get(&format!("/lists/{id}")).await?;
+                apply_safe_note_update(&mut body, &current, note_content)?;
+                return Ok(Some(vec![
+                    dry_run_request("GET", format!("/api/lists/{id}"), None),
+                    dry_run_request("PUT", format!("/api/lists/{id}"), Some(Value::Object(body))),
+                ]));
+            }
             Ok(Some(vec![dry_run_request(
                 "PUT",
                 format!("/api/lists/{id}"),
-                Some(body),
+                Some(Value::Object(body)),
             )]))
         }
         ListCmd::Delete { id } => Ok(Some(vec![dry_run_request(
@@ -4553,24 +5096,6 @@ fn parse_states_arg(raw: &str) -> Result<Value, String> {
     Ok(Value::Array(states))
 }
 
-fn normalize_list_type_arg(list_type: Option<String>) -> Option<String> {
-    let normalized = list_type?.trim().to_ascii_lowercase().trim().to_string();
-    if normalized.is_empty() {
-        return None;
-    }
-
-    let canonical = match normalized.as_str() {
-        "task" | "tasks" | "todo" | "todos" | "list" | "items" => "tasks",
-        "note" | "notes" | "markdown" | "notizzettel" => "note",
-        _ => normalized.as_str(),
-    };
-    Some(canonical.to_string())
-}
-
-fn is_note_list_type(list_type: Option<&str>) -> bool {
-    normalize_list_type_arg(list_type.map(str::to_string)).as_deref() == Some("note")
-}
-
 fn list_note_content(payload: &Value) -> Option<&str> {
     payload
         .get("note_content")
@@ -4960,7 +5485,6 @@ fn update_list_body(
     name: Option<String>,
     icon: Option<String>,
     color: Option<String>,
-    list_type: Option<String>,
     note_content: Option<String>,
     states: Option<String>,
 ) -> Result<serde_json::Map<String, Value>, String> {
@@ -4968,9 +5492,6 @@ fn update_list_body(
     insert_string(&mut body, "name", name);
     insert_string(&mut body, "icon", icon);
     insert_string(&mut body, "color", color);
-    if let Some(list_type) = normalize_list_type_arg(list_type) {
-        body.insert("list_type".into(), Value::String(list_type));
-    }
     insert_string(&mut body, "note_content", note_content);
     if let Some(states_raw) = states {
         body.insert("states".into(), parse_states_arg(&states_raw)?);
@@ -4979,6 +5500,16 @@ fn update_list_body(
         return Err(tr("cli-no-changes"));
     }
     Ok(body)
+}
+
+fn apply_safe_note_update(
+    body: &mut serde_json::Map<String, Value>,
+    current: &Value,
+    note_content: &str,
+) -> Result<(), String> {
+    let payload = safe_update_payload(current, note_content, std::mem::take(body))?;
+    *body = payload.as_object().cloned().unwrap_or_default();
+    Ok(())
 }
 
 // ─── Items ───
@@ -5162,6 +5693,14 @@ async fn run_items_list(api: &ApiClient, as_json: bool, args: ItemListArgs) -> R
             list_model.as_ref(),
             list.as_ref().and_then(list_note_content),
         );
+        let mut texts = Vec::new();
+        if let Some(name) = list_model.as_ref().map(|list| list.name.as_str()) {
+            texts.push(name);
+        }
+        if let Some(content) = list.as_ref().and_then(list_note_content) {
+            texts.push(content);
+        }
+        print_link_previews_for_texts(api, texts).await;
         maybe_auto_handoff(
             api,
             list_id,
@@ -5206,6 +5745,13 @@ async fn run_items_list(api: &ApiClient, as_json: bool, args: ItemListArgs) -> R
         filtered,
         output::print_items_for_list(list_model.as_ref(), &filtered)
     );
+    if !as_json {
+        let mut texts: Vec<&str> = filtered.iter().map(|item| item.text.as_str()).collect();
+        if let Some(name) = list_model.as_ref().map(|list| list.name.as_str()) {
+            texts.insert(0, name);
+        }
+        print_link_previews_for_texts(api, texts).await;
+    }
     maybe_auto_handoff(
         api,
         list_id,
@@ -5264,6 +5810,29 @@ async fn run_items_show(api: &ApiClient, as_json: bool, id: i64) -> Result<(), S
         println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
     } else {
         output::print_item_detail(&item, &comments);
+        let mut texts = vec![item.text.as_str()];
+        if let Some(notes) = item.notes.as_deref() {
+            texts.push(notes);
+        }
+        if let Some(tldr) = item.tldr.as_deref() {
+            texts.push(tldr);
+        }
+        if let Some(attachments) = item.attachments.as_ref() {
+            for attachment in attachments {
+                if let Some(context) = attachment.context.as_deref() {
+                    texts.push(context);
+                }
+                if let Some(alt_text) = attachment.alt_text.as_deref() {
+                    texts.push(alt_text);
+                }
+            }
+        }
+        for comment in &comments {
+            if let Some(text) = comment.text.as_deref() {
+                texts.push(text);
+            }
+        }
+        print_link_previews_for_texts(api, texts).await;
     }
     if let Some(list_id) = item.list_id {
         maybe_auto_handoff(api, list_id, None, as_json).await;
@@ -5295,6 +5864,8 @@ struct ItemAddArgs {
 
 async fn run_items_add(api: &ApiClient, as_json: bool, args: ItemAddArgs) -> Result<(), String> {
     let list_id = args.list_id;
+    let list: Value = api.get(&format!("/lists/{list_id}")).await?;
+    ensure_task_list(&list)?;
     let val = build_item_add_payload(args)?;
     let item: ListItem = api.post(&format!("/lists/{list_id}/items"), &val).await?;
     if as_json {
@@ -5589,6 +6160,11 @@ async fn run_items_done_list(api: &ApiClient, as_json: bool, list_id: i64) -> Re
         println!("{}", tr("cli-no-completed-items").dimmed());
     } else {
         output::print_items_for_list(list.as_ref(), &done);
+        let mut texts: Vec<&str> = done.iter().map(|item| item.text.as_str()).collect();
+        if let Some(name) = list.as_ref().map(|list| list.name.as_str()) {
+            texts.insert(0, name);
+        }
+        print_link_previews_for_texts(api, texts).await;
     }
     maybe_auto_handoff(
         api,
@@ -6012,6 +6588,20 @@ async fn run_search(query: &str, as_json: bool) -> Result<(), String> {
         }
     } else {
         output::print_search(&grouped);
+        let texts = grouped
+            .lists
+            .iter()
+            .flatten()
+            .map(|list| list.name.as_str())
+            .chain(
+                grouped
+                    .items
+                    .iter()
+                    .flatten()
+                    .map(|item| item.text.as_str()),
+            )
+            .collect::<Vec<_>>();
+        print_link_previews_for_texts(&api, texts).await;
     }
     Ok(())
 }
@@ -6023,7 +6613,101 @@ async fn run_activity(list_id: i64, limit: u32, as_json: bool) -> Result<(), Str
         .get_query(&format!("/lists/{list_id}/activity"), &[("limit", &lim)])
         .await?;
     json_or!(as_json, e, output::print_activity(&e));
+    if !as_json {
+        let details = e
+            .iter()
+            .map(|entry| output::activity_detail_text(entry.detail.as_ref()))
+            .collect::<Vec<_>>();
+        print_link_previews_for_texts(&api, details.iter().map(String::as_str)).await;
+    }
     maybe_auto_handoff(&api, list_id, None, as_json).await;
+    Ok(())
+}
+
+async fn print_link_previews_for_texts<'a>(
+    api: &ApiClient,
+    texts: impl IntoIterator<Item = &'a str>,
+) {
+    let mut resolver = LinkPreviewResolver::new(api.clone());
+    let previews = resolver.resolve_texts(texts).await;
+    output::print_link_previews(&previews);
+}
+
+fn invite_token(link: &str) -> Result<String, String> {
+    parse_internal_kramli_url(link)
+        .filter(|parsed| matches!(parsed.kind, crate::internal_links::InternalLinkKind::Invite))
+        .and_then(|parsed| parsed.token)
+        .ok_or_else(|| tr("cli-invite-link-invalid"))
+}
+
+#[cfg(not(test))]
+fn confirm_invite_acceptance() -> Result<bool, String> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(false);
+    }
+    dialoguer::Confirm::new()
+        .with_prompt(tr("cli-invite-accept-confirm"))
+        .default(false)
+        .interact()
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+fn confirm_invite_acceptance() -> Result<bool, String> {
+    Ok(false)
+}
+
+async fn run_invite(action: InviteCmd, as_json: bool) -> Result<(), String> {
+    let api = get_api()?;
+    let (link, accept, confirmed) = match action {
+        InviteCmd::Inspect { link } => (link, false, false),
+        InviteCmd::Accept { link, confirm } => (link, true, confirm),
+    };
+    let token = invite_token(&link)?;
+    let mut resolver = LinkPreviewResolver::new(api.clone());
+    let preview = resolver
+        .resolve_url_strict(&link)
+        .await?
+        .ok_or_else(|| tr("cli-invite-link-invalid"))?;
+
+    let already_member = preview
+        .action
+        .as_ref()
+        .is_some_and(|action| matches!(action.kind, LinkPreviewActionKind::Open));
+    let can_accept = preview.resolved
+        && preview
+            .action
+            .as_ref()
+            .is_some_and(|action| matches!(action.kind, LinkPreviewActionKind::Accept));
+    if !accept || already_member {
+        if as_json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&preview).unwrap_or_default()
+            );
+        } else {
+            output::print_link_previews(&[preview]);
+        }
+        return Ok(());
+    }
+    if !can_accept {
+        return Err(tr("link-preview-unresolved"));
+    }
+
+    if !confirmed && !confirm_invite_acceptance()? {
+        return Err(tr("cli-invite-confirmation-required"));
+    }
+    let result: Value = api.accept_invite_link(&token).await?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
+    } else {
+        println!("{} {}", "✓".green(), tr("cli-invite-accepted"));
+    }
     Ok(())
 }
 

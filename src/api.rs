@@ -69,6 +69,10 @@ impl ApiClient {
 
     /// Build an API client from persisted configuration and keychain credentials.
     pub(crate) fn new(config: &Config) -> Result<Self, String> {
+        #[cfg(test)]
+        if !crate::test_env::env_access_allowed() {
+            return Err("test environment belongs to another test".to_string());
+        }
         let api_key = config.require_api_key()?;
         let base_url = config.base_url().trim_end_matches('/').to_string();
         Self::ensure_secure_base_url(&base_url)?;
@@ -217,18 +221,24 @@ impl ApiClient {
     }
 
     fn url(&self, path: &str) -> String {
-        format!("{}/api{}", self.base_url, path)
+        let url = format!("{}/api{}", self.base_url, path);
+        #[cfg(test)]
+        crate::test_env::notify_mock_server_ready(&url);
+        url
     }
 
     fn resource_url(&self, path_or_url: &str) -> String {
         let value = path_or_url.trim();
-        if value.starts_with("http://") || value.starts_with("https://") {
-            return value.to_string();
-        }
-        if value.starts_with('/') {
-            return format!("{}{}", self.base_url, value);
-        }
-        format!("{}/{}", self.base_url, value)
+        let url = if value.starts_with("http://") || value.starts_with("https://") {
+            value.to_string()
+        } else if value.starts_with('/') {
+            format!("{}{}", self.base_url, value)
+        } else {
+            format!("{}/{}", self.base_url, value)
+        };
+        #[cfg(test)]
+        crate::test_env::notify_mock_server_ready(&url);
+        url
     }
 
     fn is_same_origin(&self, url: &str) -> bool {
@@ -558,6 +568,35 @@ impl ApiClient {
         span.set_status(result.is_ok());
         span.finish();
         result
+    }
+
+    /// Fetch metadata for a validated internal Kramli URL.
+    pub(crate) async fn get_internal_link_preview<T: DeserializeOwned>(
+        &self,
+        url: &str,
+    ) -> Result<T, String> {
+        self.get_query("/internal-links/preview", &[("url", url)])
+            .await
+    }
+
+    /// Fetch invite metadata without accepting the invite.
+    pub(crate) async fn get_invite_link<T: DeserializeOwned>(
+        &self,
+        token: &str,
+    ) -> Result<T, String> {
+        self.get(&format!("/invite-links/{token}")).await
+    }
+
+    /// Accept an invite after the caller has obtained explicit confirmation.
+    pub(crate) async fn accept_invite_link<T: DeserializeOwned>(
+        &self,
+        token: &str,
+    ) -> Result<T, String> {
+        self.post(
+            &format!("/invite-links/{token}/accept"),
+            &Value::Object(serde_json::Map::new()),
+        )
+        .await
     }
 
     /// Send an authenticated POST request with a JSON body.
@@ -910,7 +949,13 @@ mod tests {
             .await
             .expect("bind test server");
         let addr = listener.local_addr().expect("test server address");
+        let base_url = format!("http://{addr}");
+        let ready = (!responses.is_empty())
+            .then(|| crate::test_env::register_mock_server(base_url.clone()));
         let handle = tokio::spawn(async move {
+            if let Some(ready) = ready {
+                let _ = ready.await;
+            }
             let mut requests = Vec::new();
             for response in responses {
                 let (mut stream, _) =
@@ -942,7 +987,7 @@ mod tests {
             }
             requests
         });
-        (test_client(&format!("http://{addr}")), handle)
+        (test_client(&base_url), handle)
     }
 
     #[test]

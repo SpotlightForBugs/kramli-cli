@@ -67,6 +67,7 @@ kramli items add <LIST_ID> "Milk" --priority high
 kramli items attach <ITEM_ID> photo.jpg receipt.png --sensitive
 kramli lists create "Notizzettel" --type note --note-content "# Ideen\n- [ ] Termin"
 kramli lists update <LIST_ID> --note-content "# Notiz\nAktualisiert"
+kramli lists update <LIST_ID> --note-content ""
 kramli search "dark mode"
 ```
 
@@ -104,6 +105,8 @@ Notes:
 - Viewing a list sends the cross-device handoff automatically. Manual handoff is also available with `kramli handoff`.
 - Image protocol detection runs automatically; no user setup is required.
 - Press `P` or choose `Attach` in the footer to upload an image to the selected item. Enter a local path in the attachment editor; the item list reloads after a successful upload.
+- Select a plain-text note and press `e` or `Enter` to edit it. `Enter` adds a line and `Ctrl+S` saves. If saving fails, the editor keeps the unsaved text.
+- Notes with formatting or embedded content remain visible but read-only in the TUI. Edit those notes in the web or mobile app.
 - Force a specific inline image protocol with `KRAMLI_TUI_IMAGE_PROTOCOL`:
   - `imgcat` / `iterm2`
   - `kitty`
@@ -170,6 +173,27 @@ Boolean env vars accept `1`, `true`, `on`, or `yes` to enable and `0`, `false`, 
 `items attach` accepts PNG, JPG, JPEG, GIF, WebP, HEIC, and HEIF files. Every path is checked as a non-empty regular file before any network request. Use `--json` for an array of returned attachment metadata. The `upload` alias is also available.
 
 The MCP tool `upload_item_attachment` is disabled by default. Enable it explicitly with `KRAMLI_MCP_ALLOW_FILE_UPLOADS=1`. Upload paths must be inside the MCP process startup directory or a configured root listed in `KRAMLI_MCP_FILE_ROOTS` (colon-separated on Unix). The MCP response contains the same attachment metadata as the CLI and never returns the local path.
+
+## Note lists
+
+`lists create --type note --note-content <TEXT>` creates a note. `lists show` returns or prints its content. `lists update --note-content <TEXT>` replaces a plain note, and an empty value clears it. A list's type is fixed when the list is created.
+
+Before updating a note, the CLI reads its current Delta and version. It sends a versioned update only when the Delta contains plain text that can be preserved exactly. Notes with formatting, embeds, malformed operations, or ambiguous trailing whitespace are rejected instead of flattened.
+
+MCP clients can use `create_list` and `update_list`. `create_list` accepts `list_type: "note"` and `note_content`. `update_list` omits `list_type` because list types are immutable. Note updates perform the same GET plus versioned PUT used by the raw CLI and TUI.
+
+## Invite links
+
+Inspect an invite before accepting it:
+
+```bash
+kramli invite inspect https://kram.li/i/<TOKEN>
+kramli invite accept https://kram.li/i/<TOKEN> --confirm
+```
+
+Inspection performs a read only. Acceptance proceeds only when inspection resolves to an explicit `accept` action; an unresolved or invalid invite is never posted.
+
+MCP clients must call `inspect_invite` first. Call `accept_invite` only when the inspection result is resolved and its action is `accept`, passing the same token with `confirmed: true`. Confirmation is mandatory and the token must come from the inspected invite; `accept_invite` rechecks the invite before sending the mutation.
 
 ## License
 

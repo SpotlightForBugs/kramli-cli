@@ -1,5 +1,6 @@
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::api::ApiClient;
@@ -9,10 +10,13 @@ use crate::attachments::{
 };
 use crate::config::Config;
 use crate::i18n::{tr, tr_args};
+use crate::internal_links::{LinkPreview, LinkPreviewActionKind, LinkPreviewResolver};
 use crate::models::{ListItem, ShoppingList};
+use crate::note::{ensure_task_list, normalize_list_type, safe_update_payload};
 use crate::telemetry;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
+const OPTIONAL_PREVIEW_BUDGET: Duration = Duration::from_millis(1_500);
 
 fn empty_json_object() -> Value {
     Value::Object(Map::new())
@@ -118,21 +122,54 @@ async fn handle_tool_call(params: &Value) -> Result<Value, String> {
 
     let result = match name {
         "list_lists" => list_lists(&api).await,
+        "create_list" => create_list(&api, &args).await,
+        "update_list" => update_list(&api, &args).await,
         "list_items" => list_items(&api, &args).await,
         "create_item" => create_item(&api, &args).await,
         "update_item" => update_item(&api, &args).await,
         "toggle_item_done" => toggle_item_done(&api, &args).await,
         "delete_item" => delete_item(&api, &args).await,
         "upload_item_attachment" => upload_item_attachment_tool(&api, &args).await,
+        "get_list" => get_list(&api, &args).await,
+        "get_item" => get_item(&api, &args).await,
+        "search" => search(&api, &args).await,
+        "activity" => activity(&api, &args).await,
+        "inspect_invite" => inspect_invite(&api, &args).await,
+        "accept_invite" => accept_invite(&api, &args).await,
         _ => Err(tr_args("mcp-unknown-tool", &[("name", name.to_string())])),
     };
 
     span.set_status(result.is_ok());
     span.finish();
     Ok(match result {
-        Ok(value) => tool_result(value, false),
+        Ok(value) => {
+            let previews = if name == "inspect_invite" {
+                serde_json::from_value::<LinkPreview>(value.clone())
+                    .map(|preview| vec![preview])
+                    .unwrap_or_default()
+            } else if tool_resolves_link_previews(name) {
+                let texts = tool_user_texts(name, &value);
+                let mut resolver = LinkPreviewResolver::new(api.clone());
+                tokio::time::timeout(
+                    OPTIONAL_PREVIEW_BUDGET,
+                    resolver.resolve_texts(texts.iter().map(String::as_str)),
+                )
+                .await
+                .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            tool_result_with_previews(value, previews, false)
+        }
         Err(message) => tool_text_result(message, true),
     })
+}
+
+fn tool_resolves_link_previews(name: &str) -> bool {
+    matches!(
+        name,
+        "list_lists" | "list_items" | "get_list" | "get_item" | "search" | "activity"
+    )
 }
 
 fn mcp_method_trace_name(method: &str) -> &'static str {
@@ -148,12 +185,20 @@ fn mcp_method_trace_name(method: &str) -> &'static str {
 fn mcp_tool_trace_name(name: &str) -> &'static str {
     match name {
         "list_lists" => "list_lists",
+        "create_list" => "create_list",
+        "update_list" => "update_list",
         "list_items" => "list_items",
         "create_item" => "create_item",
         "update_item" => "update_item",
         "toggle_item_done" => "toggle_item_done",
         "delete_item" => "delete_item",
         "upload_item_attachment" => "upload_item_attachment",
+        "get_list" => "get_list",
+        "get_item" => "get_item",
+        "search" => "search",
+        "activity" => "activity",
+        "inspect_invite" => "inspect_invite",
+        "accept_invite" => "accept_invite",
         _ => "unknown",
     }
 }
@@ -161,6 +206,59 @@ fn mcp_tool_trace_name(name: &str) -> &'static str {
 async fn list_lists(api: &ApiClient) -> Result<Value, String> {
     let lists: Vec<ShoppingList> = api.get("/lists").await?;
     serde_json::to_value(lists).map_err(|e| e.to_string())
+}
+
+async fn create_list(api: &ApiClient, args: &Map<String, Value>) -> Result<Value, String> {
+    let mut body = Map::new();
+    body.insert(
+        "name".to_string(),
+        Value::String(required_string(args, "name")?),
+    );
+    insert_optional_string(args, &mut body, "icon", "icon")?;
+    insert_optional_string(args, &mut body, "color", "color")?;
+    if let Some(folder_id) = optional_i64(args, "folder_id")? {
+        body.insert("folder_id".to_string(), Value::from(folder_id));
+    }
+    if let Some(list_type) = optional_string(args, "list_type")? {
+        body.insert(
+            "list_type".to_string(),
+            Value::String(normalize_list_type(Some(list_type)).unwrap_or_default()),
+        );
+    }
+    if let Some(content) = optional_preserved_string(args, "note_content")? {
+        body.insert("note_content".to_string(), Value::String(content));
+    }
+    api.post("/lists", &Value::Object(body)).await
+}
+
+async fn update_list(api: &ApiClient, args: &Map<String, Value>) -> Result<Value, String> {
+    let id = required_i64(args, "id")?;
+    let mut body = Map::new();
+    insert_optional_string(args, &mut body, "name", "name")?;
+    insert_clearable_string(args, &mut body, "icon", "icon")?;
+    insert_clearable_string(args, &mut body, "color", "color")?;
+    if let Some(folder_id) = args.get("folder_id") {
+        if folder_id.is_null() {
+            body.insert("folder_id".to_string(), Value::Null);
+        } else {
+            body.insert(
+                "folder_id".to_string(),
+                Value::from(required_i64(args, "folder_id")?),
+            );
+        }
+    }
+
+    let note_content = optional_preserved_string(args, "note_content")?;
+    if body.is_empty() && note_content.is_none() {
+        return Err(tr("mcp-no-changes"));
+    }
+    let payload = if let Some(content) = note_content {
+        let current: Value = api.get(&format!("/lists/{id}")).await?;
+        safe_update_payload(&current, &content, body)?
+    } else {
+        Value::Object(body)
+    };
+    api.put(&format!("/lists/{id}"), &payload).await
 }
 
 async fn list_items(api: &ApiClient, args: &Map<String, Value>) -> Result<Value, String> {
@@ -221,6 +319,8 @@ async fn list_items(api: &ApiClient, args: &Map<String, Value>) -> Result<Value,
 
 async fn create_item(api: &ApiClient, args: &Map<String, Value>) -> Result<Value, String> {
     let list_id = required_i64(args, "list_id")?;
+    let list: Value = api.get(&format!("/lists/{list_id}")).await?;
+    ensure_task_list(&list)?;
     let text = required_string(args, "text")?;
     let mut body = Map::new();
     body.insert("text".to_string(), Value::String(text));
@@ -268,7 +368,6 @@ async fn update_item(api: &ApiClient, args: &Map<String, Value>) -> Result<Value
     if body.is_empty() {
         return Err(tr("mcp-no-changes"));
     }
-
     api.put(&format!("/items/{id}"), &Value::Object(body)).await
 }
 
@@ -302,6 +401,163 @@ async fn upload_item_attachment_tool(
     )
     .await?;
     serde_json::to_value(attachment).map_err(|error| error.to_string())
+}
+
+async fn get_list(api: &ApiClient, args: &Map<String, Value>) -> Result<Value, String> {
+    let id = required_i64(args, "id")?;
+    api.get(&format!("/lists/{id}")).await
+}
+
+async fn get_item(api: &ApiClient, args: &Map<String, Value>) -> Result<Value, String> {
+    let id = required_i64(args, "id")?;
+    let item: Value = api.get(&format!("/items/{id}")).await?;
+    let comments: Value = api.get(&format!("/items/{id}/comments")).await?;
+    let mut result = item;
+    if let Some(object) = result.as_object_mut() {
+        object.insert("comments".to_string(), comments);
+    }
+    Ok(result)
+}
+
+async fn search(api: &ApiClient, args: &Map<String, Value>) -> Result<Value, String> {
+    let query = required_string(args, "query")?;
+    api.get_query("/search", &[("q", &query)]).await
+}
+
+async fn activity(api: &ApiClient, args: &Map<String, Value>) -> Result<Value, String> {
+    let list_id = required_i64(args, "list_id")?;
+    let limit = optional_i64(args, "limit")?
+        .unwrap_or(20)
+        .max(1)
+        .to_string();
+    api.get_query(&format!("/lists/{list_id}/activity"), &[("limit", &limit)])
+        .await
+}
+
+fn required_invite_token(args: &Map<String, Value>) -> Result<String, String> {
+    let token = required_string(args, "token")?;
+    let url = format!("https://kram.li/i/{token}");
+    crate::internal_links::parse_internal_kramli_url(&url)
+        .and_then(|link| link.token)
+        .ok_or_else(|| tr("cli-invite-link-invalid"))
+}
+
+async fn inspect_invite(api: &ApiClient, args: &Map<String, Value>) -> Result<Value, String> {
+    let token = required_invite_token(args)?;
+    let mut resolver = LinkPreviewResolver::new(api.clone());
+    let preview = resolver
+        .resolve_url_strict(&format!("https://kram.li/i/{token}"))
+        .await?
+        .ok_or_else(|| tr("cli-invite-link-invalid"))?;
+    serde_json::to_value(preview).map_err(|error| error.to_string())
+}
+
+async fn accept_invite(api: &ApiClient, args: &Map<String, Value>) -> Result<Value, String> {
+    let token = required_invite_token(args)?;
+    if optional_bool(args, "confirmed")? != Some(true) {
+        return Err(tr("mcp-invite-confirmation-required"));
+    }
+    let mut resolver = LinkPreviewResolver::new(api.clone());
+    let preview = resolver
+        .resolve_url_strict(&format!("https://kram.li/i/{token}"))
+        .await?
+        .ok_or_else(|| tr("cli-invite-link-invalid"))?;
+    if !preview.resolved
+        || !preview
+            .action
+            .as_ref()
+            .is_some_and(|action| action.kind == LinkPreviewActionKind::Accept)
+    {
+        return Err(tr("link-preview-unresolved"));
+    }
+    api.accept_invite_link(&token).await
+}
+
+fn push_string_field(value: &Value, key: &str, texts: &mut Vec<String>) {
+    if let Some(text) = value.get(key).and_then(Value::as_str) {
+        texts.push(text.to_string());
+    }
+}
+
+fn push_attachment_texts(value: &Value, texts: &mut Vec<String>) {
+    let attachments = value
+        .get("attachments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    for attachment in attachments {
+        push_string_field(attachment, "context", texts);
+        push_string_field(attachment, "alt_text", texts);
+    }
+}
+
+fn push_item_texts(value: &Value, texts: &mut Vec<String>) {
+    for key in ["text", "notes", "tldr"] {
+        push_string_field(value, key, texts);
+    }
+    push_attachment_texts(value, texts);
+    for comment in value
+        .get("comments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        push_string_field(comment, "text", texts);
+    }
+}
+
+fn tool_user_texts(name: &str, value: &Value) -> Vec<String> {
+    let mut texts = Vec::new();
+    match name {
+        "list_lists" => {
+            for list in value.as_array().into_iter().flatten() {
+                push_string_field(list, "name", &mut texts);
+            }
+        }
+        "list_items" => {
+            for item in value.as_array().into_iter().flatten() {
+                push_item_texts(item, &mut texts);
+            }
+        }
+        "get_item" => {
+            push_item_texts(value, &mut texts);
+        }
+        "get_list" => {
+            push_string_field(value, "name", &mut texts);
+            push_string_field(value, "note_content", &mut texts);
+        }
+        "search" => {
+            for list in value
+                .get("lists")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_string_field(list, "name", &mut texts);
+            }
+            for item in value
+                .get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                push_string_field(item, "text", &mut texts);
+            }
+            if let Some(hits) = value.as_array() {
+                for hit in hits {
+                    push_string_field(hit, "name", &mut texts);
+                    push_string_field(hit, "text", &mut texts);
+                }
+            }
+        }
+        "activity" => {
+            for entry in value.as_array().into_iter().flatten() {
+                texts.push(crate::output::activity_detail_text(entry.get("detail")));
+            }
+        }
+        _ => {}
+    }
+    texts
 }
 
 fn insert_reminder_fields(
@@ -381,6 +637,20 @@ fn optional_clearable_string(
     match args.get(name) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.trim().to_string())),
+        _ => Err(tr_args(
+            "mcp-argument-must-string",
+            &[("name", name.into())],
+        )),
+    }
+}
+
+fn optional_preserved_string(
+    args: &Map<String, Value>,
+    name: &str,
+) -> Result<Option<String>, String> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
         _ => Err(tr_args(
             "mcp-argument-must-string",
             &[("name", name.into())],
@@ -472,9 +742,25 @@ fn insert_clearable_string(
     Ok(())
 }
 
+#[cfg(test)]
 fn tool_result(value: Value, is_error: bool) -> Value {
     let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
     tool_text_result(text, is_error)
+}
+
+fn tool_result_with_previews(value: Value, previews: Vec<LinkPreview>, is_error: bool) -> Value {
+    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+    json!({
+        "content": [{
+            "type": "text",
+            "text": text
+        }],
+        "structuredContent": {
+            "data": value,
+            "link_previews": previews
+        },
+        "isError": is_error
+    })
 }
 
 fn tool_text_result(text: String, is_error: bool) -> Value {
@@ -650,6 +936,47 @@ fn tools() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "create_list",
+            "description": tr("mcp-tool-create-list"),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "icon": {"type": "string"},
+                    "color": {"type": "string"},
+                    "folder_id": {"type": "integer"},
+                    "list_type": {
+                        "type": "string",
+                        "enum": ["tasks", "note"],
+                        "description": tr("mcp-list-type-description")
+                    },
+                    "note_content": {
+                        "type": "string",
+                        "description": tr("mcp-note-content-create-description")
+                    }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "update_list",
+            "description": tr("mcp-tool-update-list"),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "name": {"type": "string"},
+                    "icon": {"type": "string", "description": tr("mcp-clearable-icon-description")},
+                    "color": {"type": "string", "description": tr("mcp-clearable-color-description")},
+                    "folder_id": {"type": ["integer", "null"], "description": tr("mcp-clearable-folder-description")},
+                    "note_content": {"type": "string", "description": tr("mcp-note-content-update-description")}
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "list_items",
             "description": tr("mcp-tool-list-items"),
             "inputSchema": {
@@ -761,6 +1088,75 @@ fn tools() -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
+        json!({
+            "name": "get_list",
+            "description": tr("mcp-tool-get-list"),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "integer"}},
+                "required": ["id"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "get_item",
+            "description": tr("mcp-tool-get-item"),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "integer"}},
+                "required": ["id"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "search",
+            "description": tr("mcp-tool-search"),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "activity",
+            "description": tr("mcp-tool-activity"),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "list_id": {"type": "integer"},
+                    "limit": {"type": "integer"}
+                },
+                "required": ["list_id"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "inspect_invite",
+            "description": tr("mcp-tool-inspect-invite"),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"token": {"type": "string"}},
+                "required": ["token"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "accept_invite",
+            "description": tr("mcp-tool-accept-invite"),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "token": {"type": "string"},
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": tr("mcp-tool-accept-invite-confirmed")
+                    }
+                },
+                "required": ["token", "confirmed"],
+                "additionalProperties": false
+            }
+        }),
     ]
 }
 
@@ -771,9 +1167,10 @@ mod tests {
         insert_clearable_string, insert_optional_string, insert_reminder_fields, list_items,
         mcp_method_trace_name, mcp_tool_trace_name, optional_bool, optional_clearable_string,
         optional_i64, optional_i64_array, optional_string, optional_string_array, read_message,
-        required_i64, required_string, run_stdio, run_with_io, toggle_item_done, tool_result,
-        tool_text_result, tools, try_parse_message, update_item, write_message, MessageFraming,
+        required_i64, required_string, run_with_io, toggle_item_done, tool_result, tool_text_result,
+        tools, try_parse_message, update_item, write_message, MessageFraming,
     };
+    use crate::attachments::initialize_mcp_file_policy;
     use crate::api::ApiClient;
     use serde_json::{json, Map, Value};
     use std::future::Future;
@@ -789,7 +1186,13 @@ mod tests {
             .await
             .expect("test server should bind");
         let addr = listener.local_addr().expect("test server should have addr");
+        let base_url = format!("http://{addr}");
+        let ready = (!responses.is_empty())
+            .then(|| crate::test_env::register_mock_server(base_url.clone()));
         let handle = tokio::spawn(async move {
+            if let Some(ready) = ready {
+                let _ = ready.await;
+            }
             let mut requests = Vec::new();
             for body in responses {
                 let (mut stream, _) =
@@ -816,7 +1219,38 @@ mod tests {
             requests
         });
 
-        (ApiClient::for_tests(&format!("http://{addr}")), handle)
+        (ApiClient::for_tests(&base_url), handle)
+    }
+
+    async fn server_with_status(
+        status: u16,
+        body: &str,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener.local_addr().expect("test server should have addr");
+        let base_url = format!("http://{addr}");
+        let ready = crate::test_env::register_mock_server(base_url.clone());
+        let body = body.to_string();
+        let handle = tokio::spawn(async move {
+            let _ = ready.await;
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("test server accept timed out")
+                .expect("request should connect");
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).await.expect("request should read");
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            let header = format!(
+                "HTTP/1.1 {status} TEST\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(body.as_bytes()).await.unwrap();
+            vec![request.lines().next().unwrap_or_default().to_string()]
+        });
+        (base_url, handle)
     }
 
     fn schedule_properties_for_tool(tool_name: &str) -> Map<String, Value> {
@@ -920,6 +1354,8 @@ mod tests {
         assert_eq!(mcp_method_trace_name("tools/list"), "tools_list");
         assert_eq!(mcp_method_trace_name("notifications/changed"), "unknown");
         assert_eq!(mcp_tool_trace_name("list_lists"), "list_lists");
+        assert_eq!(mcp_tool_trace_name("create_list"), "create_list");
+        assert_eq!(mcp_tool_trace_name("update_list"), "update_list");
         assert_eq!(mcp_tool_trace_name("list_items"), "list_items");
         assert_eq!(mcp_tool_trace_name("create_item"), "create_item");
         assert_eq!(mcp_tool_trace_name("update_item"), "update_item");
@@ -1129,6 +1565,103 @@ mod tests {
             travel_time_minutes,
             Some("Travel time in minutes (independent from reminders).")
         );
+    }
+
+    #[test]
+    fn list_tool_schemas_expose_note_mutations_without_mutable_type() {
+        let create = schedule_properties_for_tool("create_list");
+        let update = schedule_properties_for_tool("update_list");
+
+        assert_eq!(create["list_type"]["enum"], json!(["tasks", "note"]));
+        assert!(create.contains_key("note_content"));
+        assert!(update.contains_key("note_content"));
+        assert!(!update.contains_key("list_type"));
+    }
+
+    #[tokio::test]
+    async fn list_tools_dispatch_note_create_and_safe_update() {
+        let current = json!({
+            "id": 7,
+            "name": "Notes",
+            "list_type": "note",
+            "note_content": "Old",
+            "note_delta": "[{\"insert\":\"Old\\n\"}]",
+            "note_version": 4
+        });
+        let updated = json!({
+            "id": 7,
+            "name": "Notes",
+            "list_type": "note",
+            "note_content": "New",
+            "note_delta": "[{\"insert\":\"New\\n\"}]",
+            "note_version": 5
+        });
+        let (api, requests) = api_with_responses(vec![
+            json!({"id": 8, "name": "Draft", "list_type": "note", "note_content": "Start"})
+                .to_string(),
+            current.to_string(),
+            updated.to_string(),
+        ])
+        .await;
+        let base_url = api.base_url_for_tests().to_string();
+
+        let (created, changed) = with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                ("KRAMLI_API_KEY", "kramli_test"),
+            ],
+            || async {
+                let created = handle_tool_call(&json!({
+                    "name": "create_list",
+                    "arguments": {
+                        "name": "Draft",
+                        "list_type": "note",
+                        "note_content": "Start"
+                    }
+                }))
+                .await
+                .unwrap();
+                let changed = handle_tool_call(&json!({
+                    "name": "update_list",
+                    "arguments": {"id": 7, "note_content": "New"}
+                }))
+                .await
+                .unwrap();
+                (created, changed)
+            },
+        )
+        .await;
+
+        assert_eq!(created["structuredContent"]["data"]["id"], 8);
+        assert_eq!(changed["structuredContent"]["data"]["note_content"], "New");
+        let requests = requests.await.unwrap();
+        assert!(requests[0].starts_with("POST /api/lists HTTP/1.1"));
+        assert!(requests[0].contains("\"list_type\":\"note\""));
+        assert!(requests[1].starts_with("GET /api/lists/7 HTTP/1.1"));
+        assert!(requests[2].starts_with("PUT /api/lists/7 HTTP/1.1"));
+        assert!(requests[2].contains("\"base_version\":4"));
+        assert!(requests[2].contains("\"base_delta\":\"[{\\\"insert\\\":\\\"Old\\\\n\\\"}]\""));
+        assert!(requests[2].contains("\"note_delta\":\"[{\\\"insert\\\":\\\"New\\\\n\\\"}]\""));
+    }
+
+    #[tokio::test]
+    async fn create_item_rejects_note_lists_before_posting() {
+        let (api, requests) = api_with_responses(vec![
+            json!({"id": 7, "name": "Notes", "list_type": "note"}).to_string(),
+        ])
+        .await;
+        let args = json!({"list_id": 7, "text": "Not a note item"})
+            .as_object()
+            .unwrap()
+            .clone();
+
+        assert_eq!(
+            create_item(&api, &args).await,
+            Err(crate::i18n::tr("note-task-mutation-blocked"))
+        );
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /api/lists/7 HTTP/1.1"));
     }
 
     #[test]
@@ -1452,6 +1985,7 @@ mod tests {
                 }
             ])
             .to_string(),
+            json!({"id": 7, "name": "Tasks", "list_type": "tasks"}).to_string(),
             json!({"id": 99, "text": "Created"}).to_string(),
             json!({"id": 99, "text": "Updated"}).to_string(),
             json!({"id": 99, "is_done": true}).to_string(),
@@ -1559,6 +2093,7 @@ mod tests {
             vec![
                 "GET /api/lists/7/items HTTP/1.1",
                 "GET /api/lists/7/items HTTP/1.1",
+                "GET /api/lists/7 HTTP/1.1",
                 "POST /api/lists/7/items HTTP/1.1",
                 "PUT /api/items/99 HTTP/1.1",
                 "PATCH /api/items/99/done HTTP/1.1",
@@ -1566,15 +2101,15 @@ mod tests {
             ]
         );
 
-        assert!(requests[2].contains("\"parent_item_id\":5"));
-        assert!(requests[2].contains("\"reminder\":true"));
-        assert!(requests[3].contains("\"assigned_to\":[1,2]"));
-        assert!(requests[3].contains("\"reminder\":false"));
-        assert!(requests[3].contains("\"quantity\":\"\""));
-        assert!(requests[3].contains("\"notes\":\"\""));
-        assert!(requests[3].contains("\"due_date\":\"\""));
-        assert!(requests[3].contains("\"reminder_time\":\"\""));
-        assert!(requests[3].contains("\"color\":\"\""));
+        assert!(requests[3].contains("\"parent_item_id\":5"));
+        assert!(requests[3].contains("\"reminder\":true"));
+        assert!(requests[4].contains("\"assigned_to\":[1,2]"));
+        assert!(requests[4].contains("\"reminder\":false"));
+        assert!(requests[4].contains("\"quantity\":\"\""));
+        assert!(requests[4].contains("\"notes\":\"\""));
+        assert!(requests[4].contains("\"due_date\":\"\""));
+        assert!(requests[4].contains("\"reminder_time\":\"\""));
+        assert!(requests[4].contains("\"color\":\"\""));
     }
 
     #[tokio::test]
@@ -1669,6 +2204,7 @@ mod tests {
             &[
                 ("KRAMLI_URL", base_url.as_str()),
                 ("KRAMLI_API_KEY", "kramli_test"),
+                ("KRAMLI_LANG", "en"),
             ],
             || async {
                 handle_tool_call(&json!({"name": "list_lists"}))
@@ -1681,6 +2217,8 @@ mod tests {
         assert!(result["content"][0]["text"]
             .as_str()
             .is_some_and(|text| text.contains("Weekend")));
+        assert_eq!(result["structuredContent"]["data"][0]["id"], 9);
+        assert_eq!(result["structuredContent"]["link_previews"], json!([]));
 
         let requests = requests.await.expect("server should finish");
         let first_lines = requests
@@ -1763,6 +2301,285 @@ mod tests {
     }
 
     #[test]
+    fn structured_tool_result_keeps_compatibility_text_exact() {
+        let value = json!({"id": 7, "text": "https://kramli.de/privacy"});
+        let expected = serde_json::to_string_pretty(&value).unwrap();
+        let result = super::tool_result_with_previews(value.clone(), Vec::new(), false);
+        assert_eq!(result["content"][0]["text"], expected);
+        assert_eq!(result["structuredContent"]["data"], value);
+        assert_eq!(result["structuredContent"]["link_previews"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn get_list_tool_returns_note_previews_without_posting() {
+        let original = json!({
+            "id": 7,
+            "name": "Notes",
+            "list_type": "note",
+            "note_content": "One https://kramli.de/lists/42 and https://kramli.de/privacy"
+        });
+        let (api, requests) = api_with_responses(vec![
+            original.to_string(),
+            json!({"resolved": true, "list_name": "Linked list"}).to_string(),
+        ])
+        .await;
+        let base_url = api.base_url_for_tests().to_string();
+        let result = with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                ("KRAMLI_API_KEY", "kramli_test"),
+            ],
+            || async {
+                handle_tool_call(&json!({
+                    "name": "get_list",
+                    "arguments": {"id": 7}
+                }))
+                .await
+                .unwrap()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result["content"][0]["text"],
+            serde_json::to_string_pretty(&original).unwrap()
+        );
+        assert_eq!(result["structuredContent"]["data"], original);
+        let previews = result["structuredContent"]["link_previews"]
+            .as_array()
+            .unwrap();
+        assert_eq!(previews.len(), 2);
+        assert_eq!(previews[0]["action"]["kind"], "open");
+        let requests = requests.await.unwrap();
+        assert!(requests.iter().all(|request| request.starts_with("GET ")));
+    }
+
+    #[tokio::test]
+    async fn primary_read_result_returns_when_optional_preview_exceeds_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        let ready = crate::test_env::register_mock_server(base_url.clone());
+        let server = tokio::spawn(async move {
+            let _ = ready.await;
+            let (mut primary, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4096];
+            let _ = primary.read(&mut buffer).await.unwrap();
+            let body = json!({
+                "id": 7,
+                "name": "Notes",
+                "note_content": "https://kramli.de/lists/42"
+            })
+            .to_string();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            primary.write_all(header.as_bytes()).await.unwrap();
+            primary.write_all(body.as_bytes()).await.unwrap();
+
+            let (mut preview, _) = listener.accept().await.unwrap();
+            let _ = preview.read(&mut buffer).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let (result, elapsed) = with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                ("KRAMLI_API_KEY", "kramli_test"),
+            ],
+            || async {
+                let started = tokio::time::Instant::now();
+                let result = handle_tool_call(&json!({
+                    "name": "get_list",
+                    "arguments": {"id": 7}
+                }))
+                .await
+                .unwrap();
+                (result, started.elapsed())
+            },
+        )
+        .await;
+        assert!(elapsed < Duration::from_secs(2));
+        assert_eq!(result["structuredContent"]["data"]["id"], 7);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn invite_tools_require_confirmation_and_never_accept_during_inspection() {
+        let (api, requests) = api_with_responses(vec![
+            json!({
+                "list_id": 7,
+                "list_name": "Shared",
+                "already_member": false,
+                "invite_url": "https://kram.li/i/InviteToken_1"
+            })
+            .to_string(),
+            json!({
+                "list_id": 7,
+                "list_name": "Shared",
+                "already_member": false,
+                "invite_url": "https://kram.li/i/InviteToken_1"
+            })
+            .to_string(),
+            json!({"ok": true, "list_id": 7}).to_string(),
+            json!({
+                "list_id": 8,
+                "list_name": "Member",
+                "already_member": true,
+                "invite_url": "https://kram.li/i/MemberToken_1"
+            })
+            .to_string(),
+        ])
+        .await;
+        let invite_args = json!({"token": "InviteToken_1"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let inspected = super::inspect_invite(&api, &invite_args).await.unwrap();
+        assert_eq!(inspected["action"]["kind"], "accept");
+
+        let rejected_args = json!({"token": "InviteToken_1", "confirmed": false})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(super::accept_invite(&api, &rejected_args).await.is_err());
+
+        let accepted_args = json!({"token": "InviteToken_1", "confirmed": true})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            super::accept_invite(&api, &accepted_args).await.unwrap()["ok"],
+            true
+        );
+
+        let member_args = json!({"token": "MemberToken_1", "confirmed": true})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(super::accept_invite(&api, &member_args).await.is_err());
+        let requests = requests.await.unwrap();
+        let methods = requests
+            .iter()
+            .map(|request| request.lines().next().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "GET /api/invite-links/InviteToken_1 HTTP/1.1",
+                "GET /api/invite-links/InviteToken_1 HTTP/1.1",
+                "POST /api/invite-links/InviteToken_1/accept HTTP/1.1",
+                "GET /api/invite-links/MemberToken_1 HTTP/1.1"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_invite_tool_surfaces_auth_and_expiry_failures() {
+        for (status, body) in [
+            (401, r#"{"error":"authentication required"}"#),
+            (410, r#"{"error":"invite expired"}"#),
+        ] {
+            let (base_url, requests) = server_with_status(status, body).await;
+            let result = with_env_vars_async(
+                &[
+                    ("KRAMLI_URL", base_url.as_str()),
+                    ("KRAMLI_API_KEY", "kramli_test"),
+                ],
+                || async {
+                    handle_tool_call(&json!({
+                        "name": "inspect_invite",
+                        "arguments": {"token": "InviteToken_1"}
+                    }))
+                    .await
+                    .unwrap()
+                },
+            )
+            .await;
+            assert_eq!(result["isError"], true);
+            let text = result["content"][0]["text"].as_str().unwrap_or_default();
+            assert!(
+                text.contains(&status.to_string())
+                    || text.contains("auth")
+                    || text.contains("expired")
+            );
+            assert_eq!(
+                requests.await.unwrap(),
+                vec!["GET /api/invite-links/InviteToken_1 HTTP/1.1"]
+            );
+        }
+    }
+
+    #[test]
+    fn every_enriched_tool_extracts_only_its_user_text_fields() {
+        let link = "https://kramli.de/privacy";
+        let cases = [
+            ("list_lists", json!([{"name": link, "role": link}]), 1),
+            (
+                "list_items",
+                json!([{"text": link, "notes": link, "progress": link}]),
+                2,
+            ),
+            (
+                "get_list",
+                json!({"name": link, "note_content": link, "color": link}),
+                2,
+            ),
+            (
+                "get_item",
+                json!({"text": link, "comments": [{"text": link}]}),
+                2,
+            ),
+            ("search", json!({"items": [{"text": link}]}), 1),
+            ("activity", json!([{"detail": {"text": link}}]), 1),
+        ];
+        for (name, value, expected) in cases {
+            assert_eq!(
+                super::tool_user_texts(name, &value).len(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn new_read_tools_use_expected_get_contracts() {
+        let (api, requests) = api_with_responses(vec![
+            json!({"id": 5, "text": "Item"}).to_string(),
+            json!([{"id": 1, "text": "Comment"}]).to_string(),
+            json!({"items": [{"id": 5, "text": "Item"}]}).to_string(),
+            json!([{"id": 2, "detail": {"text": "Changed"}}]).to_string(),
+        ])
+        .await;
+        let item_args = json!({"id": 5}).as_object().unwrap().clone();
+        let search_args = json!({"query": "Item"}).as_object().unwrap().clone();
+        let activity_args = json!({"list_id": 7, "limit": 5})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(super::get_item(&api, &item_args).await.unwrap()["id"], 5);
+        assert!(super::search(&api, &search_args).await.unwrap()["items"].is_array());
+        assert!(super::activity(&api, &activity_args)
+            .await
+            .unwrap()
+            .is_array());
+        let requests = requests.await.unwrap();
+        assert_eq!(
+            requests[0].lines().next().unwrap(),
+            "GET /api/items/5 HTTP/1.1"
+        );
+        assert_eq!(
+            requests[1].lines().next().unwrap(),
+            "GET /api/items/5/comments HTTP/1.1"
+        );
+        assert!(requests[2].starts_with("GET /api/search?"));
+        assert!(requests[3].starts_with("GET /api/lists/7/activity?"));
+        assert!(requests.iter().all(|request| request.starts_with("GET ")));
+    }
+
+    #[test]
     fn parser_waits_for_full_content_length_body_and_skips_header_lines_without_colon() {
         let body = b"{}";
         let mut incomplete = b"HeaderWithoutColon\r\nContent-Length: 2\r\n\r\n{".to_vec();
@@ -1785,7 +2602,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_stdio_entrypoint_is_reachable_under_timeout() {
-        let _ = tokio::time::timeout(Duration::from_millis(5), run_stdio()).await;
+    async fn run_stdio_loop_exits_on_eof() {
+        // Do not call run_stdio() with process stdin: the blocking stdin read is
+        // not reliably cancelled by tokio::time::timeout and can hang the suite.
+        initialize_mcp_file_policy();
+        let mut input = tokio::io::empty();
+        let mut output = Vec::new();
+        run_with_io(&mut input, &mut output)
+            .await
+            .expect("EOF on MCP stdin should exit cleanly");
+        assert!(output.is_empty());
     }
 }

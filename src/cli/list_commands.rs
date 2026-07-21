@@ -33,20 +33,7 @@ pub(super) async fn run_lists(cmd: ListCmd, as_json: bool) -> Result<(), String>
             }
         }
         ListCmd::Show { id } => {
-            let payload: Value = api.get(&format!("/lists/{id}")).await?;
-            let list = list_from_payload(payload.clone())?;
-            if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&payload).unwrap_or_default()
-                );
-            } else {
-                output::print_list_detail(&list);
-                if is_note_list_type(list_type_value(&payload)) {
-                    output::print_note_content(list_note_content(&payload));
-                }
-            }
-            maybe_auto_handoff(&api, id, Some(&list.name), as_json).await;
+            run_lists_show(&api, id, as_json).await?;
         }
         ListCmd::Create {
             name,
@@ -77,7 +64,6 @@ pub(super) async fn run_lists(cmd: ListCmd, as_json: bool) -> Result<(), String>
             name,
             icon,
             color,
-            list_type,
             note_content,
             states,
         } => {
@@ -89,7 +75,6 @@ pub(super) async fn run_lists(cmd: ListCmd, as_json: bool) -> Result<(), String>
                     name,
                     icon,
                     color,
-                    list_type,
                     note_content,
                     states,
                 },
@@ -99,6 +84,29 @@ pub(super) async fn run_lists(cmd: ListCmd, as_json: bool) -> Result<(), String>
         ListCmd::Delete { id } => run_lists_delete(&api, as_json, id).await?,
         ListCmd::Move { id, folder_id } => run_lists_move(&api, as_json, id, folder_id).await?,
     }
+    Ok(())
+}
+
+pub(super) async fn run_lists_show(api: &ApiClient, id: i64, as_json: bool) -> Result<(), String> {
+    let payload: Value = api.get(&format!("/lists/{id}")).await?;
+    let list = list_from_payload(payload.clone())?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+    } else {
+        output::print_list_detail(&list);
+        if is_note_list_type(list_type_value(&payload)) {
+            output::print_note_content(list_note_content(&payload));
+        }
+        let mut texts = vec![list.name.as_str()];
+        if let Some(content) = list_note_content(&payload) {
+            texts.push(content);
+        }
+        print_link_previews_for_texts(api, texts).await;
+    }
+    maybe_auto_handoff(api, id, Some(&list.name), as_json).await;
     Ok(())
 }
 
@@ -149,11 +157,15 @@ pub(super) async fn run_lists_update(
         name,
         icon,
         color,
-        list_type,
         note_content,
         states,
     } = args;
-    let body = update_list_body(name, icon, color, list_type, note_content, states)?;
+    let mut body = update_list_body(name, icon, color, note_content.clone(), states)?;
+    body.remove("note_content");
+    if let Some(note_content) = note_content {
+        let current: Value = api.get(&format!("/lists/{id}")).await?;
+        apply_safe_note_update(&mut body, &current, &note_content)?;
+    }
     let payload: Value = api.put(&format!("/lists/{id}"), &body).await?;
     let list = list_from_payload(payload.clone())?;
     if as_json {
@@ -243,7 +255,6 @@ pub(super) struct UpdateListArgs {
     pub(super) name: Option<String>,
     pub(super) icon: Option<String>,
     pub(super) color: Option<String>,
-    pub(super) list_type: Option<String>,
     pub(super) note_content: Option<String>,
     pub(super) states: Option<String>,
 }
