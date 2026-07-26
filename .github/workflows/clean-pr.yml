@@ -87,6 +87,7 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
+          python3 scripts/fix_commit_author_exec.py --self-test
           python3 scripts/fix_pr_commit_authors.py --pr "${{ steps.pr.outputs.number }}" --push
 
   clean:

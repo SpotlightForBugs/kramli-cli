@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Amend the current commit during rebase when Cursor is the author.
 
-Used as: git rebase --root --exec "python3 scripts/fix_commit_author_exec.py"
+Only reassigns authorship when the commit message already names a human
+Co-authored-by trailer. Sole cursoragent commits are left unchanged.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ def scrub_commit_message(message: str) -> str:
     return "\n".join(kept) + "\n"
 
 
-def pick_human_author(message: str, fallback_name: str, fallback_email: str) -> tuple[str, str]:
+def find_human_coauthor(message: str) -> tuple[str, str] | None:
     for match in COAUTHOR_RE.finditer(message):
         name = match.group(1).strip()
         email = match.group(2).strip().lower()
@@ -44,7 +45,19 @@ def pick_human_author(message: str, fallback_name: str, fallback_email: str) -> 
         if "cursoragent" in email:
             continue
         return name, email
-    return fallback_name, fallback_email
+    return None
+
+
+def run_self_test() -> None:
+    message = (
+        "feat: example\n\n"
+        "Co-authored-by: Johannes Häusler <mail@spotlightforbugs.eu>\n"
+    )
+    assert find_human_coauthor(message) == (
+        "Johannes Häusler",
+        "mail@spotlightforbugs.eu",
+    )
+    assert find_human_coauthor("feat: cursor only\n") is None
 
 
 def main() -> int:
@@ -54,14 +67,12 @@ def main() -> int:
     if author_email.lower() != CURSOR_AUTHOR_EMAIL.lower():
         return 0
 
-    fallback_name = os.environ.get("FALLBACK_AUTHOR_NAME", "").strip()
-    fallback_email = os.environ.get("FALLBACK_AUTHOR_EMAIL", "").strip()
-    if not fallback_name or not fallback_email:
-        print("FALLBACK_AUTHOR_NAME and FALLBACK_AUTHOR_EMAIL are required", file=sys.stderr)
-        return 1
-
     message = subprocess.check_output(["git", "log", "-1", "--format=%B"], text=True)
-    new_name, new_email = pick_human_author(message, fallback_name, fallback_email)
+    human = find_human_coauthor(message)
+    if human is None:
+        return 0
+
+    new_name, new_email = human
     new_message = scrub_commit_message(message)
 
     env = os.environ.copy()
@@ -83,4 +94,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+        run_self_test()
+        print("self-test: ok")
+        raise SystemExit(0)
     raise SystemExit(main())
