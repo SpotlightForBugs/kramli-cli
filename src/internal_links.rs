@@ -534,10 +534,7 @@ fn parse_kram_li_host(segments: &[&str], fragment: &str) -> Option<InternalKraml
     None
 }
 
-fn parse_kramli_de_list_segments(
-    segments: &[&str],
-    fragment: &str,
-) -> Option<InternalKramliLink> {
+fn parse_kramli_de_list_segments(segments: &[&str], fragment: &str) -> Option<InternalKramliLink> {
     if segments.len() == 3
         && segments[..2] == ["lists", "join"]
         && valid_token(segments[2], INVITE_TOKEN_MIN_LEN, INVITE_TOKEN_MAX_LEN)
