@@ -1249,6 +1249,7 @@ impl App {
             simulate_missing_deleted_item: false,
             #[cfg(test)]
             force_list_icon_protocol_failure: false,
+            #[cfg(test)]
             force_empty_kanban_columns: false,
         }
     }

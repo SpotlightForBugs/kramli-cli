@@ -8063,8 +8063,6 @@ async fn run_status(as_json: bool) -> Result<(), String> {
             if let Ok(p) = api.get::<Profile>("/profile").await {
                 out["profile"] = profile_json_with_lang(&p);
             }
-        } else {
-            ()
         }
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
         return Ok(());
@@ -10263,8 +10261,6 @@ async fn run_security(cmd: SecurityCmd, as_json: bool) -> Result<(), String> {
                     let mark = if met { "✓".green() } else { "·".normal() };
                     println!("  {mark} {label}");
                 }
-            } else {
-                ()
             }
             Ok(())
         }
