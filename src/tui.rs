@@ -675,6 +675,8 @@ struct App {
     simulate_missing_deleted_item: bool,
     #[cfg(test)]
     force_list_icon_protocol_failure: bool,
+    #[cfg(test)]
+    force_empty_kanban_columns: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -916,36 +918,80 @@ where
 }
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>, String> {
-    enable_raw_mode().map_err(|e| e.to_string())?;
+    init_terminal_with_hooks(
+        enable_raw_mode,
+        disable_raw_mode,
+        enter_interactive_stdout,
+        leave_interactive_stdout,
+        |stdout| Terminal::new(CrosstermBackend::new(stdout)),
+    )
+}
+
+fn enter_interactive_stdout(stdout: &mut io::Stdout) -> io::Result<()> {
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+}
+
+fn leave_interactive_stdout(stdout: &mut io::Stdout) -> io::Result<()> {
+    execute!(
+        stdout,
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        crossterm::cursor::Show
+    )
+}
+
+fn init_terminal_with_hooks<E, D, En, Le, N>(
+    enable_raw_mode_fn: E,
+    disable_raw_mode_fn: D,
+    enter_interactive_fn: En,
+    leave_interactive_fn: Le,
+    new_terminal: N,
+) -> Result<Terminal<CrosstermBackend<io::Stdout>>, String>
+where
+    E: FnOnce() -> io::Result<()>,
+    D: FnOnce() -> io::Result<()>,
+    En: FnOnce(&mut io::Stdout) -> io::Result<()>,
+    Le: FnOnce(&mut io::Stdout) -> io::Result<()>,
+    N: FnOnce(io::Stdout) -> Result<Terminal<CrosstermBackend<io::Stdout>>, io::Error>,
+{
+    enable_raw_mode_fn().map_err(|e| e.to_string())?;
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
-        let _ = disable_raw_mode();
+    if let Err(error) = enter_interactive_fn(&mut stdout) {
+        let _ = disable_raw_mode_fn();
         return Err(error.to_string());
     }
-    let backend = CrosstermBackend::new(stdout);
-    Terminal::new(backend).map_err(|error| {
-        let _ = disable_raw_mode();
+    new_terminal(stdout).map_err(|error| {
+        let _ = disable_raw_mode_fn();
         let mut stdout = io::stdout();
-        let _ = execute!(
-            stdout,
-            LeaveAlternateScreen,
-            DisableMouseCapture,
-            crossterm::cursor::Show
-        );
+        let _ = leave_interactive_fn(&mut stdout);
         error.to_string()
     })
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), String> {
+    restore_terminal_with_hooks(
+        terminal,
+        disable_raw_mode,
+        |backend| execute!(backend, LeaveAlternateScreen, DisableMouseCapture),
+    )
+}
+
+fn restore_terminal_with_hooks<B, D, Leave>(
+    terminal: &mut Terminal<B>,
+    disable_raw_mode_fn: D,
+    leave_screen_fn: Leave,
+) -> Result<(), String>
+where
+    B: Backend,
+    B::Error: std::fmt::Display,
+    D: FnOnce() -> io::Result<()>,
+    Leave: FnOnce(&mut B) -> io::Result<()>,
+{
     let mut first_error = None;
-    if let Err(error) = disable_raw_mode() {
+    if let Err(error) = disable_raw_mode_fn() {
         first_error.get_or_insert_with(|| error.to_string());
     }
-    if let Err(error) = execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    ) {
+    if let Err(error) = leave_screen_fn(terminal.backend_mut()) {
         first_error.get_or_insert_with(|| error.to_string());
     }
     if let Err(error) = terminal.show_cursor() {
@@ -1078,6 +1124,26 @@ async fn run_event_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
 ) -> Result<(), String> {
+    run_event_loop_with_io(
+        terminal,
+        app,
+        |timeout| event::poll(timeout).map_err(|e| e.to_string()),
+        || event::read().map_err(|e| e.to_string()),
+    )
+    .await
+}
+
+async fn run_event_loop_with_io<B, P, R>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    poll_event: P,
+    read_event: R,
+) -> Result<(), String>
+where
+    B: Backend,
+    P: Fn(Duration) -> Result<bool, String>,
+    R: Fn() -> Result<Event, String>,
+{
     let mut dirty = true;
     loop {
         if app.drain_load_messages() {
@@ -1094,18 +1160,16 @@ async fn run_event_loop<B: Backend>(
             return Ok(());
         }
 
-        if !event::poll(Duration::from_millis(120)).map_err(|e| e.to_string())? {
+        if !poll_event(Duration::from_millis(120))? {
             continue;
         }
 
         loop {
-            if handle_runtime_event(terminal, app, event::read().map_err(|e| e.to_string())?)
-                .await?
-            {
+            if handle_runtime_event(terminal, app, read_event()?).await? {
                 dirty = true;
             }
 
-            if !event::poll(Duration::from_millis(0)).map_err(|e| e.to_string())? {
+            if !poll_event(Duration::from_millis(0))? {
                 break;
             }
         }
@@ -1187,6 +1251,7 @@ impl App {
             simulate_missing_deleted_item: false,
             #[cfg(test)]
             force_list_icon_protocol_failure: false,
+            force_empty_kanban_columns: false,
         }
     }
 
@@ -4154,6 +4219,11 @@ impl App {
     }
 
     fn kanban_columns(&self) -> Vec<KanbanColumn> {
+        #[cfg(test)]
+        if self.force_empty_kanban_columns {
+            return Vec::new();
+        }
+
         let Some(list) = self.selected_list() else {
             return vec![
                 KanbanColumn {
@@ -4192,6 +4262,9 @@ impl App {
 
     fn kanban_buckets(&self) -> (Vec<KanbanColumn>, Vec<Vec<usize>>) {
         let columns = self.kanban_columns();
+        if columns.is_empty() {
+            return (columns, Vec::new());
+        }
         let mut buckets = vec![Vec::new(); columns.len()];
 
         let fallback_column = columns
@@ -8885,13 +8958,34 @@ mod tests {
     impl Drop for TerminalEnvGuard {
         fn drop(&mut self) {
             for (key, value) in &self.previous {
-                if let Some(value) = value {
-                    std::env::set_var(key, value);
-                } else {
-                    std::env::remove_var(key);
-                }
+                restore_env_var(key, value.clone());
             }
         }
+    }
+
+    fn restore_env_var(key: &str, previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn restore_env_var_puts_back_previous_value_or_removes_key() {
+        crate::test_env::with_env_lock(|| {
+            let key = "KRAMLI_RESTORE_ENV_VAR_TEST";
+            std::env::set_var(key, "present");
+            restore_env_var(key, std::env::var_os(key));
+            assert_eq!(std::env::var(key).unwrap(), "present");
+
+            std::env::remove_var(key);
+            restore_env_var(key, None);
+            assert!(std::env::var_os(key).is_none());
+
+            restore_env_var(key, Some("restored".into()));
+            assert_eq!(std::env::var_os(key).unwrap(), "restored");
+            std::env::remove_var(key);
+        });
     }
 
     async fn api_with_responses(
@@ -8996,7 +9090,7 @@ mod tests {
         output
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn note_lists_block_task_editors() {
         let (api, _) = api_with_responses(Vec::new()).await;
         let mut app = App::new(api, false);
@@ -9009,7 +9103,7 @@ mod tests {
         assert_eq!(app.status, Some(tr("note-task-mutation-blocked")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn preview_cards_render_multiple_actions_and_unresolved_fallback() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -9046,7 +9140,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn note_detail_retains_content_and_renders_link_cards() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -9073,7 +9167,7 @@ mod tests {
         assert!(app.items.is_empty());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn note_lists_hide_view_mode_toolbar() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -9093,7 +9187,7 @@ mod tests {
         assert!(text.contains(&tr("view-note")));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn note_link_previews_are_keyboard_selectable() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -9133,7 +9227,7 @@ mod tests {
         assert_eq!(app.selected_link_preview, 0);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn note_view_scrolls_with_arrow_keys() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -9153,7 +9247,7 @@ mod tests {
         assert_eq!(app.detail_scroll, 2);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn note_view_allows_content_mouse_and_auto_focuses_items() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -9175,7 +9269,7 @@ mod tests {
         assert!(!app.handle_empty_items_mouse(false));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn invite_preview_selection_is_get_only_until_confirmation() {
         let (api, requests) = api_with_responses(Vec::new()).await;
         let mut app = App::new(api, false);
@@ -9197,7 +9291,7 @@ mod tests {
         assert!(requests.await.unwrap().is_empty());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn confirmed_invite_acceptance_posts_and_refreshes_target_list() {
         let (api, requests) = api_with_responses(vec![json!({
             "ok": true,
@@ -9227,7 +9321,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn comments_refresh_replaces_item_previews_without_breaking_item_state() {
         let (api, requests) = api_with_responses(vec![
             json!({"resolved": true, "list_name": "Comment link"}).to_string(),
@@ -9268,7 +9362,7 @@ mod tests {
         assert!(requests.await.unwrap()[0].starts_with("GET /api/internal-links/preview?"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn stale_preview_responses_are_discarded_by_generation_and_fingerprint() {
         let mut app = test_app();
         let owner = item_preview_owner(1);
@@ -9313,7 +9407,7 @@ mod tests {
         assert_eq!(app.link_previews[&owner].len(), 1);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn failed_preview_results_are_retryable_and_content_changes_replace_pending_work() {
         let mut app = test_app();
         let owner = item_preview_owner(1);
@@ -9349,7 +9443,7 @@ mod tests {
         assert_ne!(app.pending_link_previews[&owner], first_retry);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn preview_target_item_is_selected_after_target_list_items_load() {
         let mut app = test_app();
         app.pending_open_list_id = Some(7);
@@ -9369,7 +9463,7 @@ mod tests {
         assert_eq!(app.pending_open_item_id, None);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn configured_v_binding_runs_when_no_preview_is_available() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -9383,7 +9477,7 @@ mod tests {
         assert!(app.editor.is_some());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn selecting_note_list_loads_detail_instead_of_items() {
         let (api, requests) = api_with_responses(vec![
             json!({"id": 1, "list_type": "note", "note_content": "Saved note"}).to_string(),
@@ -9412,7 +9506,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn failed_invite_acceptance_keeps_confirmation_open() {
         let (api, requests) = api_with_responses(vec!["not-json".to_string()]).await;
         let mut app = App::new(api, false);
@@ -9433,7 +9527,7 @@ mod tests {
         assert_eq!(requests.await.unwrap().len(), 1);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn rich_note_stays_read_only_with_explanation() {
         let mut app = test_app();
         let mut note = test_list();
@@ -9456,7 +9550,7 @@ mod tests {
         assert_eq!(app.status, Some(tr("tui-note-rich-read-only")));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn plain_note_editor_saves_versioned_delta() {
         let updated = json!({
             "id": 1,
@@ -9504,7 +9598,7 @@ mod tests {
         assert!(requests[0].starts_with("PUT /api/lists/1 HTTP/1.1"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn failed_note_save_preserves_unsaved_text() {
         let (api, requests) = api_with_responses(vec!["not-json".to_string()]).await;
         let mut app = App::new(api, false);
@@ -9537,7 +9631,7 @@ mod tests {
         assert_eq!(requests.await.unwrap().len(), 1);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn open_attachment_editor_requires_selected_item() {
         let mut app = test_app();
         app.items.clear();
@@ -9546,7 +9640,7 @@ mod tests {
         assert_eq!(app.status, Some(tr("output-no-items")));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn attachment_editor_uploads_selected_item_file() {
         let cwd = std::env::current_dir().expect("cwd");
         let root = cwd.join(format!("kramli-tui-attach-{}", std::process::id()));
@@ -9579,7 +9673,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn attachment_editor_requires_non_empty_path() {
         let mut app = test_app();
         app.items = vec![sample_item(5, "Milk")];
@@ -9590,7 +9684,7 @@ mod tests {
         assert_eq!(app.status, Some(tr("attachment-path-required")));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn save_editor_rejects_empty_text_invalid_due_and_progress() {
         let (api, requests) = api_with_responses(Vec::new()).await;
         let mut app = App::new(api, true);
@@ -9628,7 +9722,7 @@ mod tests {
         assert!(requests.await.unwrap().is_empty());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn footer_crud_actions_toggle_delete_members_invite_undo() {
         crate::test_env::with_env_lock_async(|| async {
             let previous_auto_handoff = std::env::var_os(KRAMLI_AUTO_HANDOFF_ENV);
@@ -9700,15 +9794,12 @@ mod tests {
                 ]
             );
 
-            match previous_auto_handoff {
-                Some(value) => std::env::set_var(KRAMLI_AUTO_HANDOFF_ENV, value),
-                None => std::env::remove_var(KRAMLI_AUTO_HANDOFF_ENV),
-            }
+            restore_env_var(KRAMLI_AUTO_HANDOFF_ENV, previous_auto_handoff);
         })
         .await;
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn legal_consent_keyboard_accepts_terms() {
         let (api, requests) = api_with_responses(vec![
             serde_json::json!({"legal": {"pending": []}}).to_string(),
@@ -9735,7 +9826,7 @@ mod tests {
         assert_eq!(requests, vec!["POST /api/accept-terms HTTP/1.1"]);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn beta_consent_decline_sets_should_quit() {
         let mut app = test_app();
         app.beta_consent_pending = true;
@@ -9749,7 +9840,7 @@ mod tests {
         assert!(app.should_quit);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn link_preview_open_external_url_sets_status() {
         let (api, requests) = api_with_responses(Vec::new()).await;
         let mut app = App::new(api, false);
@@ -9769,7 +9860,7 @@ mod tests {
         assert!(requests.await.unwrap().is_empty());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn calendar_ctrl_arrow_shifts_due_hours() {
         let (api, requests) = api_with_responses(vec![serde_json::json!({
             "id": 1,
@@ -9820,7 +9911,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn extracts_html_note_image_sources() {
         assert_eq!(
             extract_note_image_source(r#"<p>Text</p><img class="x" src="/uploads/item.jpg">"#),
@@ -9832,7 +9923,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn extracts_markdown_note_image_sources() {
         assert_eq!(
             extract_note_image_source("before ![photo](https://example.test/p.png) after"),
@@ -9840,7 +9931,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn rejects_data_image_sources_for_external_opening() {
         assert_eq!(
             extract_note_image_source(r#"<img src="data:image/png;base64,abc">"#),
@@ -9848,7 +9939,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn image_source_helpers_cover_scheme_extension_and_temp_paths() {
         assert_eq!(valid_image_source(" javascript:alert(1) "), None);
         assert_eq!(valid_image_source("mailto:test@example.com"), None);
@@ -9880,7 +9971,7 @@ mod tests {
             .is_some_and(|name| name.starts_with("kramli-cli-image-")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn image_source_helpers_cover_attachment_and_parser_edge_cases() {
         let mut attachment = test_attachment(1, None, Some("image/png"));
         assert!(is_image_attachment(&attachment));
@@ -9911,7 +10002,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn item_display_helpers_cover_dates_reminders_and_filters() {
         assert_eq!(date_with_time_display(None, Some("08:00")), "-");
         assert_eq!(
@@ -9941,7 +10032,7 @@ mod tests {
         assert!(!item_matches_filter(&item, "hardware"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn render_helpers_cover_list_detail_footer_and_consent_overlays() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -10002,7 +10093,7 @@ mod tests {
         terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn render_helpers_cover_image_editor_help_and_mode_branches() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -10053,7 +10144,7 @@ mod tests {
         terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn render_helpers_cover_kanban_calendar_drag_and_editor_variants() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -10161,7 +10252,7 @@ mod tests {
         terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn footer_action_metadata_covers_shortcuts_labels_and_env_names() {
         let actions = [
             FooterAction::Add,
@@ -10185,7 +10276,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn editor_save_helpers_cover_progress_and_reminder_body_paths() {
         let (api, requests) = api_with_responses(vec![
             serde_json::json!({
@@ -10277,7 +10368,7 @@ mod tests {
         assert_eq!(app.selected_item, 1);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn move_helpers_cover_kanban_and_calendar_update_paths() {
         let (api, requests) = api_with_responses(vec![
             serde_json::json!({
@@ -10351,7 +10442,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn image_background_helpers_cover_spawn_and_error_paths() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -10386,7 +10477,7 @@ mod tests {
         assert!(app.status.is_some());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn profile_and_image_background_loaders_cover_success_paths() {
         let (api, requests) = api_with_responses(vec![
             serde_json::json!({"display_name": "Ada"}).to_string(),
@@ -10440,7 +10531,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn external_image_loader_fetches_without_launching_os_app_in_tests() {
         let (api, requests) = api_with_responses(vec!["bytes".to_string()]).await;
         let mut app = App::new(api, true);
@@ -10479,13 +10570,13 @@ mod tests {
         assert_eq!(requests, vec!["GET /img/open.png HTTP/1.1"]);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn test_build_external_openers_never_launch_desktop_apps() {
         assert!(open_path(Path::new("/does/not/exist.png")).await.is_ok());
         assert!(open_url("https://example.test/").await.is_ok());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn event_loop_and_runtime_event_helpers_cover_input_branches() {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         let mut app = test_app();
@@ -10573,7 +10664,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_tui_session_helper_covers_success_and_restore_error_paths() {
         crate::test_env::with_env_lock_async(|| async {
             let previous_protocol = std::env::var_os(KRAMLI_TUI_IMAGE_PROTOCOL_ENV);
@@ -10606,15 +10697,12 @@ mod tests {
             .await;
             assert!(result.is_err());
 
-            match previous_protocol {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV),
-            }
+            restore_env_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, previous_protocol);
         })
         .await;
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_tui_terminal_factory_covers_init_error_and_success_paths() {
         let err = run_tui_with_terminal_factory::<ratatui::backend::TestBackend, _, _, _>(
             ApiClient::for_tests("https://kramli.test"),
@@ -10642,7 +10730,7 @@ mod tests {
         .expect("terminal factory helper should succeed with a test backend");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn restore_terminal_function_is_reachable() {
         if !std::io::IsTerminal::is_terminal(&io::stdout()) {
             return;
@@ -10652,7 +10740,7 @@ mod tests {
         let _ = restore_terminal(&mut terminal);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn calendar_drag_helpers_cover_started_and_date_click_paths() {
         let responses = vec![
             serde_json::json!({"id": 1, "list_id": 1, "text": "Milk", "is_done": false, "due_date": "2026-07-11"})
@@ -10735,7 +10823,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn accept_beta_consent_reloads_lists_when_legal_is_clear() {
         let (api, requests) = api_with_responses(vec![serde_json::json!([]).to_string()]).await;
         let mut app = App::new(api, true);
@@ -10758,7 +10846,7 @@ mod tests {
         assert_eq!(requests, vec!["GET /api/lists HTTP/1.1"]);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn draw_list_panel_uses_image_icon_targets_for_folder_and_lists() {
         let mut app = test_app();
         app.set_inline_images_enabled(true);
@@ -10778,7 +10866,7 @@ mod tests {
         terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn ensure_list_icon_background_queues_and_applies_error_results() {
         let mut app = test_app();
         app.set_inline_images_enabled(true);
@@ -10797,7 +10885,7 @@ mod tests {
         assert!(app.failed_list_icons.contains("bad..icon"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn bootstrap_icon_fetch_uses_override_base_url_and_handles_http_errors() {
         crate::test_env::with_env_lock_async(|| async {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10874,7 +10962,7 @@ mod tests {
         .await;
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn beta_overlay_renders_profile_image_when_available() {
         let mut app = test_app();
         app.beta_consent_pending = true;
@@ -10890,7 +10978,7 @@ mod tests {
         terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn draw_editor_and_protocol_fallback_helpers_cover_remaining_paths() {
         crate::test_env::with_env_lock(|| {
             let previous_term = std::env::var_os(TERM_ENV);
@@ -10916,30 +11004,12 @@ mod tests {
             std::env::set_var(WT_SESSION_ENV, "xyz");
             assert_eq!(autodetect_protocol_fallback(), Some(ProtocolType::Sixel));
 
-            match previous_term {
-                Some(value) => std::env::set_var(TERM_ENV, value),
-                None => std::env::remove_var(TERM_ENV),
-            }
-            match previous_program {
-                Some(value) => std::env::set_var(TERM_PROGRAM_ENV, value),
-                None => std::env::remove_var(TERM_PROGRAM_ENV),
-            }
-            match previous_lc_terminal {
-                Some(value) => std::env::set_var(LC_TERMINAL_ENV, value),
-                None => std::env::remove_var(LC_TERMINAL_ENV),
-            }
-            match previous_kitty {
-                Some(value) => std::env::set_var(KITTY_WINDOW_ID_ENV, value),
-                None => std::env::remove_var(KITTY_WINDOW_ID_ENV),
-            }
-            match previous_iterm {
-                Some(value) => std::env::set_var(ITERM_SESSION_ID_ENV, value),
-                None => std::env::remove_var(ITERM_SESSION_ID_ENV),
-            }
-            match previous_wt {
-                Some(value) => std::env::set_var(WT_SESSION_ENV, value),
-                None => std::env::remove_var(WT_SESSION_ENV),
-            }
+            restore_env_var(TERM_ENV, previous_term);
+            restore_env_var(TERM_PROGRAM_ENV, previous_program);
+            restore_env_var(LC_TERMINAL_ENV, previous_lc_terminal);
+            restore_env_var(KITTY_WINDOW_ID_ENV, previous_kitty);
+            restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
+            restore_env_var(WT_SESSION_ENV, previous_wt);
 
             let mut editor = EditorState {
                 mode: EditorMode::Edit,
@@ -10969,7 +11039,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn empty_selection_helpers_are_inert() {
         assert_eq!(shifted_index(0, 3, 0), 0);
         assert_eq!(shifted_index(99, -3, 0), 0);
@@ -10977,7 +11047,7 @@ mod tests {
         assert_eq!(scroll_to_visible(12, 0, 4), 0);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn list_panel_rows_skip_profile_area() {
         let area = Rect::new(0, 0, 30, 20);
         let rows = list_panel_rows_area(area);
@@ -10991,7 +11061,7 @@ mod tests {
         assert_eq!(list_panel_rows_area(small), small);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn html_notes_are_rendered_as_plain_text() {
         assert_eq!(
             note_text_for_display("<p>Milk &amp; bread</p><br><strong>Today</strong>"),
@@ -11047,7 +11117,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn foldered_lists_keep_list_icon_slot_and_render_folder_rows() {
         let folder_id_only = test_shopping_list(1, "Groceries", None, Some(83), None, false);
         assert!(list_has_folder(&folder_id_only));
@@ -11074,7 +11144,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn list_panel_rows_expand_nested_folder_paths() {
         let lists = vec![
             test_shopping_list(1, "Roadmap", None, Some(10), Some("Work/Backend"), false),
@@ -11092,7 +11162,7 @@ mod tests {
         assert_eq!(selected_list_panel_row(&rows, 1), 3);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn list_display_name_for_tui_includes_folder_path() {
         let nested = test_shopping_list(7, "Roadmap", None, Some(11), Some("Work/Backend"), false);
         assert_eq!(list_display_name_for_tui(&nested), "Work/Backend / Roadmap");
@@ -11101,7 +11171,7 @@ mod tests {
         assert_eq!(list_display_name_for_tui(&plain), "Groceries");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn item_row_text_keeps_subitem_indent() {
         let mut item = sample_item(42, "Child task");
         item.depth = Some(2);
@@ -11109,7 +11179,7 @@ mod tests {
         assert_eq!(item_row_text(&item), "    [ ] Child task");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn item_depths_are_derived_from_parent_ids() {
         let mut items = vec![sample_item(1, "Parent"), sample_item(2, "Child")];
         items[1].parent_item_id = Some(1);
@@ -11120,7 +11190,7 @@ mod tests {
         assert_eq!(items[1].depth, Some(1));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn wrap_plain_row_keeps_hanging_indent() {
         assert_eq!(
             wrap_plain_row("> ", "  ", "[ ] abcdefgh", 8),
@@ -11128,7 +11198,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn wrapped_item_hit_test_accounts_for_visual_height() {
         let items = vec![sample_item(1, "abcdefghijkl"), sample_item(2, "short")];
         let visible = vec![0, 1];
@@ -11151,7 +11221,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn mouse_buttons_track_left_button_only() {
         assert_eq!(
             MouseButtons::from_kind(MouseEventKind::Down(MouseButton::Left)),
@@ -11183,7 +11253,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn navigation_action_maps_all_global_keys() {
         assert_eq!(
             navigation_action_for_key(KeyCode::Tab),
@@ -11261,7 +11331,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn view_modes_and_key_binding_sources_cover_branch_variants() {
         assert_eq!(ViewMode::List.next(), ViewMode::Kanban);
         assert_eq!(ViewMode::Kanban.next(), ViewMode::Calendar);
@@ -11286,7 +11356,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn key_binding_parser_covers_alias_function_and_invalid_paths() {
         let shifted_tab = parse_key_binding("shift+tab").expect("shift tab should parse");
         assert_eq!(shifted_tab.code, KeyCode::BackTab);
@@ -11305,7 +11375,7 @@ mod tests {
         assert!(parse_key_binding("   ").is_none());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn layout_and_column_helpers_cover_edge_branches() {
         let state_columns = list_states_to_columns(Some(&[
             ApiListState {
@@ -11349,7 +11419,7 @@ mod tests {
         assert_eq!(scroll_to_visible(2, 3, 4), 2);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_layout_helpers_cover_empty_and_agenda_branches() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -11382,7 +11452,7 @@ mod tests {
         assert!(!month_empty.is_empty());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn app_navigation_helpers_update_mode_focus_and_selection() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -11438,7 +11508,7 @@ mod tests {
         assert_eq!(app.focus, FocusPane::Items);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn app_state_helpers_cover_calendar_scroll_and_comment_branches() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -11508,7 +11578,7 @@ mod tests {
         assert_eq!(app.selected_item, 0);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn app_apply_helpers_cover_profile_lists_images_and_load_messages() {
         let mut app = test_app();
 
@@ -11724,7 +11794,7 @@ mod tests {
         assert!(!app.drain_load_messages());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn background_load_helpers_cover_reload_and_auto_handoff_paths() {
         crate::test_env::with_env_lock_async(|| async {
             let previous_auto_handoff = std::env::var_os(KRAMLI_AUTO_HANDOFF_ENV);
@@ -11784,15 +11854,12 @@ mod tests {
                 vec!["POST /api/activity/viewing HTTP/1.1"]
             );
 
-            match previous_auto_handoff {
-                Some(value) => std::env::set_var(KRAMLI_AUTO_HANDOFF_ENV, value),
-                None => std::env::remove_var(KRAMLI_AUTO_HANDOFF_ENV),
-            }
+            restore_env_var(KRAMLI_AUTO_HANDOFF_ENV, previous_auto_handoff);
         })
         .await;
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn footer_actions_cover_item_member_invite_and_undo_paths() {
         crate::test_env::with_env_lock_async(|| async {
             let previous_auto_handoff = std::env::var_os(KRAMLI_AUTO_HANDOFF_ENV);
@@ -11908,15 +11975,12 @@ mod tests {
                 ]
             );
 
-            match previous_auto_handoff {
-                Some(value) => std::env::set_var(KRAMLI_AUTO_HANDOFF_ENV, value),
-                None => std::env::remove_var(KRAMLI_AUTO_HANDOFF_ENV),
-            }
+            restore_env_var(KRAMLI_AUTO_HANDOFF_ENV, previous_auto_handoff);
         })
         .await;
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn navigation_and_key_helpers_cover_remaining_mode_paths() {
         let mut app = test_app();
         app.lists = vec![
@@ -12057,7 +12121,7 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn editor_key_and_save_helpers_cover_refactored_branches() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -12152,7 +12216,7 @@ mod tests {
         assert!(app.comments_cache.is_empty());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn comment_editor_save_posts_and_updates_cache() {
         let (api, requests) = api_with_responses(vec![
             serde_json::json!({"id": 9, "text": "Hello"}).to_string(),
@@ -12188,7 +12252,7 @@ mod tests {
         assert_eq!(requests, vec!["POST /api/items/7/comments HTTP/1.1"]);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn save_editor_delegates_filter_and_comment_modes() {
         let (api, requests) = api_with_responses(vec![
             serde_json::json!({"id": 11, "text": "Posted"}).to_string(),
@@ -12246,7 +12310,7 @@ mod tests {
         assert_eq!(requests, vec!["POST /api/items/7/comments HTTP/1.1"]);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn editor_key_helpers_cover_remaining_motion_paths() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -12303,7 +12367,7 @@ mod tests {
         assert!(app.editor.is_none());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn empty_state_and_progress_helpers_cover_remaining_branches() {
         assert_eq!(editor_bool_label(Some(true)), tr("label-on"));
         assert_eq!(editor_bool_label(Some(false)), tr("label-off"));
@@ -12341,7 +12405,7 @@ mod tests {
         assert!(!app.move_kanban_selection(0));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn editor_opening_helpers_handle_empty_and_default_paths() {
         let mut app = test_app();
 
@@ -12362,7 +12426,7 @@ mod tests {
         assert!(app.editor.is_some());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn app_navigation_and_mouse_helpers_cover_false_and_editor_branches() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -12480,7 +12544,7 @@ mod tests {
         assert!(app.editor.is_some());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn app_mouse_helpers_cover_tabs_footer_lists_and_modes() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -12679,7 +12743,7 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn sort_lists_for_tui_groups_by_folder_then_name() {
         let mut lists = vec![
             test_shopping_list(1, "Zed", None, None, None, false),
@@ -12701,7 +12765,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn bootstrap_icons_use_asset_names_and_text_fallbacks_without_emoji() {
         assert_eq!(
             bootstrap_icon_asset_name(Some("bi bi-cart-fill")),
@@ -12789,7 +12853,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn tui_icon_style_reads_raw_environment_value() {
         crate::test_env::with_env_lock(|| {
             std::env::set_var(KRAMLI_ICON_STYLE_ENV, "raw");
@@ -12801,7 +12865,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn bootstrap_sprite_contains_icons_from_official_symbol_ids() {
         let sprite = r#"
             <svg xmlns="http://www.w3.org/2000/svg">
@@ -12817,7 +12881,7 @@ mod tests {
         assert!(!bootstrap_sprite_contains_icon(sprite, "../secret"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn bootstrap_icon_color_follows_theme_and_env_hints() {
         assert_eq!(
             icon_svg_color_from_values(Some("light"), None, None),
@@ -12845,7 +12909,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn bootstrap_svg_icons_render_to_images() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1"/></svg>"##;
         let image =
@@ -12854,7 +12918,7 @@ mod tests {
         assert!(image.height() >= 16);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn item_filter_matches_text_notes_priority_and_tags() {
         let item = ListItem {
             id: 1,
@@ -12900,7 +12964,7 @@ mod tests {
         assert!(!item_matches_filter(&item, "groceries"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn tags_value_trims_and_drops_empty_tags() {
         assert_eq!(
             tags_value("foo, , bar"),
@@ -12911,14 +12975,14 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn editor_reminder_details_enable_reminders_by_default() {
         assert!(editor_reminder_details_provided("09:00", &[]));
         assert!(editor_reminder_details_provided("", &[0, 60]));
         assert!(!editor_reminder_details_provided("  ", &[]));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parses_iso_dates_and_rejects_invalid_dates() {
         assert_eq!(
             parse_iso_date("2026-06-14T10:00:00Z"),
@@ -12940,7 +13004,7 @@ mod tests {
         assert_eq!(parse_iso_date("2026-13-01"), None);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn validates_due_date_editor_input() {
         assert!(valid_due_date_input(""));
         assert!(valid_due_date_input("2026-06-17"));
@@ -12956,7 +13020,7 @@ mod tests {
         assert!(due_date_input_prefix_allowed("mañana"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn preserves_due_time_suffix_when_moving_dates() {
         let target = SimpleDate {
             year: 2026,
@@ -12977,7 +13041,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn due_date_with_hour_delta_wraps_across_days() {
         let fallback = SimpleDate {
             year: 2026,
@@ -12998,7 +13062,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_date_helpers_use_monday_first_weeks() {
         assert_eq!(days_in_month(2024, 2), 29);
         assert_eq!(days_in_month(2026, 2), 28);
@@ -13014,14 +13078,14 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_cell_widths_fit_available_width() {
         assert_eq!(calendar_cell_widths(0), [0; 7]);
         assert_eq!(calendar_cell_widths(7), [1, 1, 1, 1, 1, 1, 1]);
         assert_eq!(calendar_cell_widths(10), [2, 2, 2, 1, 1, 1, 1]);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_rows_use_visible_separators() {
         assert_eq!(
             calendar_row(["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"], &[2; 7]),
@@ -13029,7 +13093,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_panel_layout_switches_between_wide_and_stacked_modes() {
         let (month_wide, agenda_wide) = calendar_panel_layout(Rect::new(0, 0, 100, 20));
         assert_eq!(month_wide.y, agenda_wide.y);
@@ -13040,7 +13104,7 @@ mod tests {
         assert_eq!(month_narrow.x, agenda_narrow.x);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_day_cell_labels_show_selection_today_and_overflow() {
         let date = SimpleDate {
             year: 2026,
@@ -13059,7 +13123,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_day_selection_prefers_drag_target_and_selected_day() {
         let date = SimpleDate {
             year: 2026,
@@ -13086,7 +13150,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn format_iso_date_zero_pads_month_and_day() {
         assert_eq!(
             format_iso_date(SimpleDate {
@@ -13098,7 +13162,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn shifted_date_moves_across_month_boundaries() {
         assert_eq!(
             shifted_date(
@@ -13132,7 +13196,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn shifted_month_preserves_day_and_clamps_month_end() {
         assert_eq!(
             shifted_month(
@@ -13166,7 +13230,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn start_of_month_keeps_year_and_month() {
         assert_eq!(
             start_of_month(SimpleDate {
@@ -13182,7 +13246,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_hit_helpers_return_dates_and_items() {
         let date = SimpleDate {
             year: 2026,
@@ -13213,7 +13277,7 @@ mod tests {
         assert_eq!(calendar_item_at(&layout, 10, 9), None);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_pointer_date_matches_rendered_grid_cells() {
         let content = Rect::new(0, 0, 80, 20);
         let month = SimpleDate {
@@ -13253,7 +13317,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_month_filter_keeps_only_visible_month_dates() {
         let month = SimpleDate {
             year: 2026,
@@ -13279,7 +13343,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_month_agenda_groups_dates_and_undated_items() {
         let mut items = vec![
             sample_item(1, "Milk"),
@@ -13327,7 +13391,7 @@ mod tests {
         assert_eq!(out[6], ("  No date".to_string(), Some(3)));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_month_agenda_respects_max_rows() {
         let mut items = vec![sample_item(1, "Milk"), sample_item(2, "Bread")];
         items[0].due_date = Some("2026-06-04".to_string());
@@ -13358,7 +13422,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn centered_popup_stays_inside_small_terminals() {
         let area = Rect::new(0, 0, 20, 8);
         let (outer, inner) = centered_popup(area, 56, 94, 16, 24);
@@ -13375,7 +13439,7 @@ mod tests {
         assert!(inner.y + inner.height <= outer.y + outer.height);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn centered_popup_uses_requested_bounds_when_space_allows() {
         let area = Rect::new(0, 0, 120, 40);
         let (outer, _) = centered_popup(area, 56, 94, 16, 24);
@@ -13386,7 +13450,7 @@ mod tests {
         assert_eq!(outer.y, 8);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn editor_layout_stays_inside_small_terminals() {
         let area = Rect::new(0, 0, 40, 10);
         let layout = editor_layout(area);
@@ -13397,7 +13461,7 @@ mod tests {
         assert!(layout.outer.y + layout.outer.height <= area.y + area.height);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn beta_consent_layout_stays_inside_small_terminals() {
         let area = Rect::new(0, 0, 32, 8);
         let layout = beta_consent_layout(area);
@@ -13408,7 +13472,7 @@ mod tests {
         assert!(layout.outer.y + layout.outer.height <= area.y + area.height);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn item_rows_area_rejects_block_borders() {
         let block = Rect::new(10, 5, 20, 8);
         let rows = item_rows_area(block);
@@ -13418,7 +13482,7 @@ mod tests {
         assert!(rect_contains(rows, 11, 6));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn detects_supported_image_protocols_from_terminal_env() {
         assert!(
             detected_protocol_from_env_values("alacritty", "", "", false, false, false).is_none()
@@ -13476,7 +13540,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn image_preference_and_debug_lines_cover_env_overrides() {
         crate::test_env::with_env_lock(|| {
             std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, "kitty");
@@ -13548,34 +13612,16 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("img env protocol=(unset) images=(unset)")));
 
-            match previous_protocol {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV),
-            }
-            match previous_images {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGES_ENV),
-            }
-            match previous_term {
-                Some(value) => std::env::set_var(TERM_ENV, value),
-                None => std::env::remove_var(TERM_ENV),
-            }
-            match previous_program {
-                Some(value) => std::env::set_var(TERM_PROGRAM_ENV, value),
-                None => std::env::remove_var(TERM_PROGRAM_ENV),
-            }
-            match previous_lc_terminal {
-                Some(value) => std::env::set_var(LC_TERMINAL_ENV, value),
-                None => std::env::remove_var(LC_TERMINAL_ENV),
-            }
-            match previous_iterm {
-                Some(value) => std::env::set_var(ITERM_SESSION_ID_ENV, value),
-                None => std::env::remove_var(ITERM_SESSION_ID_ENV),
-            }
+            restore_env_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, previous_protocol);
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+            restore_env_var(TERM_ENV, previous_term);
+            restore_env_var(TERM_PROGRAM_ENV, previous_program);
+            restore_env_var(LC_TERMINAL_ENV, previous_lc_terminal);
+            restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn build_picker_and_probe_detection_cover_auto_probe_paths() {
         crate::test_env::with_env_lock(|| {
             std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
@@ -13619,38 +13665,17 @@ mod tests {
             std::env::remove_var(WT_SESSION_ENV);
             assert!(!should_probe_terminal_images());
 
-            match previous_images {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGES_ENV),
-            }
-            match previous_term {
-                Some(value) => std::env::set_var(TERM_ENV, value),
-                None => std::env::remove_var(TERM_ENV),
-            }
-            match previous_program {
-                Some(value) => std::env::set_var(TERM_PROGRAM_ENV, value),
-                None => std::env::remove_var(TERM_PROGRAM_ENV),
-            }
-            match previous_lc_terminal {
-                Some(value) => std::env::set_var(LC_TERMINAL_ENV, value),
-                None => std::env::remove_var(LC_TERMINAL_ENV),
-            }
-            match previous_kitty {
-                Some(value) => std::env::set_var(KITTY_WINDOW_ID_ENV, value),
-                None => std::env::remove_var(KITTY_WINDOW_ID_ENV),
-            }
-            match previous_iterm {
-                Some(value) => std::env::set_var(ITERM_SESSION_ID_ENV, value),
-                None => std::env::remove_var(ITERM_SESSION_ID_ENV),
-            }
-            match previous_wt {
-                Some(value) => std::env::set_var(WT_SESSION_ENV, value),
-                None => std::env::remove_var(WT_SESSION_ENV),
-            }
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+            restore_env_var(TERM_ENV, previous_term);
+            restore_env_var(TERM_PROGRAM_ENV, previous_program);
+            restore_env_var(LC_TERMINAL_ENV, previous_lc_terminal);
+            restore_env_var(KITTY_WINDOW_ID_ENV, previous_kitty);
+            restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
+            restore_env_var(WT_SESSION_ENV, previous_wt);
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn editor_value_helpers_cover_all_fields() {
         let mut editor = EditorState {
             mode: EditorMode::Edit,
@@ -13697,7 +13722,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn kanban_defaults_and_editor_suggestion_helpers_cover_remaining_branches() {
         let mut app = test_app();
         app.lists.clear();
@@ -13749,7 +13774,7 @@ mod tests {
         assert!(app.apply_editor_suggestion(1));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn profile_result_mode_mouse_and_calendar_hour_false_paths_are_covered() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -13815,7 +13840,7 @@ mod tests {
             .expect("missing selected item should return false"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn localized_bool_input_and_icon_marker_helpers_cover_remaining_branches() {
         crate::i18n::set_locale("de");
         assert_eq!(parse_editor_bool_input(&tr("label-on")), Some(true));
@@ -13846,7 +13871,7 @@ mod tests {
         tokio::task::yield_now().await;
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_tui_entrypoint_is_reachable_under_cfg_test() {
         crate::test_env::with_env_lock_async(|| async {
             let _ = run_tui().await;
@@ -13854,7 +13879,7 @@ mod tests {
         .await;
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn iterm_env_overrides_bad_kitty_probe_result() {
         assert!(matches!(
             env_override_for_probed_protocol(ProtocolType::Kitty, Some(ProtocolType::Iterm2)),
@@ -13874,7 +13899,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn kanban_down_moves_within_same_column() {
         let buckets = vec![vec![0, 2, 4], vec![1, 3], vec![]];
 
@@ -13885,7 +13910,7 @@ mod tests {
         assert_eq!(next_kanban_selection(&buckets, 999, 1), Some(2));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn stepped_kanban_selection_applies_multi_step_delta_in_column() {
         let buckets = vec![vec![10, 11, 12, 13], vec![20, 21]];
 
@@ -13895,7 +13920,7 @@ mod tests {
         assert_eq!(stepped_kanban_selection(&buckets, 20, 1), Some(21));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn kanban_window_reserves_hint_rows_without_losing_selection() {
         let bucket = vec![0, 1, 2, 3, 4, 5, 6, 7];
         let (start, item_count, show_top, show_bottom) = kanban_window(&bucket, 6, 5);
@@ -13905,7 +13930,7 @@ mod tests {
         assert!(start <= 6 && 6 < start + item_count);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn next_kanban_column_selection_keeps_row_position() {
         let buckets = vec![vec![10, 11, 12], vec![20, 21], vec![], vec![30, 31, 32, 33]];
 
@@ -13916,7 +13941,7 @@ mod tests {
         assert_eq!(next_kanban_column_selection(&buckets, 10, -1), None);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn wrapped_index_wraps_in_both_directions() {
         assert_eq!(wrapped_index(0, 1, 3), 1);
         assert_eq!(wrapped_index(2, 1, 3), 0);
@@ -13925,7 +13950,7 @@ mod tests {
         assert_eq!(wrapped_index(3, 2, 0), 0);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn cycle_suggestion_value_handles_exact_and_prefix_matches() {
         let progress = vec![
             "Offen".to_string(),
@@ -13954,7 +13979,7 @@ mod tests {
         assert_eq!(cycle_suggestion_value("Ta", &tags, 0), None);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn autocomplete_last_tag_replaces_only_last_segment() {
         let suggestions = vec![
             "Brot".to_string(),
@@ -13981,7 +14006,7 @@ mod tests {
         assert_eq!(autocomplete_last_tag("Brot, xyz", &suggestions, 1), None);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn wrapped_kanban_selection_cycles_within_column() {
         let buckets = vec![vec![10, 11, 12], vec![20, 21]];
 
@@ -13996,7 +14021,7 @@ mod tests {
         assert_eq!(stepped_kanban_selection_wrapped(&[], 0, 1), None);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn key_bindings_match_shifted_default_letters() {
         let bindings = KeyBindings {
             bindings: default_key_bindings(),
@@ -14006,7 +14031,7 @@ mod tests {
         assert_eq!(action, Some(FooterAction::Add));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn key_binding_parser_supports_remap_tokens() {
         let binding = parse_key_binding("ctrl+x").expect("valid key binding");
         assert_eq!(binding.label, "C+X");
@@ -14018,7 +14043,7 @@ mod tests {
         assert!(space.matches(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty())));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn auto_handoff_only_sends_current_pending_list() {
         assert!(should_send_auto_handoff(Some(42), Some(42), 42));
         assert!(!should_send_auto_handoff(Some(43), Some(42), 42));
@@ -14026,7 +14051,7 @@ mod tests {
         assert!(!should_send_auto_handoff(None, Some(42), 42));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn auto_handoff_env_flag_defaults_on_and_can_disable() {
         assert!(auto_handoff_enabled_from_value(None));
         assert!(auto_handoff_enabled_from_value(Some("invalid")));
@@ -14035,7 +14060,7 @@ mod tests {
         assert!(auto_handoff_enabled_from_value(Some("yes")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_state_config_columns_supports_strings_and_objects() {
         let columns = parse_state_config_columns(Some(
             r#"["My day", {"name":"Done","is_done":true}, {"name":"My day"}, {"name":"Review","done":false}]"#,
@@ -14049,7 +14074,7 @@ mod tests {
         assert!(!columns[2].is_done);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_state_config_columns_marks_last_done_when_missing() {
         let columns = parse_state_config_columns(Some(r#"["Open", "My day"]"#));
         assert_eq!(columns.len(), 2);
@@ -14057,7 +14082,7 @@ mod tests {
         assert!(columns[1].is_done);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn legal_pending_doc_helpers_extract_profile_and_response_keys() {
         let profile = Profile {
             id: Some(1),
@@ -14095,7 +14120,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_mouse_item_change_reloads_comments_and_previews() {
         let (api, requests) = api_with_responses(vec![json!([]).to_string()]).await;
         let mut app = App::new(api, false);
@@ -14147,7 +14172,7 @@ mod tests {
         assert_eq!(requests, vec!["GET /api/items/2/comments HTTP/1.1"]);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn note_link_preview_mouse_click_activates_preview() {
         let (api, requests) = api_with_responses(Vec::new()).await;
         let mut app = App::new(api, false);
@@ -14200,7 +14225,7 @@ mod tests {
         assert!(requests.await.unwrap().is_empty());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn invite_confirmation_decline_and_accepting_overlay_render() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -14234,7 +14259,7 @@ mod tests {
         assert!(confirm_text.contains("Shared"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn editor_suggestion_and_mouse_save_cancel_navigate_fields() {
         let (api, requests) = api_with_responses(vec![json!({
             "id": 1,
@@ -14323,7 +14348,7 @@ mod tests {
         assert_eq!(requests, vec!["PUT /api/items/1 HTTP/1.1"]);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn auto_handoff_and_stale_link_preview_drain() {
         crate::test_env::with_env_lock_async(|| async {
             let previous_auto_handoff = std::env::var_os(KRAMLI_AUTO_HANDOFF_ENV);
@@ -14376,15 +14401,12 @@ mod tests {
             let requests = requests.await.expect("test server should finish");
             assert_eq!(requests, vec!["POST /api/activity/viewing HTTP/1.1"]);
 
-            match previous_auto_handoff {
-                Some(value) => std::env::set_var(KRAMLI_AUTO_HANDOFF_ENV, value),
-                None => std::env::remove_var(KRAMLI_AUTO_HANDOFF_ENV),
-            }
+            restore_env_var(KRAMLI_AUTO_HANDOFF_ENV, previous_auto_handoff);
         })
         .await;
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn double_click_list_item_opens_editor() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -14413,7 +14435,7 @@ mod tests {
         assert!(app.editor.is_some());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn kanban_card_text_renders_quantity_due_and_comments() {
         let mut item = sample_item(1, "Milk");
         item.quantity = Some("2".to_string());
@@ -14444,7 +14466,7 @@ mod tests {
         assert!(rendered.contains("c3"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn runtime_event_routes_legal_consent_keys() {
         let (api, requests) =
             api_with_responses(vec![json!({"legal": {"pending": []}}).to_string()]).await;
@@ -14506,7 +14528,7 @@ mod tests {
         assert_eq!(requests, vec!["POST /api/accept-terms HTTP/1.1"]);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     #[should_panic(expected = "accept terms message expected")]
     fn accept_terms_load_message_guard_rejects_unexpected_variants() {
         let message = LoadMessage::Lists(Ok(vec![]));
@@ -14516,7 +14538,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn accept_terms_load_message_guard_accepts_expected_variant() {
         let message = LoadMessage::AcceptTerms {
             result: Ok(json!({"legal": {"pending": []}})),
@@ -14527,7 +14549,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn list_display_and_sort_helpers_cover_empty_and_id_only_branches() {
         let folder_only = test_shopping_list(1, "   ", None, Some(83), None, false);
         assert_eq!(
@@ -14549,7 +14571,7 @@ mod tests {
         assert_eq!(empty_icon_slot(), "  ");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn normalize_list_icon_raw_style_preserves_custom_and_fallback_values() {
         crate::test_env::with_env_lock(|| {
             std::env::set_var(KRAMLI_ICON_STYLE_ENV, "raw");
@@ -14560,12 +14582,12 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn terminal_cleanup_guard_drop_runs_without_panic_when_not_dismissed() {
         drop(TerminalCleanupGuard::new());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn footer_refresh_filter_image_attach_and_comment_actions_are_covered() {
         let (api, requests) =
             api_with_responses(vec![json!([{"id": 1, "name": "Groceries"}]).to_string()]).await;
@@ -14603,7 +14625,7 @@ mod tests {
         assert_eq!(requests, vec!["GET /api/lists HTTP/1.1"]);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn reload_item_link_previews_collects_notes_tldr_attachments_and_comments() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -14647,7 +14669,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn select_link_preview_cycles_backward_and_skips_when_empty() {
         let mut app = test_app();
         app.link_previews.insert(
@@ -14677,7 +14699,7 @@ mod tests {
         assert_eq!(app.selected_link_preview, 1);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn runtime_event_routes_beta_consent_and_editor_branches() {
         let (api, _requests) = api_with_responses(Vec::new()).await;
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -14722,7 +14744,7 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_tui_session_internal_covers_restore_failure_path() {
         let outcome = run_tui_session_internal(
             &mut Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap(),
@@ -14738,14 +14760,14 @@ mod tests {
         assert!(!outcome.restore_succeeded);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn compare_lists_for_tui_orders_by_folder_id_when_names_missing() {
         let a = test_shopping_list(1, "B", None, Some(5), None, false);
         let b = test_shopping_list(2, "A", None, Some(4), None, false);
         assert_eq!(compare_lists_for_tui(&a, &b), Ordering::Greater);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn init_terminal_function_is_reachable_on_real_stdout() {
         let _ = init_terminal().map(|mut terminal| restore_terminal(&mut terminal));
 
@@ -14755,7 +14777,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn build_image_picker_auto_probe_applies_env_override_suffix() {
         crate::test_env::with_env_lock(|| {
             std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, "auto");
@@ -14783,34 +14805,16 @@ mod tests {
             assert!(enabled);
             assert!(summary.contains("auto="));
 
-            match previous_protocol {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV),
-            }
-            match previous_term {
-                Some(value) => std::env::set_var(TERM_ENV, value),
-                None => std::env::remove_var(TERM_ENV),
-            }
-            match previous_program {
-                Some(value) => std::env::set_var(TERM_PROGRAM_ENV, value),
-                None => std::env::remove_var(TERM_PROGRAM_ENV),
-            }
-            match previous_lc_terminal {
-                Some(value) => std::env::set_var(LC_TERMINAL_ENV, value),
-                None => std::env::remove_var(LC_TERMINAL_ENV),
-            }
-            match previous_iterm {
-                Some(value) => std::env::set_var(ITERM_SESSION_ID_ENV, value),
-                None => std::env::remove_var(ITERM_SESSION_ID_ENV),
-            }
-            match previous_images {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGES_ENV),
-            }
+            restore_env_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, previous_protocol);
+            restore_env_var(TERM_ENV, previous_term);
+            restore_env_var(TERM_PROGRAM_ENV, previous_program);
+            restore_env_var(LC_TERMINAL_ENV, previous_lc_terminal);
+            restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
         });
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn save_editor_attachment_upload_error_keeps_editor_open() {
         let (api, _) = api_with_responses(Vec::new()).await;
         let mut app = App::new(api, false);
@@ -14840,7 +14844,7 @@ mod tests {
         assert!(app.status.as_ref().is_some_and(|status| !status.is_empty()));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_mouse_help_dismisses_overlay_without_changing_selection() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -14853,7 +14857,7 @@ mod tests {
         assert!(!app.show_help);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_event_loop_redraws_after_load_messages_without_input() {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         let mut app = test_app();
@@ -14867,7 +14871,7 @@ mod tests {
             .expect("event loop should exit after redraw");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn init_terminal_factory_uses_real_stdout_when_available() {
         if !std::io::IsTerminal::is_terminal(&io::stdout()) {
             return;
@@ -14886,7 +14890,7 @@ mod tests {
         .expect("injected init_terminal factory should succeed on a real stdout tty");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn footer_attach_shortcut_and_shift_modifier_labels_are_exposed() {
         assert_eq!(FooterAction::Attach.chip_shortcut(), "P");
         assert_eq!(key_binding_modifier_label(KeyModifiers::SHIFT), "S+");
@@ -14898,7 +14902,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn accept_beta_consent_shows_legal_pending_and_starts_initial_load() {
         let mut app = test_app();
         app.beta_consent_pending = true;
@@ -14916,7 +14920,7 @@ mod tests {
         assert!(app.initial_load_started);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn legal_consent_mouse_decline_is_ignored_while_submitting() {
         let mut app = test_app();
         app.legal_consent_pending = true;
@@ -14935,7 +14939,7 @@ mod tests {
         assert!(!app.should_quit);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn drain_load_messages_applies_note_detail_and_stale_link_previews() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -14978,7 +14982,7 @@ mod tests {
         assert!(!app.link_previews.contains_key(&owner));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_defaults_and_navigation_sync_selected_items() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -15010,7 +15014,7 @@ mod tests {
         assert!(app.calendar_visible_month.is_some());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn save_editor_create_note_and_blocked_paths_cover_remaining_modes() {
         let (api, create_requests) = api_with_responses(vec![serde_json::json!({
             "id": 42,
@@ -15117,7 +15121,7 @@ mod tests {
         assert_eq!(requests, vec!["POST /api/lists/1/items HTTP/1.1"]);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn show_members_summary_truncates_long_member_lists() {
         let (api, requests) = api_with_responses(vec![serde_json::json!([
             {"display_name": "Ada"},
@@ -15139,7 +15143,7 @@ mod tests {
         assert_eq!(requests, vec!["GET /api/lists/1/members HTTP/1.1"]);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_key_alt_scroll_and_link_preview_activation_cover_branches() {
         let (api, requests) = api_with_responses(Vec::new()).await;
         let mut app = App::new(api, false);
@@ -15177,7 +15181,7 @@ mod tests {
         assert!(requests.await.unwrap().is_empty());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn open_list_from_preview_selects_known_list_or_queues_reload() {
         let mut app = test_app();
         app.lists = vec![
@@ -15194,7 +15198,7 @@ mod tests {
         assert_eq!(app.pending_open_list_id, Some(99));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn push_editor_char_rejects_invalid_due_date_and_progress_prefixes() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -15218,7 +15222,7 @@ mod tests {
             .is_some_and(|status| { status.contains(tr("label-state").trim_end_matches(':')) }));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_mouse_routes_scroll_tabs_footer_and_clears_drag_outside_content() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -15271,7 +15275,7 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn note_mode_lines_without_cache_shows_loading_placeholder() {
         let mut app = test_app();
         let mut note = test_list();
@@ -15283,7 +15287,7 @@ mod tests {
         assert_eq!(lines[0].spans[0].content.as_ref(), tr("tui-note-loading"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn bootstrap_icon_cache_persists_successful_fetches() {
         crate::test_env::with_env_lock_async(|| async {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15326,7 +15330,7 @@ mod tests {
         .await;
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn build_image_picker_auto_probe_can_upgrade_halfblocks_to_iterm() {
         crate::test_env::with_env_lock(|| {
             std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
@@ -15356,30 +15360,15 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("imgcat") || line.contains("iterm")));
 
-            match previous_images {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGES_ENV),
-            }
-            match previous_term {
-                Some(value) => std::env::set_var(TERM_ENV, value),
-                None => std::env::remove_var(TERM_ENV),
-            }
-            match previous_program {
-                Some(value) => std::env::set_var(TERM_PROGRAM_ENV, value),
-                None => std::env::remove_var(TERM_PROGRAM_ENV),
-            }
-            match previous_lc_terminal {
-                Some(value) => std::env::set_var(LC_TERMINAL_ENV, value),
-                None => std::env::remove_var(LC_TERMINAL_ENV),
-            }
-            match previous_iterm {
-                Some(value) => std::env::set_var(ITERM_SESSION_ID_ENV, value),
-                None => std::env::remove_var(ITERM_SESSION_ID_ENV),
-            }
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+            restore_env_var(TERM_ENV, previous_term);
+            restore_env_var(TERM_PROGRAM_ENV, previous_program);
+            restore_env_var(LC_TERMINAL_ENV, previous_lc_terminal);
+            restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
         });
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn kanban_mouse_drag_moves_item_into_done_column() {
         let (api, requests) = api_with_responses(vec![
             serde_json::json!({
@@ -15422,7 +15411,7 @@ mod tests {
         assert_eq!(requests.len(), 2);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn calendar_mouse_drag_updates_target_before_drop() {
         let (api, requests) = api_with_responses(vec![serde_json::json!({
             "id": 1,
@@ -15498,7 +15487,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn filter_editor_save_via_handle_key_applies_visible_selection() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -15513,7 +15502,7 @@ mod tests {
         assert_eq!(app.selected_item, 1);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn apply_comments_result_refreshes_previews_for_selected_item() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -15536,7 +15525,7 @@ mod tests {
             .contains_key(&item_preview_owner(7)));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn move_visible_list_selection_no_ops_when_empty() {
         let mut app = test_app();
         app.items = vec![sample_item(1, "Alpha")];
@@ -15544,7 +15533,7 @@ mod tests {
         assert!(!app.move_visible_list_selection(1));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn select_visible_edge_item_keeps_selection_when_already_selected() {
         let mut app = test_app();
         app.items = vec![sample_item(1, "Alpha"), sample_item(2, "Beta")];
@@ -15552,7 +15541,7 @@ mod tests {
         assert!(!app.select_visible_edge_item(true));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_editor_key_is_no_op_without_editor() {
         let mut app = test_app();
         app.handle_editor_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()))
@@ -15561,7 +15550,7 @@ mod tests {
         assert!(app.editor.is_none());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_editor_key_ignores_unhandled_key_in_editor() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -15575,14 +15564,14 @@ mod tests {
         assert_eq!(app.editor.as_ref().unwrap().text, "");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn push_editor_char_is_no_op_without_editor() {
         let mut app = test_app();
         app.push_editor_char('x');
         assert!(app.editor.is_none());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn push_editor_char_planned_date_rejects_invalid_prefix() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -15594,7 +15583,7 @@ mod tests {
         assert_eq!(app.status.as_deref(), Some("Invalid input"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_mouse_footer_click_returns_without_list_panel() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -15619,7 +15608,7 @@ mod tests {
         assert!(app.show_help);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_mouse_list_panel_click_returns_without_content() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -15640,7 +15629,7 @@ mod tests {
         assert_eq!(app.selected_list, 0);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_mouse_item_click_no_ops_when_items_empty() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -15660,7 +15649,7 @@ mod tests {
         assert!(app.status.is_some());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_mouse_left_up_clears_drag_state_in_content() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -15686,13 +15675,13 @@ mod tests {
         assert!(app.kanban_drag_item.is_none());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn handle_mouse_scroll_up_delegates_to_scroll_active() {
         let mut app = test_app();
         assert!(app.handle_mouse_scroll(mouse(MouseEventKind::ScrollUp, 5, 5)));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn apply_mouse_scroll_calendar_navigates_month_view() {
         let mut app = test_app();
         app.mode = ViewMode::Calendar;
@@ -15713,7 +15702,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn handle_tab_mouse_selects_calendar_tab() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -15732,7 +15721,7 @@ mod tests {
         assert_eq!(app.mode, ViewMode::Calendar);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_mouse_editor_and_kanban_bucket_routing() {
         let area = Rect::new(0, 0, 100, 30);
         let layout = editor_layout(area);
@@ -15802,7 +15791,7 @@ mod tests {
         assert!(buckets[0].contains(&1));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn kanban_selection_moves_and_wraps_across_columns() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -15847,7 +15836,7 @@ mod tests {
         assert_eq!(app.selected_item, 1);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn progress_input_and_editor_suggestion_helpers() {
         let mut app = test_app();
         let mut done_only = test_list();
@@ -15931,7 +15920,7 @@ mod tests {
         assert!(!app.apply_editor_suggestion(1));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn move_selected_item_guards_and_update_paths() {
         let mut app = test_app();
         let mut note = test_list();
@@ -16050,7 +16039,7 @@ mod tests {
         assert_eq!(requests.len(), 2);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn scroll_active_routes_to_note_detail_in_notes_view() {
         let mut app = test_app();
         let mut note = test_list();
@@ -16069,7 +16058,7 @@ mod tests {
         assert_eq!(app.detail_scroll, 2);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn refresh_detail_image_background_early_return_branches() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -16122,7 +16111,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn refresh_profile_image_skips_when_cached_or_pending() {
         let mut app = test_app();
         app.set_inline_images_enabled(true);
@@ -16143,7 +16132,7 @@ mod tests {
         assert_eq!(app.pending_profile_image.as_deref(), Some(source.as_str()));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn apply_list_icon_reports_protocol_errors() {
         let mut app = test_app();
         app.picker.set_protocol_type(ProtocolType::Sixel);
@@ -16161,7 +16150,7 @@ mod tests {
         assert!(app.list_icon_images.contains_key("halfblocks-ok"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn selected_image_source_and_open_background_paths() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -16224,7 +16213,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn open_editor_guards_note_lists_and_empty_selection() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -16320,7 +16309,7 @@ mod tests {
         .expect("fail-on-draw terminal should construct")
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn fail_on_draw_backend_forwards_cursor_layout_and_size_queries() {
         let mut terminal = fail_on_draw_terminal(usize::MAX);
         let backend = terminal.backend_mut();
@@ -16352,9 +16341,15 @@ mod tests {
             "{} tui::tests::{test_name} --exact --nocapture --test-threads=1 --ignored",
             exe.display()
         );
-        let status = std::process::Command::new(script)
-            .args(["-q", "-c", &command])
-            .arg("/dev/null")
+        let status = std::process::Command::new("timeout")
+            .args([
+                &crate::test_env::test_timeout_arg(),
+                script,
+                "-q",
+                "-c",
+                &command,
+                "/dev/null",
+            ])
             .status()
             .expect("pseudo-terminal subprocess should spawn");
         assert!(
@@ -16363,7 +16358,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_tui_entrypoint_requires_env_lock() {
         crate::test_env::with_env_lock_async(|| async {
             let _ = run_tui().await;
@@ -16371,7 +16366,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_tui_session_inline_probe_and_draw_failure_paths() {
         crate::test_env::with_env_lock_async(|| async {
             let previous_protocol = std::env::var_os(KRAMLI_TUI_IMAGE_PROTOCOL_ENV);
@@ -16423,19 +16418,13 @@ mod tests {
             .result;
             assert!(first_draw_error.is_err());
 
-            match previous_protocol {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV),
-            }
-            match previous_images {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGES_ENV),
-            }
+            restore_env_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, previous_protocol);
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
         })
         .await;
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn init_terminal_and_restore_terminal_round_trip() {
         let _ = init_terminal().map(|mut terminal| restore_terminal(&mut terminal));
 
@@ -16445,12 +16434,12 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn init_terminal_round_trip_runs_under_pseudo_terminal() {
         run_tui_test_in_pseudo_terminal("init_terminal_round_trip_tty_case");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     #[ignore = "runs in a pseudo-terminal subprocess"]
     fn init_terminal_round_trip_tty_case() {
         if !std::io::IsTerminal::is_terminal(&io::stdout()) {
@@ -16460,7 +16449,7 @@ mod tests {
         restore_terminal(&mut terminal).expect("restore_terminal should succeed on a tty");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn init_terminal_tty_case_noops_when_stdout_is_not_tty() {
         if std::io::IsTerminal::is_terminal(&io::stdout()) {
             return;
@@ -16468,18 +16457,18 @@ mod tests {
         init_terminal_round_trip_tty_case();
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn init_terminal_tty_noop_guard_runs_under_pseudo_terminal() {
         run_tui_test_in_pseudo_terminal("init_terminal_tty_case_noops_on_tty");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     #[ignore = "runs in a pseudo-terminal subprocess"]
     fn init_terminal_tty_case_noops_on_tty() {
         init_terminal_tty_case_noops_when_stdout_is_not_tty();
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn run_event_loop_poll_paths_run_under_pseudo_terminal() {
         run_tui_test_in_pseudo_terminal("run_event_loop_poll_paths_tty_case");
     }
@@ -16504,7 +16493,7 @@ mod tests {
         run_event_loop_poll_paths_on_tty().await;
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     #[ignore = "runs in a pseudo-terminal subprocess"]
     async fn run_event_loop_poll_paths_tty_case() {
         tokio::time::timeout(Duration::from_secs(20), run_event_loop_poll_paths_on_tty())
@@ -16512,7 +16501,7 @@ mod tests {
             .expect("test timed out after 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_event_loop_poll_paths_tty_case_noops_when_stdout_is_not_tty() {
         tokio::time::timeout(
             Duration::from_secs(20),
@@ -16522,12 +16511,12 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn run_event_loop_tty_noop_guard_runs_under_pseudo_terminal() {
         run_tui_test_in_pseudo_terminal("run_event_loop_poll_paths_tty_case_noops_on_tty");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     #[ignore = "runs in a pseudo-terminal subprocess"]
     async fn run_event_loop_poll_paths_tty_case_noops_on_tty() {
         tokio::time::timeout(
@@ -16538,7 +16527,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_runtime_event_routes_input_and_reports_errors() {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
 
@@ -16622,7 +16611,7 @@ mod tests {
         assert!(app.status.as_ref().is_some_and(|status| !status.is_empty()));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_event_loop_handles_poll_errors_and_quit() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -16656,7 +16645,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_note_mode_mouse_covers_early_return_branches() {
         let mut app = test_app();
         let mut note = test_list();
@@ -16710,7 +16699,7 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_list_mode_mouse_covers_detail_image_and_wrapped_miss_paths() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -16761,7 +16750,7 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn kanban_mouse_helpers_cover_finish_drag_and_selection_branches() {
         let (api, requests) = api_with_responses(vec![
             serde_json::json!({
@@ -16905,7 +16894,7 @@ mod tests {
         let _ = requests.await;
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn calendar_mouse_helpers_cover_agenda_header_empty_and_item_paths() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -17072,7 +17061,7 @@ mod tests {
         assert!(app.calendar_selected_date.is_none());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_editor_mouse_covers_non_left_click_and_no_editor_paths() {
         let mut app = test_app();
         let area = Rect::new(0, 0, 100, 30);
@@ -17105,7 +17094,7 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn beta_and_legal_consent_helpers_cover_accept_decline_and_noop_branches() {
         let area = Rect::new(0, 0, 80, 24);
         let layout = beta_consent_layout(area);
@@ -17187,7 +17176,7 @@ mod tests {
         assert!(legal_app.should_quit);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn drain_load_messages_covers_accept_invite_and_terms_branches() {
         let mut app = test_app();
         app.invite_confirmation = Some(PendingInviteAcceptance {
@@ -17213,7 +17202,7 @@ mod tests {
         assert!(app.invite_confirmation.is_none());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn apply_profile_result_covers_reload_lists_when_legal_clear_branch() {
         let (api, requests) = api_with_responses(vec![serde_json::json!([]).to_string()]).await;
         let mut app = App::new(api, true);
@@ -17247,7 +17236,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn move_calendar_month_selection_covers_matching_item_branch() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -17272,7 +17261,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_event_loop_covers_multi_event_drain_branches() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -17305,7 +17294,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn build_image_picker_forced_halfblocks_and_probe_env_suffix() {
         crate::test_env::with_env_lock(|| {
             for seed_env in [false, true] {
@@ -17377,35 +17366,17 @@ mod tests {
                 assert!(safe_summary.contains("(safe)"));
                 assert!(safe_debug.iter().any(|line| line.contains("safe")));
 
-                match previous_images {
-                    Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
-                    None => std::env::remove_var(KRAMLI_TUI_IMAGES_ENV),
-                }
-                match previous_term {
-                    Some(value) => std::env::set_var(TERM_ENV, value),
-                    None => std::env::remove_var(TERM_ENV),
-                }
-                match previous_program {
-                    Some(value) => std::env::set_var(TERM_PROGRAM_ENV, value),
-                    None => std::env::remove_var(TERM_PROGRAM_ENV),
-                }
-                match previous_kitty {
-                    Some(value) => std::env::set_var(KITTY_WINDOW_ID_ENV, value),
-                    None => std::env::remove_var(KITTY_WINDOW_ID_ENV),
-                }
-                match previous_iterm {
-                    Some(value) => std::env::set_var(ITERM_SESSION_ID_ENV, value),
-                    None => std::env::remove_var(ITERM_SESSION_ID_ENV),
-                }
-                match previous_wt {
-                    Some(value) => std::env::set_var(WT_SESSION_ENV, value),
-                    None => std::env::remove_var(WT_SESSION_ENV),
-                }
+                restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+                restore_env_var(TERM_ENV, previous_term);
+                restore_env_var(TERM_PROGRAM_ENV, previous_program);
+                restore_env_var(KITTY_WINDOW_ID_ENV, previous_kitty);
+                restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
+                restore_env_var(WT_SESSION_ENV, previous_wt);
             }
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn build_image_picker_auto_uses_safe_halfblocks_when_probe_skipped() {
         crate::test_env::with_env_lock(|| {
             for seed_env in [false, true] {
@@ -17451,39 +17422,18 @@ mod tests {
                 assert!(summary.contains("(safe)"));
                 assert!(debug.iter().any(|line| line.contains("safe")));
 
-                match previous_images {
-                    Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
-                    None => std::env::remove_var(KRAMLI_TUI_IMAGES_ENV),
-                }
-                match previous_term {
-                    Some(value) => std::env::set_var(TERM_ENV, value),
-                    None => std::env::remove_var(TERM_ENV),
-                }
-                match previous_program {
-                    Some(value) => std::env::set_var(TERM_PROGRAM_ENV, value),
-                    None => std::env::remove_var(TERM_PROGRAM_ENV),
-                }
-                match previous_lc_terminal {
-                    Some(value) => std::env::set_var(LC_TERMINAL_ENV, value),
-                    None => std::env::remove_var(LC_TERMINAL_ENV),
-                }
-                match previous_kitty {
-                    Some(value) => std::env::set_var(KITTY_WINDOW_ID_ENV, value),
-                    None => std::env::remove_var(KITTY_WINDOW_ID_ENV),
-                }
-                match previous_iterm {
-                    Some(value) => std::env::set_var(ITERM_SESSION_ID_ENV, value),
-                    None => std::env::remove_var(ITERM_SESSION_ID_ENV),
-                }
-                match previous_wt {
-                    Some(value) => std::env::set_var(WT_SESSION_ENV, value),
-                    None => std::env::remove_var(WT_SESSION_ENV),
-                }
+                restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+                restore_env_var(TERM_ENV, previous_term);
+                restore_env_var(TERM_PROGRAM_ENV, previous_program);
+                restore_env_var(LC_TERMINAL_ENV, previous_lc_terminal);
+                restore_env_var(KITTY_WINDOW_ID_ENV, previous_kitty);
+                restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
+                restore_env_var(WT_SESSION_ENV, previous_wt);
             }
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn should_probe_terminal_images_respects_explicit_disable_flag() {
         crate::test_env::with_env_lock(|| {
             for seed_env in [false, true] {
@@ -17506,23 +17456,14 @@ mod tests {
                 std::env::set_var(TERM_PROGRAM_ENV, "ghostty");
                 assert!(!should_probe_terminal_images());
 
-                match previous_images {
-                    Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
-                    None => std::env::remove_var(KRAMLI_TUI_IMAGES_ENV),
-                }
-                match previous_term {
-                    Some(value) => std::env::set_var(TERM_ENV, value),
-                    None => std::env::remove_var(TERM_ENV),
-                }
-                match previous_program {
-                    Some(value) => std::env::set_var(TERM_PROGRAM_ENV, value),
-                    None => std::env::remove_var(TERM_PROGRAM_ENV),
-                }
+                restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+                restore_env_var(TERM_ENV, previous_term);
+                restore_env_var(TERM_PROGRAM_ENV, previous_program);
             }
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_state_config_columns_ignores_invalid_entries() {
         assert!(parse_state_config_columns(Some("not-json")).is_empty());
         assert!(parse_state_config_columns(Some(r#"{"name":"Open"}"#)).is_empty());
@@ -17536,7 +17477,7 @@ mod tests {
         assert!(columns[1].is_done);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn kanban_navigation_helpers_handle_zero_delta_and_empty_buckets() {
         let buckets = vec![vec![10, 11], vec![20]];
 
@@ -17553,7 +17494,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn kanban_window_falls_back_to_single_row_when_hints_do_not_fit() {
         let bucket: Vec<usize> = (0..20).collect();
         let (start, count, show_top, show_bottom) = kanban_window(&bucket, 10, 2);
@@ -17563,7 +17504,7 @@ mod tests {
         assert!(show_bottom);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn item_row_text_and_kanban_card_text_render_done_state_and_metadata() {
         let mut item = sample_item(1, "Milk");
         item.is_done = Some(true);
@@ -17581,7 +17522,7 @@ mod tests {
         assert!(kanban_card_text(&item).starts_with("[x] Milk"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn apply_item_depths_honors_preset_depth_and_stops_on_cycles_or_missing_parents() {
         let mut preset = sample_item(1, "Preset depth");
         preset.depth = Some(3);
@@ -17604,7 +17545,7 @@ mod tests {
         assert_eq!(items[4].depth, Some(2));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn html_note_helpers_decode_entities_and_strip_malformed_markup() {
         assert_eq!(note_text_for_display("<style>hidden"), "");
         assert_eq!(note_text_for_display("<span unclosed"), "");
@@ -17618,7 +17559,7 @@ mod tests {
         assert_eq!(note_text_for_display("Hello&nbsp;world"), "Hello world");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn list_has_folder_detects_named_folders_without_folder_id() {
         let named_only = test_shopping_list(1, "Groceries", None, None, Some("Home"), false);
         assert!(list_has_folder(&named_only));
@@ -17635,7 +17576,7 @@ mod tests {
         )));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn apply_comments_result_ignores_failed_responses() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -17645,7 +17586,7 @@ mod tests {
         assert_eq!(app.comments_cache.get(&1).map(Vec::len), Some(0));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn apply_note_detail_result_handles_off_list_and_error_paths() {
         let mut app = test_app();
         let mut note = test_list();
@@ -17672,7 +17613,7 @@ mod tests {
         assert!(app.status.is_none());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn activate_link_preview_handles_unresolved_and_internal_navigation() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut app = test_app();
@@ -17734,7 +17675,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn invite_confirmation_keyboard_accepts_or_ignores_keys() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let (api, _requests) = api_with_responses(vec![json!({
@@ -17781,7 +17722,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn open_selected_image_background_reports_missing_items() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -17790,7 +17731,7 @@ mod tests {
         assert_eq!(app.status, Some(tr("output-no-items")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn note_and_comment_editors_enforce_selection_and_note_rules() {
         let mut app = test_app();
         app.lists.clear();
@@ -17828,7 +17769,7 @@ mod tests {
         assert_eq!(app.status, Some(tr("output-no-items")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn open_attachment_editor_blocks_note_lists() {
         let mut app = test_app();
         let mut note = test_list();
@@ -17839,7 +17780,7 @@ mod tests {
         assert_eq!(app.status, Some(tr("note-task-mutation-blocked")));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn save_editor_no_ops_without_editor_or_attachment_item() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut app = test_app();
@@ -17872,7 +17813,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn kanban_selection_noops_when_delta_zero_or_selection_unchanged() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -17904,7 +17845,7 @@ mod tests {
         assert!(!app.move_kanban_column_selection(0));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn progress_defaults_and_tag_suggestions_use_kanban_fallbacks() {
         let mut app = test_app();
         let mut blank_columns = test_list();
@@ -17938,7 +17879,7 @@ mod tests {
         assert_eq!(app.tag_suggestions(), vec!["Eggs".to_string()]);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn editor_suggestion_helpers_reject_unknown_progress_and_tags() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -17970,7 +17911,7 @@ mod tests {
         assert!(!app.apply_editor_suggestion(1));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn calendar_due_date_updates_skip_unchanged_and_missing_items() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut app = test_app();
@@ -18048,7 +17989,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn due_date_suffix_and_time_parsing_reject_invalid_values() {
         assert_eq!(due_date_time_suffix("2026-06-17"), None);
         assert_eq!(due_date_time_suffix("2026-06-17X09:30"), None);
@@ -18069,7 +18010,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn text_wrapping_and_fit_cell_handle_zero_and_narrow_widths() {
         assert_eq!(fit_cell("hello", 0), "");
         assert_eq!(
@@ -18086,7 +18027,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_pointer_and_agenda_helpers_handle_edge_sizes() {
         assert_eq!(
             calendar_pointer_date(
@@ -18145,7 +18086,7 @@ mod tests {
         assert_eq!(out[0].0, "2026-07-04");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn editor_field_hints_and_layout_helpers_cover_remaining_branches() {
         assert_eq!(
             editor_field_hint(EditorField::Text, EditorMode::Note),
@@ -18167,7 +18108,7 @@ mod tests {
         assert!(footer_buttons(Rect::new(0, 0, 4, 6), &bindings).is_empty());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn note_link_preview_index_skips_header_and_above_lines() {
         let mut app = test_app();
         let mut note = test_list();
@@ -18201,7 +18142,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn note_mode_lines_skip_empty_link_preview_bucket() {
         let mut app = test_app();
         let mut note = test_list();
@@ -18220,7 +18161,7 @@ mod tests {
         }));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn invite_confirmation_overlay_is_noop_without_pending_invite() {
         let app = test_app();
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -18230,7 +18171,7 @@ mod tests {
         assert!(!terminal_text(&terminal).contains(&tr("tui-invite-confirm-title")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn lists_panel_renders_cached_bootstrap_icon_images() {
         crate::test_env::with_env_lock(|| {
             let _terminal_env = TerminalEnvGuard::clear();
@@ -18260,18 +18201,12 @@ mod tests {
             terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
             assert!(terminal_text(&terminal).contains("Home"));
 
-            match previous_images {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGES_ENV),
-            }
-            match previous_protocol {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV),
-            }
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+            restore_env_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, previous_protocol);
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn list_panel_marks_only_the_selected_list_with_arrow() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -18289,7 +18224,7 @@ mod tests {
         assert!(text.matches('>').count() >= 1);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn list_mode_renders_unselected_item_rows() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -18305,7 +18240,7 @@ mod tests {
         assert!(text.contains("Second task"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn item_detail_refreshes_inline_image_background_during_draw() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut app = App::new(ApiClient::for_tests("https://kramli.test"), false);
@@ -18329,7 +18264,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn item_detail_shows_available_image_state_and_reminder_off() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -18349,7 +18284,7 @@ mod tests {
         assert!(text.contains(&tr("tui-image-state-available")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn kanban_and_calendar_modes_render_empty_item_placeholders() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -18372,7 +18307,7 @@ mod tests {
         assert!(terminal_text(&terminal).contains("Loading items"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn kanban_board_shows_top_scroll_hint_for_long_columns() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -18397,7 +18332,7 @@ mod tests {
         assert!(terminal_text(&terminal).contains('↑'));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn note_and_attachment_editors_render_mode_specific_chrome() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -18452,7 +18387,7 @@ mod tests {
         assert!(terminal_text(&terminal).contains(&tr("attachment-path")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn image_protocol_preference_honors_explicit_env_overrides() {
         crate::test_env::with_env_lock(|| {
             let _terminal_env = TerminalEnvGuard::clear();
@@ -18482,18 +18417,12 @@ mod tests {
                 "sixel"
             );
 
-            match previous_images {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGES_ENV),
-            }
-            match previous_protocol {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV),
-            }
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+            restore_env_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, previous_protocol);
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_pointer_date_handles_separator_and_tiny_month_panels() {
         let month = SimpleDate {
             year: 2026,
@@ -18526,7 +18455,7 @@ mod tests {
         let _ = calendar_pointer_date(content, separator_x.saturating_add(1), monday_row, month);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn build_image_picker_scenarios_clear_terminal_env_between_probes() {
         crate::test_env::with_env_lock(|| {
             let _images = TerminalEnvGuard::clear();
@@ -18574,7 +18503,7 @@ mod tests {
         std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, "seed-protocol");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_tui_entrypoint_reaches_factory_with_configured_credentials() {
         tokio::time::timeout(Duration::from_secs(20), async {
             crate::test_env::with_env_lock_async(|| async {
@@ -18590,7 +18519,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn init_terminal_retries_cleanup_after_alternate_screen_is_already_active() {
         if !std::io::IsTerminal::is_terminal(&io::stdout()) {
             return;
@@ -18605,7 +18534,7 @@ mod tests {
         assert!(second.is_ok() || second.is_err());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn restore_terminal_collects_errors_from_broken_backend_state() {
         if !std::io::IsTerminal::is_terminal(&io::stdout()) {
             return;
@@ -18619,7 +18548,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_event_loop_waits_for_poll_and_drains_quit_after_idle_spin() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -18655,7 +18584,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn list_icon_protocol_creation_failure_marks_icon_as_failed() {
         let mut app = test_app();
         app.picker.set_protocol_type(ProtocolType::Halfblocks);
@@ -18668,7 +18597,7 @@ mod tests {
         assert!(app.failed_list_icons.contains("zero-size"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn open_editor_returns_when_task_mutations_are_blocked_for_tests() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -18679,7 +18608,7 @@ mod tests {
         assert_eq!(app.status, Some(tr("note-task-mutation-blocked")));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn save_editor_skips_network_when_list_or_item_context_is_missing() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut app = test_app();
@@ -18733,7 +18662,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn save_note_editor_skips_when_note_id_is_missing() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut app = test_app();
@@ -18763,7 +18692,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn note_lists_block_toggle_done_and_delete_actions() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut app = test_app();
@@ -18779,7 +18708,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn delete_selected_item_reloads_when_local_copy_is_missing() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let (api, requests) = api_with_responses(vec![
@@ -18811,7 +18740,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn note_mode_mouse_ignores_preview_index_when_preview_list_is_empty() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut app = test_app();
@@ -18844,7 +18773,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn list_icon_new_protocol_failure_marks_icon_as_failed() {
         let mut app = test_app();
         app.force_list_icon_protocol_failure = true;
@@ -18856,7 +18785,7 @@ mod tests {
         assert!(app.failed_list_icons.contains("protocol-fail"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn env_var_restoration_executes_both_some_and_none_branches() {
         crate::test_env::with_env_lock(|| {
             fn restore(key: &str, previous: Option<std::ffi::OsString>) {
@@ -18889,7 +18818,7 @@ mod tests {
         });
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_key_routes_invite_confirmation_before_navigation() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let (api, _requests) = api_with_responses(Vec::new()).await;
@@ -18908,7 +18837,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_key_ignores_unhandled_alt_modified_keys() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut app = test_app();
@@ -18924,7 +18853,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_help_key_keeps_overlay_open_for_unrecognized_keys() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut app = test_app();
@@ -18938,7 +18867,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_navigation_skips_mode_tabs_in_note_view_and_scrolls_detail() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut app = test_app();
@@ -18963,7 +18892,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn select_list_panel_row_updates_selection_and_reloads_items() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let (api, requests) = api_with_responses(vec![
@@ -19001,7 +18930,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn kanban_mode_mouse_noops_when_progress_columns_are_missing() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut app = test_app();
@@ -19022,7 +18951,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn kanban_drag_drop_on_same_column_does_not_persist_move() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut app = test_app();
@@ -19039,7 +18968,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn calendar_mode_mouse_left_click_starts_date_selection() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut app = test_app();
@@ -19076,7 +19005,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn calendar_drag_finish_clears_state_without_target_date() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut app = test_app();
@@ -19103,7 +19032,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn move_kanban_selection_noops_when_target_equals_current_item() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -19112,7 +19041,7 @@ mod tests {
         assert!(!app.move_kanban_selection(99));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn default_progress_value_scans_all_configured_column_names() {
         let mut app = test_app();
         let mut blank_then_named = test_list();
@@ -19141,7 +19070,7 @@ mod tests {
         assert_eq!(app.default_progress_value(), "Archived");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn progress_choices_use_builtin_defaults_when_no_columns_exist() {
         let mut app = test_app();
         let mut blank_columns = test_list();
@@ -19162,7 +19091,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn move_kanban_column_selection_noops_when_target_matches_current() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -19188,7 +19117,7 @@ mod tests {
         assert!(!app.move_kanban_column_selection(0));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_pointer_date_treats_column_separators_as_misses() {
         let month = SimpleDate {
             year: 2026,
@@ -19219,7 +19148,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn profile_panel_renders_debug_image_runtime_lines() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -19237,7 +19166,7 @@ mod tests {
         assert!(text.contains("probe: on"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn list_panel_renders_text_icons_when_inline_images_are_disabled() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -19255,7 +19184,7 @@ mod tests {
         assert!(terminal_text(&terminal).contains("Groceries"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn draw_kanban_mode_returns_when_progress_columns_are_empty() {
         let mut app = test_app();
         app.lists.clear();
@@ -19266,7 +19195,7 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn editor_field_renders_inactive_field_styles() {
         let editor = EditorState {
             mode: EditorMode::Edit,
@@ -19295,7 +19224,7 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn image_preference_name_reports_forced_iterm_protocol() {
         assert_eq!(
             image_preference_name(ImageProtocolPreference::Forced(ProtocolType::Iterm2)),
@@ -19303,7 +19232,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn build_image_picker_auto_probe_applies_env_override_suffix_on_foot() {
         crate::test_env::with_env_lock(|| {
             let _terminal_env = TerminalEnvGuard::clear();
@@ -19320,7 +19249,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn stepped_kanban_wrapped_selection_returns_none_for_missing_columns() {
         assert_eq!(stepped_kanban_selection_wrapped(&[], 0, 1), None);
         assert_eq!(
@@ -19329,7 +19258,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn move_kanban_selection_stops_at_last_item_in_column() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -19338,7 +19267,7 @@ mod tests {
         assert!(!app.move_kanban_selection(1));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn move_selected_item_calendar_hours_skips_unchanged_due_dates() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut app = test_app();
@@ -19380,7 +19309,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn kanban_window_realigns_selected_row_when_it_falls_outside_window() {
         let bucket: Vec<usize> = (0..30).collect();
         let (start, _count, _, _) = kanban_window(&bucket, 0, 4);
@@ -19391,7 +19320,7 @@ mod tests {
         assert!(adjust_start <= 25 && 25 < adjust_start + 3);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn extract_bootstrap_class_icon_skips_invalid_candidates_before_matching() {
         assert_eq!(
             extract_bootstrap_class_icon(r#"<i class="bi bi-Bad_Name bi-cart-fill"></i>"#),
@@ -19399,7 +19328,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn bootstrap_icon_fetch_uses_disk_cache_before_network() {
         tokio::time::timeout(Duration::from_secs(20), async {
             crate::test_env::with_env_lock_async(|| async {
@@ -19420,7 +19349,7 @@ mod tests {
         .expect("test timed out after 20s");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn html_attr_value_reads_unquoted_attribute_values() {
         assert_eq!(
             html_attr_value(r#"<img src=/uploads/photo.jpg alt=pic>"#, "src"),
@@ -19428,7 +19357,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     #[should_panic(expected = "acceptance message expected")]
     fn accept_invite_load_message_guard_rejects_unexpected_variants() {
         let message = LoadMessage::Lists(Ok(vec![]));
@@ -19438,7 +19367,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     #[should_panic(expected = "preview message expected")]
     fn comments_preview_load_message_guard_rejects_unexpected_variants() {
         let message = LoadMessage::Lists(Ok(vec![]));
@@ -19448,7 +19377,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     #[should_panic(expected = "note detail message expected")]
     fn note_detail_load_message_guard_rejects_unexpected_variants() {
         let message = LoadMessage::Lists(Ok(vec![]));
@@ -19458,7 +19387,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     #[should_panic(expected = "acceptance message expected")]
     fn failed_invite_message_guard_rejects_unexpected_variants() {
         let message = LoadMessage::Lists(Ok(vec![]));
@@ -19468,7 +19397,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     #[should_panic(expected = "accept terms message expected")]
     fn legal_consent_message_guard_rejects_unexpected_variants() {
         let message = LoadMessage::Lists(Ok(vec![]));
@@ -19478,7 +19407,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     #[should_panic(expected = "unexpected reload message")]
     fn reload_lists_message_guard_rejects_unexpected_variants() {
         let message = LoadMessage::Items {
@@ -19491,7 +19420,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     #[should_panic(expected = "unexpected items message")]
     fn reload_items_message_guard_rejects_unexpected_variants() {
         let message = LoadMessage::Lists(Ok(vec![]));
@@ -19501,7 +19430,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn image_env_restoration_tests_cover_seeded_previous_values() {
         crate::test_env::with_env_lock(|| {
             seed_terminal_env_for_restoration_coverage();
@@ -19516,34 +19445,16 @@ mod tests {
             std::env::set_var(KITTY_WINDOW_ID_ENV, "1");
             assert_eq!(autodetect_protocol_fallback(), Some(ProtocolType::Kitty));
 
-            match previous_term {
-                Some(value) => std::env::set_var(TERM_ENV, value),
-                None => std::env::remove_var(TERM_ENV),
-            }
-            match previous_program {
-                Some(value) => std::env::set_var(TERM_PROGRAM_ENV, value),
-                None => std::env::remove_var(TERM_PROGRAM_ENV),
-            }
-            match previous_lc_terminal {
-                Some(value) => std::env::set_var(LC_TERMINAL_ENV, value),
-                None => std::env::remove_var(LC_TERMINAL_ENV),
-            }
-            match previous_kitty {
-                Some(value) => std::env::set_var(KITTY_WINDOW_ID_ENV, value),
-                None => std::env::remove_var(KITTY_WINDOW_ID_ENV),
-            }
-            match previous_iterm {
-                Some(value) => std::env::set_var(ITERM_SESSION_ID_ENV, value),
-                None => std::env::remove_var(ITERM_SESSION_ID_ENV),
-            }
-            match previous_wt {
-                Some(value) => std::env::set_var(WT_SESSION_ENV, value),
-                None => std::env::remove_var(WT_SESSION_ENV),
-            }
+            restore_env_var(TERM_ENV, previous_term);
+            restore_env_var(TERM_PROGRAM_ENV, previous_program);
+            restore_env_var(LC_TERMINAL_ENV, previous_lc_terminal);
+            restore_env_var(KITTY_WINDOW_ID_ENV, previous_kitty);
+            restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
+            restore_env_var(WT_SESSION_ENV, previous_wt);
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn build_image_picker_restores_seeded_env_after_auto_probe() {
         crate::test_env::with_env_lock(|| {
             seed_terminal_env_for_restoration_coverage();
@@ -19562,30 +19473,15 @@ mod tests {
                 build_image_picker(ImageProtocolPreference::Auto);
             assert!(enabled);
 
-            match previous_images {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGES_ENV),
-            }
-            match previous_term {
-                Some(value) => std::env::set_var(TERM_ENV, value),
-                None => std::env::remove_var(TERM_ENV),
-            }
-            match previous_program {
-                Some(value) => std::env::set_var(TERM_PROGRAM_ENV, value),
-                None => std::env::remove_var(TERM_PROGRAM_ENV),
-            }
-            match previous_lc_terminal {
-                Some(value) => std::env::set_var(LC_TERMINAL_ENV, value),
-                None => std::env::remove_var(LC_TERMINAL_ENV),
-            }
-            match previous_iterm {
-                Some(value) => std::env::set_var(ITERM_SESSION_ID_ENV, value),
-                None => std::env::remove_var(ITERM_SESSION_ID_ENV),
-            }
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+            restore_env_var(TERM_ENV, previous_term);
+            restore_env_var(TERM_PROGRAM_ENV, previous_program);
+            restore_env_var(LC_TERMINAL_ENV, previous_lc_terminal);
+            restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn image_protocol_preference_restores_seeded_env_overrides() {
         crate::test_env::with_env_lock(|| {
             seed_terminal_env_for_restoration_coverage();
@@ -19596,18 +19492,12 @@ mod tests {
                 image_protocol_preference(),
                 ImageProtocolPreference::Forced(ProtocolType::Sixel)
             ));
-            match previous_images {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGES_ENV),
-            }
-            match previous_protocol {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV),
-            }
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+            restore_env_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, previous_protocol);
         });
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn lists_panel_cached_icon_rendering_restores_seeded_image_env() {
         tokio::time::timeout(Duration::from_secs(20), async {
             crate::test_env::with_env_lock_async(|| async {
@@ -19635,18 +19525,621 @@ mod tests {
                 let mut terminal =
                     Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
                 terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
-                match previous_images {
-                    Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
-                    None => std::env::remove_var(KRAMLI_TUI_IMAGES_ENV),
-                }
-                match previous_protocol {
-                    Some(value) => std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, value),
-                    None => std::env::remove_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV),
-                }
+                restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+                restore_env_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, previous_protocol);
             })
             .await;
         })
         .await
         .expect("test timed out after 20s");
+    }
+
+    fn injected_terminal_io_error(message: &str) -> io::Error {
+        io::Error::new(io::ErrorKind::Other, message)
+    }
+
+    #[kramli_test_macros::test]
+    fn init_terminal_hooks_return_error_when_raw_mode_setup_fails() {
+        let result = init_terminal_with_hooks(
+            || Err(injected_terminal_io_error("enable raw failed")),
+            || Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+            |stdout| Terminal::new(CrosstermBackend::new(stdout)),
+        );
+        assert_eq!(result.unwrap_err(), "enable raw failed");
+    }
+
+    #[kramli_test_macros::test]
+    fn init_terminal_hooks_cleanup_raw_mode_when_alternate_screen_fails() {
+        let disable_calls = std::cell::Cell::new(0);
+        let result = init_terminal_with_hooks(
+            || Ok(()),
+            || {
+                disable_calls.set(disable_calls.get() + 1);
+                Ok(())
+            },
+            |_| Err(injected_terminal_io_error("enter screen failed")),
+            |_| Ok(()),
+            |stdout| Terminal::new(CrosstermBackend::new(stdout)),
+        );
+        assert_eq!(result.unwrap_err(), "enter screen failed");
+        assert_eq!(disable_calls.get(), 1);
+    }
+
+    #[kramli_test_macros::test]
+    fn init_terminal_hooks_cleanup_when_terminal_construction_fails() {
+        let disable_calls = std::cell::Cell::new(0);
+        let leave_calls = std::cell::Cell::new(0);
+        let result = init_terminal_with_hooks(
+            || Ok(()),
+            || {
+                disable_calls.set(disable_calls.get() + 1);
+                Ok(())
+            },
+            |_| Ok(()),
+            |_| {
+                leave_calls.set(leave_calls.get() + 1);
+                Ok(())
+            },
+            |_| Err(injected_terminal_io_error("terminal new failed")),
+        );
+        assert_eq!(result.unwrap_err(), "terminal new failed");
+        assert_eq!(disable_calls.get(), 1);
+        assert_eq!(leave_calls.get(), 1);
+    }
+
+    struct FailShowCursorBackend {
+        inner: ratatui::backend::TestBackend,
+    }
+
+    impl ratatui::backend::Backend for FailShowCursorBackend {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.draw(content).map_err(|never| match never {})
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.hide_cursor().map_err(|never| match never {})
+        }
+
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            Err(injected_terminal_io_error("show cursor failed"))
+        }
+
+        fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+            self.inner
+                .get_cursor_position()
+                .map_err(|never| match never {})
+        }
+
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            self.inner
+                .set_cursor_position(position)
+                .map_err(|never| match never {})
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.inner.clear().map_err(|never| match never {})
+        }
+
+        fn clear_region(
+            &mut self,
+            clear_type: ratatui::backend::ClearType,
+        ) -> Result<(), Self::Error> {
+            self.inner
+                .clear_region(clear_type)
+                .map_err(|never| match never {})
+        }
+
+        fn size(&self) -> Result<Size, Self::Error> {
+            self.inner.size().map_err(|never| match never {})
+        }
+
+        fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
+            self.inner.window_size().map_err(|never| match never {})
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.inner.flush().map_err(|never| match never {})
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn restore_terminal_hooks_collect_disable_raw_mode_failure() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let result = restore_terminal_with_hooks(
+            &mut terminal,
+            || Err(injected_terminal_io_error("disable raw failed")),
+            |_| Ok(()),
+        );
+        assert_eq!(result.unwrap_err(), "disable raw failed");
+    }
+
+    #[kramli_test_macros::test]
+    fn restore_terminal_hooks_collect_leave_screen_failure() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let result = restore_terminal_with_hooks(
+            &mut terminal,
+            || Ok(()),
+            |_| Err(injected_terminal_io_error("leave screen failed")),
+        );
+        assert_eq!(result.unwrap_err(), "leave screen failed");
+    }
+
+    #[kramli_test_macros::test]
+    fn restore_terminal_hooks_collect_show_cursor_failure() {
+        let mut terminal = Terminal::new(FailShowCursorBackend {
+            inner: ratatui::backend::TestBackend::new(80, 24),
+        })
+        .unwrap();
+        let result = restore_terminal_with_hooks(&mut terminal, || Ok(()), |_| Ok(()));
+        assert_eq!(result.unwrap_err(), "show cursor failed");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn run_tui_entrypoint_invokes_default_prepare_closure() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            crate::test_env::with_env_lock_async(|| async {
+                std::env::set_var("KRAMLI_URL", "http://127.0.0.1:9");
+                std::env::set_var("KRAMLI_API_KEY", "kramli_test");
+                let outcome = run_tui_with_terminal_factory(
+                    ApiClient::for_tests("http://127.0.0.1:9"),
+                    false,
+                    || {
+                        Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+                            .map_err(|error| error.to_string())
+                    },
+                    |_| Ok(()),
+                    |app| {
+                        app.beta_consent_pending = false;
+                        app.should_quit = true;
+                    },
+                )
+                .await;
+                assert!(outcome.is_ok());
+            })
+            .await;
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    fn run_tui_entrypoint_under_pseudo_terminal() {
+        run_tui_test_in_pseudo_terminal("run_tui_entrypoint_tty_case");
+    }
+
+    #[kramli_test_macros::test]
+    #[ignore = "requires pseudo-terminal for real init_terminal coverage"]
+    fn run_tui_entrypoint_tty_case() {
+        if !std::io::IsTerminal::is_terminal(&io::stdout()) {
+            return;
+        }
+        let mut terminal = init_terminal().expect("init_terminal should succeed on a tty");
+        restore_terminal(&mut terminal).expect("restore_terminal should succeed on a tty");
+    }
+
+    #[kramli_test_macros::test]
+    fn run_tui_entrypoint_runs_under_pseudo_terminal() {
+        run_tui_entrypoint_under_pseudo_terminal();
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn note_link_preview_click_ignores_out_of_range_index() {
+        let mut app = test_app();
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.apply_note_detail_result(
+            1,
+            Ok(json!({"note_content": "See https://example.test/link for details"})),
+        );
+        app.link_previews.insert(note_preview_owner(1), Vec::new());
+        let content = Rect::new(10, 5, 60, 20);
+        let inner = content.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        app.handle_note_mode_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), inner.x + 1, inner.y),
+            content,
+            true,
+        )
+        .await
+        .expect("out-of-range preview click should be ignored");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn kanban_mouse_handler_returns_when_progress_columns_are_empty() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Orphan")];
+        app.mode = ViewMode::Kanban;
+        app.force_empty_kanban_columns = true;
+        app.handle_kanban_mode_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 5, 5),
+            Rect::new(0, 0, 80, 24),
+            true,
+            false,
+            false,
+        )
+        .await
+        .expect("empty kanban columns should no-op");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn kanban_drag_release_on_same_column_does_not_move_item() {
+        let (api, requests) = api_with_responses(Vec::new()).await;
+        let mut app = App::new(api, true);
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Stay")];
+        app.mode = ViewMode::Kanban;
+        app.selected_item = 0;
+        app.kanban_drag_item = Some(0);
+        app.kanban_drag_started = true;
+        app.kanban_drag_source_column = Some(0);
+        app.kanban_drag_target_column = Some(0);
+        let moved = app
+            .finish_kanban_drag(Some(0))
+            .await
+            .expect("same-column release should succeed");
+        assert!(!moved);
+        let requests = requests.await.expect("test server should finish");
+        assert!(requests.is_empty());
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn calendar_left_down_click_opens_add_editor_from_empty_agenda() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.mode = ViewMode::Calendar;
+        app.calendar_visible_month = Some(today_utc());
+        let content = Rect::new(0, 0, 80, 24);
+        app.handle_calendar_mode_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 70, 20),
+            content,
+            true,
+            false,
+            false,
+        )
+        .await
+        .expect("empty agenda click should succeed");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn calendar_drag_to_same_date_skips_network_update() {
+        let (api, requests) = api_with_responses(Vec::new()).await;
+        let mut app = App::new(api, true);
+        app.lists = vec![test_list()];
+        let mut item = sample_item(1, "Same day");
+        item.due_date = Some("2026-07-10".to_string());
+        app.items = vec![item];
+        app.mode = ViewMode::Calendar;
+        app.calendar_visible_month = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 1,
+        });
+        app.calendar_drag_item = Some(0);
+        app.calendar_drag_started = true;
+        app.calendar_drag_source_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 10,
+        });
+        app.calendar_drag_target_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 10,
+        });
+        app.finish_started_calendar_drag(
+            Rect::new(0, 0, 80, 24),
+            mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
+        )
+        .await
+        .expect("same-date drag should clear without update");
+        assert!(requests.await.expect("test server should finish").is_empty());
+    }
+
+    #[kramli_test_macros::test]
+    fn move_kanban_selection_is_inert_when_target_matches_current_item() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Only")];
+        app.selected_item = 0;
+        app.mode = ViewMode::Kanban;
+        assert!(!app.move_kanban_selection(1));
+    }
+
+    #[kramli_test_macros::test]
+    fn default_progress_value_falls_back_when_every_column_name_is_blank() {
+        let mut app = test_app();
+        let mut blank_columns = test_list();
+        blank_columns.states = Some(vec![ApiListState {
+            name: Some("   ".to_string()),
+            color: None,
+            is_done: Some(false),
+        }]);
+        app.lists = vec![blank_columns];
+        assert_eq!(app.default_progress_value(), tr("tui-kanban-open"));
+    }
+
+    #[kramli_test_macros::test]
+    fn progress_suggestions_use_defaults_when_columns_are_blank() {
+        let mut app = test_app();
+        let mut blank_columns = test_list();
+        blank_columns.states = Some(vec![ApiListState {
+            name: Some("   ".to_string()),
+            color: None,
+            is_done: Some(false),
+        }]);
+        app.lists = vec![blank_columns];
+        let suggestions = app.progress_suggestions();
+        assert_eq!(suggestions.len(), 3);
+        assert!(suggestions.contains(&tr("tui-kanban-open")));
+    }
+
+    #[kramli_test_macros::test]
+    fn apply_editor_suggestion_returns_false_when_editor_is_missing() {
+        let mut app = test_app();
+        app.editor = None;
+        assert!(!app.apply_editor_suggestion(1));
+    }
+
+    #[kramli_test_macros::test]
+    fn move_kanban_column_selection_is_inert_when_selection_is_unchanged() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Only")];
+        app.selected_item = 0;
+        app.mode = ViewMode::Kanban;
+        assert!(!app.move_kanban_column_selection(0));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn move_selected_item_calendar_hours_is_inert_when_due_date_is_unchanged() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        let mut item = sample_item(1, "Fixed");
+        item.due_date = Some("2026-07-10".to_string());
+        app.items = vec![item];
+        app.mode = ViewMode::Calendar;
+        app.selected_item = 0;
+        app.calendar_selected_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 10,
+        });
+        assert!(
+            !app.move_selected_item_calendar_hours(0)
+                .await
+                .expect("unchanged hour delta should succeed")
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn calendar_pointer_date_returns_none_for_column_gutter() {
+        let month = SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 1,
+        };
+        let content = Rect::new(0, 0, 40, 20);
+        let (_, month_area) = calendar_panel_layout(content.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        }));
+        let inner = month_area.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let widths = calendar_cell_widths(inner.width.saturating_sub(6));
+        let monday_row = inner.y.saturating_add(1);
+        let gutter_x = inner.x
+            + widths
+                .iter()
+                .take(1)
+                .sum::<u16>()
+            + 1;
+        assert_eq!(
+            calendar_pointer_date(content, gutter_x, monday_row, month),
+            None
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn draw_kanban_mode_returns_when_progress_columns_are_missing() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "No columns")];
+        app.mode = ViewMode::Kanban;
+        app.force_empty_kanban_columns = true;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+    }
+
+    #[kramli_test_macros::test]
+    fn profile_panel_renders_debug_image_runtime_lines_in_debug_builds() {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.profile_name = Some("Debug".to_string());
+        app.image_runtime_info = Some("images: kitty".to_string());
+        app.image_runtime_debug = vec!["probe: on".to_string()];
+        app.lists = vec![test_list()];
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        assert!(terminal_text(&terminal).contains("probe: on"));
+    }
+
+    #[kramli_test_macros::test]
+    fn list_panel_renders_bootstrap_icon_targets_for_nested_folders() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.set_inline_images_enabled(true);
+        app.picker.set_protocol_type(ProtocolType::Halfblocks);
+        app.lists = vec![
+            test_shopping_list(1, "Root", Some("folder2"), None, None, false),
+            test_shopping_list(2, "Child", Some("cart-fill"), Some(1), Some("Root"), false),
+        ];
+        app.apply_list_icon_result("folder2".to_string(), Ok(DynamicImage::new_rgba8(2, 2)));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        assert!(terminal_text(&terminal).contains("Root"));
+    }
+
+    #[kramli_test_macros::test]
+    fn build_image_picker_auto_probe_uses_env_override_suffix_for_iterm() {
+        crate::test_env::with_env_lock(|| {
+            let _terminal_env = TerminalEnvGuard::clear();
+            let previous_images = std::env::var_os(KRAMLI_TUI_IMAGES_ENV);
+            std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
+            std::env::set_var(TERM_ENV, "xterm-256color");
+            std::env::set_var(TERM_PROGRAM_ENV, "WezTerm");
+            std::env::set_var(LC_TERMINAL_ENV, "iTerm2");
+            std::env::set_var(ITERM_SESSION_ID_ENV, "session");
+            let (_picker, enabled, summary, _debug) =
+                build_image_picker(ImageProtocolPreference::Auto);
+            assert!(enabled);
+            assert!(summary.contains("probe+iterm") || summary.contains("probe+env"));
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+        });
+    }
+
+    #[kramli_test_macros::test]
+    fn stepped_kanban_selection_returns_none_for_empty_bucket() {
+        let buckets = vec![vec![1], vec![]];
+        assert_eq!(stepped_kanban_selection(&buckets, 1, 1), None);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn fetch_bootstrap_icon_image_uses_cached_bytes_when_render_succeeds() {
+        let icon = format!("cached-icon-{}", std::process::id());
+        let cache_path = bootstrap_icon_cache_path(&icon).expect("cache path");
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let svg = r#"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='#fff'/></svg>"#;
+        fs::write(&cache_path, svg.as_bytes()).unwrap();
+        let image = fetch_bootstrap_icon_image(&icon).await.expect("cached icon");
+        assert!(image.width() > 0);
+        assert!(image.height() > 0);
+        let _ = fs::remove_file(cache_path);
+    }
+
+    #[kramli_test_macros::test]
+    fn write_cached_bootstrap_icon_noops_when_cache_path_is_unavailable() {
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(write_cached_bootstrap_icon("", b"svg"));
+    }
+
+    #[kramli_test_macros::test]
+    fn extract_html_image_source_reads_data_src_attribute() {
+        assert_eq!(
+            extract_html_image_source(r#"<img data-src="/uploads/note.png">"#).as_deref(),
+            Some("/uploads/note.png")
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn accept_invite_load_message_guard_accepts_expected_variant() {
+        let message = LoadMessage::AcceptInvite {
+            list_id: Some(7),
+            result: Ok(json!({"list_id": 7})),
+        };
+        match message {
+            LoadMessage::AcceptInvite { .. } => {}
+            _ => panic!("acceptance message expected"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn link_previews_load_message_guard_accepts_expected_variant() {
+        let message = LoadMessage::LinkPreviews {
+            owner: item_preview_owner(1),
+            identity: PreviewRequestIdentity {
+                generation: 1,
+                fingerprint: 1,
+            },
+            previews: vec![],
+        };
+        match message {
+            LoadMessage::LinkPreviews { .. } => {}
+            _ => panic!("preview message expected"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn note_detail_load_message_guard_accepts_expected_variant() {
+        let message = LoadMessage::NoteDetail {
+            list_id: 1,
+            result: Ok(json!({"note_content": "Plain"})),
+        };
+        match message {
+            LoadMessage::NoteDetail { .. } => {}
+            _ => panic!("note detail message expected"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn reload_lists_load_message_guard_accepts_expected_variant() {
+        let message = LoadMessage::Lists(Ok(vec![]));
+        match message {
+            LoadMessage::Lists(_) => {}
+            _ => panic!("unexpected reload message"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn reload_items_load_message_guard_accepts_expected_variant() {
+        let message = LoadMessage::Items {
+            list_id: 1,
+            result: Ok(vec![]),
+        };
+        match message {
+            LoadMessage::Items { .. } => {}
+            _ => panic!("unexpected items message"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn legal_consent_load_message_guard_accepts_expected_variant() {
+        let message = LoadMessage::AcceptTerms {
+            result: Ok(json!({"legal": {"pending": []}})),
+        };
+        match message {
+            LoadMessage::AcceptTerms { .. } => {}
+            _ => panic!("accept terms message expected"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn restore_terminal_on_real_stdout_when_available() {
+        if !std::io::IsTerminal::is_terminal(&io::stdout()) {
+            return;
+        }
+        let backend = CrosstermBackend::new(io::stdout());
+        if let Ok(mut terminal) = Terminal::new(backend) {
+            restore_terminal(&mut terminal).expect("restore should succeed on stdout tty");
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn init_terminal_on_real_stdout_when_available() {
+        if !std::io::IsTerminal::is_terminal(&io::stdout()) {
+            return;
+        }
+        let mut terminal = init_terminal().expect("init should succeed on stdout tty");
+        restore_terminal(&mut terminal).expect("restore should succeed on stdout tty");
     }
 }

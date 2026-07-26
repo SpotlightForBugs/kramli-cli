@@ -188,7 +188,7 @@ pub(crate) fn mutation_id() -> String {
 mod tests {
     use super::*;
 
-    #[test]
+    #[kramli_test_macros::test]
     fn validates_only_lossless_plain_deltas() {
         let plain = json!({
             "list_type": "note",
@@ -224,7 +224,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn collects_link_sources_from_note_delta() {
         let payload = json!({
             "list_type": "note",
@@ -248,7 +248,7 @@ mod tests {
             .any(|text| text.contains("PvxNDHrxliG3YtBaq-k1fg.json")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn normalize_list_type_handles_whitespace_and_unknown_aliases() {
         assert_eq!(normalize_list_type(Some("  ".to_string())), None);
         assert_eq!(
@@ -261,7 +261,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn collect_note_link_sources_handles_delta_edge_cases() {
         let content_only = json!({
             "list_type": "note",
@@ -294,7 +294,7 @@ mod tests {
         assert!(sources.contains(&"https://kramli.de/privacy".to_string()));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn collect_note_link_sources_reads_embed_uri_without_source() {
         let delta = json!({
             "list_type": "note",
@@ -306,7 +306,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn collect_note_link_sources_reads_embed_source_and_uri() {
         let delta = json!({
             "list_type": "note",
@@ -317,7 +317,7 @@ mod tests {
         assert!(sources.contains(&"https://kramli.de/uri".to_string()));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn collect_note_link_sources_skips_whitespace_only_insert_text() {
         let delta = json!({
             "list_type": "note",
@@ -326,7 +326,7 @@ mod tests {
         assert!(collect_note_link_sources(&delta).is_empty());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn collect_note_link_sources_skips_numeric_insert_operations() {
         let delta = json!({
             "list_type": "note",
@@ -335,7 +335,7 @@ mod tests {
         assert!(collect_note_link_sources(&delta).is_empty());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn collect_note_link_sources_skips_non_preview_embeds_and_non_text_inserts() {
         let delta = json!({
             "list_type": "note",
@@ -348,7 +348,7 @@ mod tests {
         assert!(collect_note_link_sources(&delta).is_empty());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn collect_note_link_sources_reads_anchor_attributes() {
         let delta = json!({
             "list_type": "note",
@@ -360,7 +360,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn validate_plain_note_accepts_empty_delta_operations() {
         let payload = json!({
             "list_type": "note",
@@ -373,7 +373,7 @@ mod tests {
         assert_eq!(parsed.delta, "");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn builds_versioned_payload_and_preserves_clear() {
         let current = json!({
             "list_type": "note",

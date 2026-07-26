@@ -185,7 +185,7 @@ mod tests {
             .collect()
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn every_locale_has_same_keys_as_english() {
         let en_path = locale_file("en");
         let en_content = fs::read_to_string(&en_path)
@@ -224,12 +224,12 @@ mod tests {
         crate::test_env::with_env_lock(|| with_env_var_inner(key, value, f))
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn normalize_candidate_rejects_modifier_only_values() {
         assert_eq!(normalize_candidate("@euro"), None);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn detect_locale_reads_lang_and_defaults_to_english() {
         crate::test_env::with_env_vars(
             &[
@@ -255,23 +255,23 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn try_parse_supported_locale_rejects_supported_language_tags_with_unsupported_script() {
         assert!(try_parse_supported_locale("haw-US").is_none());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn try_parse_supported_locale_accepts_primary_language_when_full_tag_is_invalid() {
         assert_eq!(try_parse_supported_locale("de-").unwrap().to_string(), "de");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn extract_keys_skips_equals_only_key_lines() {
         let keys = extract_keys("valid = Value\n= blank\n");
         assert_eq!(keys, vec!["valid".to_string()]);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn try_parse_supported_locale_uses_primary_language_fallback() {
         assert_eq!(
             try_parse_supported_locale("de-XX").unwrap().to_string(),
@@ -280,19 +280,19 @@ mod tests {
         assert!(try_parse_supported_locale("haw-US").is_none());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn try_parse_supported_locale_rejects_supported_language_with_unsupported_region() {
         assert!(try_parse_supported_locale("haw-US").is_none());
         assert_eq!(try_parse_supported_locale("de").unwrap().to_string(), "de");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn extract_keys_skips_blank_key_lines() {
         let keys = extract_keys("valid = Value\n = blank\n");
         assert_eq!(keys, vec!["valid".to_string()]);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn try_parse_supported_locale_rejects_unsupported_primary_language() {
         assert!(try_parse_supported_locale("haw-US").is_none());
         assert_eq!(
@@ -301,13 +301,13 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn extract_keys_skips_blank_and_continuation_lines() {
         let keys = extract_keys("valid = Value\n   continuation\n\n# comment\n = blank\n");
         assert_eq!(keys, vec!["valid".to_string()]);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn locale_candidate_parsing_handles_empty_charset_modifier_and_fallbacks() {
         assert_eq!(normalize_candidate("  "), None);
         assert_eq!(
@@ -326,7 +326,7 @@ mod tests {
         assert_eq!(parse_supported_locale("xx-YY").to_string(), "en");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn locale_env_and_profile_helpers_cover_explicit_and_default_paths() {
         with_env_var(KRAMLI_LANG_ENV, Some("fr_FR.UTF-8"), || {
             assert!(is_explicit_lang_set());
@@ -350,7 +350,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn env_helper_restores_existing_lang_value() {
         crate::test_env::with_env_lock(|| {
             std::env::set_var(KRAMLI_LANG_ENV, "en");
@@ -364,7 +364,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn translations_with_and_without_arguments_are_returned() {
         assert!(set_locale("en"));
         assert!(!tr("label-items").is_empty());

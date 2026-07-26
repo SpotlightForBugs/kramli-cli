@@ -571,7 +571,7 @@ mod tests {
         telemetry.and_then(parse_env_bool).unwrap_or(false)
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn telemetry_is_disabled_until_consent_or_env_enable() {
         assert!(!is_enabled_from_values(None, None, None));
         assert!(!is_enabled_from_values(None, None, Some("invalid")));
@@ -580,7 +580,7 @@ mod tests {
         assert!(is_enabled_from_values(None, None, Some("true")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn dnt_and_no_telemetry_override_explicit_enable() {
         assert!(!is_enabled_from_values(Some("1"), None, None));
         assert!(!is_enabled_from_values(Some("maybe"), None, None));
@@ -589,7 +589,7 @@ mod tests {
         assert!(!is_enabled_from_values(None, Some("yes"), Some("true")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn telemetry_env_helpers_parse_sampling_and_error_capture() {
         with_env_var(KRAMLI_TRACES_SAMPLE_RATE_ENV, None, || {
             assert_eq!(traces_sample_rate(), 1.0);
@@ -621,7 +621,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn telemetry_env_helper_restores_existing_values() {
         let _guard = ENV_LOCK.lock().expect("telemetry env lock poisoned");
         std::env::set_var(KRAMLI_TRACES_SAMPLE_RATE_ENV, "0.5");
@@ -640,7 +640,7 @@ mod tests {
         std::env::remove_var(KRAMLI_TRACES_SAMPLE_RATE_ENV);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn drops_response_body() {
         let msg = "Could not parse response: expected value\nBody: {\"email\":\"a@b.com\"}";
         let scrubbed = scrub_message(msg);
@@ -649,14 +649,14 @@ mod tests {
         assert!(scrubbed.starts_with("Could not parse response:"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn drops_response_body_with_spaced_marker() {
         let msg = "Failed\n  Body : sensitive@example.com";
         assert_eq!(scrub_message(msg), "Failed");
         assert_eq!(body_prefix("Failed\nBody: sensitive@example.com"), "Failed");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn redaction_helpers_cover_empty_tokens_and_jwts() {
         assert_eq!(redact_token("   "), "   ");
 
@@ -666,7 +666,7 @@ mod tests {
         assert!(!looks_like_jwt("short.parts.no"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn redacts_api_key() {
         let msg = "Invalid API key: kramli_abcDEF123456 rejected";
         let scrubbed = scrub_message(msg);
@@ -674,14 +674,14 @@ mod tests {
         assert!(!scrubbed.contains("abcDEF123456"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn redacts_email() {
         let scrubbed = scrub_message("login failed for user@example.com today");
         assert!(scrubbed.contains("[REDACTED_EMAIL]"));
         assert!(!scrubbed.contains("user@example.com"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn redacts_common_secret_shapes() {
         let scrubbed = scrub_message(
             "token=abc123 Authorization: Bearer redaction-test-bearer-token https://kram.li/i/invite-secret",
@@ -694,7 +694,7 @@ mod tests {
         assert!(!scrubbed.contains("redaction-test-bearer-token"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn redacts_compact_authorization_headers() {
         let scrubbed = scrub_message(
             "Authorization:Bearer compact-secret Authorization:BearerInlineSecret bearer=another-secret",
@@ -707,7 +707,7 @@ mod tests {
         assert!(!scrubbed.contains("another-secret"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn keeps_plain_messages() {
         assert_eq!(
             scrub_message("Network error: timeout"),
@@ -715,7 +715,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn route_templates_drop_ids_tokens_and_query_values() {
         assert_eq!(route_template("/"), "/");
         assert_eq!(
@@ -737,7 +737,7 @@ mod tests {
         assert_eq!(status_class(503), "5xx");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn disabled_trace_wrappers_are_inert() {
         let transaction = TraceTransaction::start("test.transaction", "test");
         transaction.finish(true);
@@ -762,7 +762,7 @@ mod tests {
         span.set_status(false);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn enabled_trace_wrappers_cover_active_scope_paths() {
         with_env_var(TEST_KRAMLI_TELEMETRY_ENV, Some("true"), || {
             {
@@ -788,7 +788,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn scrub_event_keeps_only_safe_trace_tags() {
         let event = Event {
             transaction: Some("cli.command".to_string()),
@@ -813,7 +813,7 @@ mod tests {
         assert!(!scrubbed.tags.contains_key("email"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn scrub_event_drops_sensitive_structured_fields() {
         let mut event = Event {
             message: Some("Failed for user@example.com".to_string()),
@@ -864,7 +864,7 @@ mod tests {
         assert!(exc.mechanism.is_none());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn body_prefix_strips_response_body_lines() {
         assert_eq!(
             body_prefix("Request failed\nBody: {\"secret\":\"value\"}"),
@@ -873,7 +873,7 @@ mod tests {
         assert_eq!(body_prefix("No body here"), "No body here");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn trace_span_applies_tags_data_and_status_with_active_sentry() {
         let _guard = sentry::init((
             "https://9435ede2d0d8eceedf3b3e0eb5cb6aff@o4509985277018112.ingest.de.sentry.io/4510966154002512",
@@ -900,7 +900,7 @@ mod tests {
         transaction.finish(true);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn trace_span_drop_applies_cancelled_status_with_active_sentry() {
         let _guard = sentry::init((
             "https://9435ede2d0d8eceedf3b3e0eb5cb6aff@o4509985277018112.ingest.de.sentry.io/4510966154002512",
@@ -928,7 +928,7 @@ mod tests {
         transaction.finish(true);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn trace_span_helpers_are_safe_without_active_client() {
         let span = TraceSpan::child("test.child", "test.child");
         span.set_tag("operation", "demo");
@@ -938,7 +938,7 @@ mod tests {
         span.finish();
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn body_prefix_stops_at_first_body_marker_in_multiline_messages() {
         assert_eq!(
             body_prefix("First line\nSecond\nBody: secret"),
@@ -946,7 +946,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn trace_span_drop_finishes_unfinished_spans_as_cancelled() {
         with_env_var(TEST_KRAMLI_TELEMETRY_ENV, Some("true"), || {
             let span = TraceSpan::child_with_enabled("test.child", "child", true);
@@ -956,7 +956,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn trace_transaction_finish_handles_error_capture_branches() {
         with_env_var(KRAMLI_CAPTURE_COMMAND_ERRORS_ENV, Some("yes"), || {
             let tx = TraceTransaction::start("test.command", "test.command");

@@ -1,0 +1,6 @@
+[profile.default]
+test-timeout = "20s"
+slow-timeout = { period = "20s", terminate-after = 1 }
+
+[profile.default.junit]
+path = "target/nextest/junit.xml"

@@ -429,7 +429,7 @@ mod tests {
         result
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn whitespace_config_path_falls_back_to_default() {
         let path = std::env::temp_dir()
             .join("kramli-clean-config-test")
@@ -455,7 +455,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn explicit_config_path_is_used_without_touching_user_home() {
         let path = std::env::temp_dir()
             .join("kramli-explicit-config-test")
@@ -508,7 +508,7 @@ mod tests {
         result
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn unset_preferences_are_disabled_until_user_answers() {
         with_clean_config_env(|| {
             let cfg = config_file(None, None);
@@ -517,7 +517,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn saved_preferences_control_telemetry_and_bootstrap_icons() {
         with_clean_config_env(|| {
             let cfg = config_file(Some(true), Some(true));
@@ -530,7 +530,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn env_bool_parser_accepts_common_forms() {
         assert_eq!(parse_env_bool("1"), Some(true));
         assert_eq!(parse_env_bool(" yes "), Some(true));
@@ -539,7 +539,7 @@ mod tests {
         assert_eq!(parse_env_bool("later"), None);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn config_getters_setters_and_reset_cover_persisted_fields() {
         with_clean_config_env(|| {
             let mut cfg = config_file(Some(true), Some(false));
@@ -572,7 +572,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn load_from_existing_config_file_covers_parse_branch() {
         with_clean_config_env(|| {
             let path = std::env::temp_dir().join(format!(
@@ -603,7 +603,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn missing_config_file_and_save_path_are_covered() {
         with_clean_config_env(|| {
             let path = std::env::temp_dir()
@@ -628,7 +628,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn save_wrapper_uses_default_config_path() {
         let home = std::env::temp_dir().join(format!("kramli-config-home-{}", std::process::id()));
         let home_value = home.to_string_lossy().to_string();
@@ -667,13 +667,13 @@ mod tests {
         let _ = fs::remove_dir_all(home);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn save_to_path_skips_parent_creation_when_path_has_no_parent() {
         let cfg = config_file(None, None);
         assert!(cfg.save_to_path(std::path::Path::new("/")).is_err());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn save_to_path_creates_missing_parent_directories() {
         with_clean_config_env(|| {
             let parent =
@@ -688,14 +688,14 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn save_to_path_reports_create_dir_errors() {
         let path = std::path::PathBuf::from("/proc/kramli-config-unwritable/config.json");
         let cfg = config_file(None, None);
         assert!(cfg.save_to_path(&path).is_err());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn set_and_delete_api_key_cover_keychain_paths() {
         with_clean_config_env(|| {
             let cfg = Config::load();
@@ -704,14 +704,14 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn keyring_entry_can_be_constructed() {
         with_clean_config_env(|| {
             assert!(Config::keyring_entry(KEYRING_API_KEY).is_ok());
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn keychain_fallback_branches_are_testable_without_system_keychain() {
         with_clean_config_env(|| {
             let _guard = TEST_KEYCHAIN_LOCK.lock().expect("test lock poisoned");
@@ -735,7 +735,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn environment_overrides_cover_config_branches() {
         with_env_vars(
             &[
@@ -774,7 +774,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn environment_helpers_cover_truthy_and_override_paths() {
         with_env_vars(&[(TEST_BOOL_ENV, " YES ")], || {
             assert!(env_is_truthy(TEST_BOOL_ENV));
@@ -808,7 +808,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn env_test_helper_restores_existing_values() {
         crate::test_env::with_env_lock(|| {
             std::env::set_var(TEST_BOOL_ENV, "before");

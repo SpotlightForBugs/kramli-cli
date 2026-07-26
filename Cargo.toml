@@ -49,3 +49,4 @@ lto = "thin"
 
 [dev-dependencies]
 http = "1"
+kramli-test-macros = { path = "kramli-test-macros" }

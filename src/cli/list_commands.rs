@@ -309,7 +309,7 @@ mod tests {
         (ApiClient::for_tests(&base_url), handle)
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn list_commands_cover_human_and_json_output_branches() {
         let responses = vec![
             json!([{"id": 7, "name": "Groceries"}]).to_string(),
@@ -395,7 +395,7 @@ mod tests {
         assert!(requests[4].starts_with("PUT /api/lists/7 HTTP/1.1"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn list_show_json_output_includes_full_payload() {
         let payload = json!({
             "id": 7,
@@ -414,7 +414,7 @@ mod tests {
         assert!(requests[0].starts_with("GET /api/lists/7 HTTP/1.1"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn api_with_empty_responses_skips_mock_registration() {
         let (api, requests) = api_with_responses(Vec::new()).await;
         drop(api);
@@ -422,7 +422,7 @@ mod tests {
         assert!(captured.is_empty());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn list_update_with_note_content_uses_safe_delta_contract() {
         let current = json!({
             "id": 7,

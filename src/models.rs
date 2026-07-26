@@ -421,7 +421,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_search_response_accepts_empty_array() {
         let value = serde_json::json!([]);
         let parsed = SearchResponse::from_value(value).expect("should parse empty array");
@@ -430,7 +430,7 @@ mod tests {
         assert!(grouped.items.is_none());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_search_response_covers_object_null_and_error_shapes() {
         let null = SearchResponse::from_value(serde_json::Value::Null)
             .expect("null should parse as empty flat response")
@@ -476,12 +476,12 @@ mod tests {
         assert!(SearchResponse::from_value(serde_json::json!([null])).is_err());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_search_response_object_with_null_lists_is_rejected() {
         assert!(SearchResponse::from_value(serde_json::json!({"lists": null})).is_err());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_search_response_prefers_flat_after_empty_grouped() {
         let parsed = SearchResponse::from_value(serde_json::json!({
             "unexpected_grouped_field": true,
@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(hits[0].id, 12);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_search_response_uses_flat_when_grouped_missing() {
         let parsed = SearchResponse::from_value(serde_json::json!({
             "type": "list",
@@ -508,7 +508,7 @@ mod tests {
         assert_eq!(hits[0].id, 5);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_search_response_flat_fallback_for_empty_grouped() {
         let parsed = SearchResponse::from_value(serde_json::json!({
             "lists": null,
@@ -523,12 +523,12 @@ mod tests {
         assert_eq!(hits[0].id, 5);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_search_response_rejects_invalid_grouped_lists_field() {
         assert!(SearchResponse::from_value(serde_json::json!({"lists": "bad"})).is_err());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_search_response_falls_back_to_flat_after_empty_grouped_fields() {
         let parsed = SearchResponse::from_value(serde_json::json!({
             "lists": null,
@@ -543,13 +543,13 @@ mod tests {
         assert_eq!(hits[0].text.as_deref(), Some("Grouped wrapper"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     #[should_panic(expected = "expected flat search response")]
     fn flat_search_response_guard_rejects_grouped_variant() {
         expect_flat_hits(SearchResponse::Grouped(SearchResults::default()));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_search_response_accepts_flat_hits() {
         let value = serde_json::json!([
             {
@@ -569,7 +569,7 @@ mod tests {
         assert_eq!(items[0].text, "Sample");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_search_response_infers_list_arrays_without_type() {
         let value = serde_json::json!([
             {
@@ -587,7 +587,7 @@ mod tests {
         assert_eq!(lists[0].name, "Groceries");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_search_response_infers_item_arrays_without_type() {
         let value = serde_json::json!([
             {
@@ -607,7 +607,7 @@ mod tests {
         assert_eq!(items[0].text, "Milk");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_search_response_covers_fallback_names_and_unknown_hits() {
         let value = serde_json::json!([
             {"type": "list", "id": 10},
@@ -628,7 +628,7 @@ mod tests {
         assert!(SearchResponse::from_value(serde_json::json!([{"id": true}])).is_err());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_profile_lang_aliases() {
         let from_lang: Profile = serde_json::from_value(serde_json::json!({"lang": "fr"}))
             .expect("profile with lang should parse");
@@ -644,7 +644,7 @@ mod tests {
         assert_eq!(from_locale.lang.as_deref(), Some("de_DE"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_api_key_scopes_array() {
         let key: ApiKey = serde_json::from_value(serde_json::json!({
             "id": 1,
@@ -660,7 +660,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_api_key_scopes_string() {
         let key: ApiKey = serde_json::from_value(serde_json::json!({
             "id": 2,
@@ -673,7 +673,7 @@ mod tests {
         assert!(matches!(key.scopes, Some(ApiKeyScopes::Single(value)) if value == "all"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn shopping_list_is_note_recognizes_note_type_aliases() {
         use super::ShoppingList;
 

@@ -1006,13 +1006,13 @@ mod tests {
         (test_client(&base_url), handle)
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn allows_https() {
         assert!(ApiClient::ensure_secure_base_url("https://kramli.de").is_ok());
         assert!(ApiClient::ensure_secure_base_url("https://self-hosted.example.com").is_ok());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn allows_http_loopback() {
         assert!(ApiClient::ensure_secure_base_url("http://localhost:8000").is_ok());
         assert!(ApiClient::ensure_secure_base_url("http://127.0.0.1:5000").is_ok());
@@ -1020,7 +1020,7 @@ mod tests {
         assert!(ApiClient::ensure_secure_base_url("http://api.localhost").is_ok());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn rejects_http_remote() {
         assert!(ApiClient::ensure_secure_base_url("http://kramli.de").is_err());
         assert!(ApiClient::ensure_secure_base_url("http://192.0.2.10:8080").is_err());
@@ -1039,7 +1039,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn resource_url_uses_base_for_relative_paths() {
         let client = test_client("https://kramli.de");
         assert_eq!(
@@ -1052,14 +1052,14 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn same_origin_detection_rejects_external_hosts() {
         let client = test_client("https://kramli.de");
         assert!(client.is_same_origin("https://kramli.de/uploads/file.jpg"));
         assert!(!client.is_same_origin("https://example.com/file.jpg"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn external_resources_are_opt_in() {
         assert!(!ApiClient::external_resources_enabled_from(None));
         assert!(!ApiClient::external_resources_enabled_from(Some("invalid")));
@@ -1067,7 +1067,7 @@ mod tests {
         assert!(ApiClient::external_resources_enabled_from(Some("true")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn public_https_resources_are_allowed_by_default() {
         assert!(ApiClient::public_https_resource_allowed(
             "https://cdn.example.com/avatar.png"
@@ -1077,7 +1077,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn unsafe_external_resources_are_not_allowed_by_default() {
         assert!(!ApiClient::public_https_resource_allowed(
             "http://cdn.example.com/avatar.png"
@@ -1102,7 +1102,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn api_error_message_extracts_common_json_fields() {
         assert_eq!(
             ApiClient::format_api_error_message(br#"{"error":"List not found"}"#),
@@ -1118,7 +1118,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn api_error_message_extracts_validation_errors() {
         assert_eq!(
             ApiClient::format_api_error_message(
@@ -1128,7 +1128,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn api_error_message_uses_plain_text_fallback() {
         assert_eq!(
             ApiClient::format_api_error_message(b"Service unavailable"),
@@ -1136,7 +1136,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn api_error_message_scrubs_sensitive_values() {
         let scrubbed =
             ApiClient::format_api_error_message(b"Invalid API key: kramli_secretvalue rejected");
@@ -1144,7 +1144,7 @@ mod tests {
         assert!(!scrubbed.contains("kramli_secretvalue"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn api_error_message_reports_empty_response() {
         assert_eq!(
             ApiClient::format_api_error_message(b"  \n  "),
@@ -1152,7 +1152,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn api_error_message_reports_non_utf8_as_byte_count() {
         assert_eq!(
             ApiClient::format_api_error_message(&[0xff, 0xfe]),
@@ -1160,7 +1160,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn private_resource_and_header_helpers_cover_edge_branches() {
         let client = test_client("https://kramli.de:8443");
 
@@ -1174,7 +1174,7 @@ mod tests {
         assert!(ApiClient::language_headers().contains_key(reqwest::header::ACCEPT_LANGUAGE));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn public_resource_host_filter_covers_private_ranges() {
         assert!(!ApiClient::public_resource_host_allowed(""));
         assert!(!ApiClient::public_resource_host_allowed("0.1.2.3"));
@@ -1189,7 +1189,7 @@ mod tests {
         assert!(!ApiClient::public_https_resource_allowed("not a url"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn resource_request_kind_helpers_cover_headers_and_tags() {
         let client = test_client("https://kramli.de:8443");
 
@@ -1228,7 +1228,7 @@ mod tests {
             .contains_key(reqwest::header::ACCEPT_LANGUAGE));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn append_limited_bytes_covers_success_and_overflow() {
         let mut out = vec![1, 2];
         ApiClient::append_limited_bytes(&mut out, &[3, 4], 4).unwrap();
@@ -1236,7 +1236,7 @@ mod tests {
         assert!(ApiClient::append_limited_bytes(&mut out, &[5], 4).is_err());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn error_extraction_and_truncation_cover_fallbacks() {
         assert_eq!(
             ApiClient::format_api_error_message(br#"{"title":"Nope"}"#),
@@ -1261,7 +1261,7 @@ mod tests {
         assert!(ApiClient::truncate_error_message(&"x".repeat(600)).ends_with('…'));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn api_request_helpers_cover_success_and_error_paths() {
         let (api, server) = api_with_responses(vec![
             TestResponse::json(json!({"ok": true})),
@@ -1304,7 +1304,7 @@ mod tests {
         assert_eq!(requests[8], "GET /api/fail HTTP/1.1");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn resource_fetching_covers_same_public_external_and_error_paths() {
         let (api, server) = api_with_responses(vec![
             TestResponse::bytes(b"same".to_vec()),
@@ -1336,7 +1336,7 @@ mod tests {
         assert_eq!(requests[3], "GET /missing.png HTTP/1.1");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn api_retries_on_rate_limit_then_succeeds() {
         let (api, server) = api_with_responses(vec![
             TestResponse {
@@ -1357,7 +1357,7 @@ mod tests {
         assert_eq!(requests[1], "GET /api/ok HTTP/1.1");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn api_rate_limit_interval_waits_between_requests() {
         let (api, server) = api_with_responses(vec![
             TestResponse::json(json!({"first": true})),
@@ -1376,7 +1376,7 @@ mod tests {
         assert_eq!(requests.len(), 2);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn api_get_rejects_non_json_success_body() {
         let (api, server) =
             api_with_responses(vec![TestResponse::status(200, b"plain text")]).await;
@@ -1385,13 +1385,13 @@ mod tests {
         assert_eq!(requests[0], "GET /api/broken HTTP/1.1");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn api_get_reports_network_errors() {
         let api = test_client("http://127.0.0.1:1");
         assert!(api.get::<Value>("/missing").await.is_err());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn api_post_multipart_reports_network_errors() {
         let api = test_client("http://127.0.0.1:1");
         let result: Result<Value, String> = api
@@ -1406,7 +1406,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn api_returns_rate_limited_response_after_max_retries() {
         let responses = (0..4)
             .map(|_| TestResponse {
@@ -1421,13 +1421,13 @@ mod tests {
         assert_eq!(requests.len(), 4);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn api_delete_ok_reports_network_errors() {
         let api = test_client("http://127.0.0.1:1");
         assert!(api.delete_ok("/items/1").await.is_err());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn api_client_new_rejects_foreign_test_tasks() {
         let result = tokio::spawn(async { ApiClient::new(&Config::load()) })
             .await
@@ -1435,7 +1435,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn api_request_helpers_report_network_errors_for_all_verbs() {
         let api = test_client("http://127.0.0.1:1");
         assert!(api.get::<Value>("/missing").await.is_err());
@@ -1458,17 +1458,17 @@ mod tests {
         assert!(api.delete::<Value>("/items/1").await.is_err());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn public_https_resource_without_host_is_rejected() {
         assert!(!ApiClient::public_https_resource_allowed("https://"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn public_https_resource_rejects_https_url_missing_host() {
         assert!(!ApiClient::public_https_resource_host_allowed(None));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn api_with_empty_responses_skips_mock_registration() {
         let (api, server) = api_with_responses(Vec::new()).await;
         drop(api);
@@ -1476,13 +1476,13 @@ mod tests {
         assert!(requests.is_empty());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn resource_fetch_reports_transport_errors_before_status() {
         let api = test_client("http://127.0.0.1:1");
         assert!(api.get_bytes("/offline.png").await.is_err());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn api_retry_delay_uses_valid_retry_after_seconds() {
         let (api, server) = api_with_responses(vec![
             TestResponse {
@@ -1499,7 +1499,7 @@ mod tests {
         assert_eq!(requests.len(), 2);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn api_client_new_rejects_foreign_test_env() {
         crate::test_env::with_env_vars_async(
             &[
@@ -1521,7 +1521,7 @@ mod tests {
         .await;
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn api_retry_delay_ignores_invalid_retry_after() {
         use reqwest::header::{HeaderValue, RETRY_AFTER};
 
@@ -1553,14 +1553,14 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn public_https_resource_parse_failure_is_rejected() {
         assert!(!ApiClient::public_https_resource_allowed("https://"));
         let parsed = Url::parse("data:text/plain,cov").expect("data url should parse");
         assert!(!ApiClient::public_https_resource_allowed_parsed(&parsed));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn api_error_message_reports_byte_count_for_blank_utf8_body() {
         let body = "   \n\u{200b}\n   ";
         assert_eq!(

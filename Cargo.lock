@@ -2070,6 +2070,7 @@ dependencies = [
  "http 1.4.0",
  "image",
  "keyring",
+ "kramli-test-macros",
  "ratatui",
  "ratatui-image",
  "reqwest 0.12.28",
@@ -2080,6 +2081,15 @@ dependencies = [
  "shell-words",
  "tokio",
  "unic-langid",
+]
+
+[[package]]
+name = "kramli-test-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

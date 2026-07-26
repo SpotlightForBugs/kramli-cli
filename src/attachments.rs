@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, RwLock};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Deserialize;
 
@@ -11,6 +13,43 @@ use crate::models::Attachment;
 const MCP_UPLOADS_ENV: &str = "KRAMLI_MCP_ALLOW_FILE_UPLOADS";
 const MCP_FILE_ROOTS_ENV: &str = "KRAMLI_MCP_FILE_ROOTS";
 static MCP_STARTUP_CWD: LazyLock<RwLock<Option<PathBuf>>> = LazyLock::new(|| RwLock::new(None));
+#[cfg(test)]
+static TEST_FORCE_MCP_READ_ERR: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_FORCE_MCP_WRITE_ERR: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn set_test_mcp_read_err(force: bool) {
+    TEST_FORCE_MCP_READ_ERR.store(force, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_mcp_write_err(force: bool) {
+    TEST_FORCE_MCP_WRITE_ERR.store(force, Ordering::SeqCst);
+}
+
+fn read_mcp_startup_cwd() -> Result<Option<PathBuf>, ()> {
+    #[cfg(test)]
+    if TEST_FORCE_MCP_READ_ERR.load(Ordering::SeqCst) {
+        return Err(());
+    }
+    MCP_STARTUP_CWD
+        .read()
+        .map(|guard| guard.as_ref().cloned())
+        .map_err(|_| ())
+}
+
+fn write_mcp_startup_cwd(cwd: PathBuf) {
+    #[cfg(test)]
+    if TEST_FORCE_MCP_WRITE_ERR.load(Ordering::SeqCst) {
+        return;
+    }
+    if let Ok(mut guard) = MCP_STARTUP_CWD.write() {
+        if should_set_startup_cwd(guard.as_ref()) {
+            *guard = Some(cwd);
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct AttachmentUpload {
@@ -93,11 +132,7 @@ pub(crate) async fn upload_item_attachment(
 
 pub(crate) fn initialize_mcp_file_policy() {
     if let Ok(cwd) = std::env::current_dir() {
-        if let Ok(mut guard) = MCP_STARTUP_CWD.write() {
-            if should_set_startup_cwd(guard.as_ref()) {
-                *guard = Some(cwd);
-            }
-        }
+        write_mcp_startup_cwd(cwd);
     }
 }
 
@@ -134,9 +169,9 @@ pub(crate) fn ensure_mcp_upload_allowed(path: &Path) -> Result<(), String> {
         .canonicalize()
         .map_err(|_| tr_args("attachment-file-not-found", &[]))?;
     let mut roots = Vec::new();
-    match MCP_STARTUP_CWD.read() {
-        Ok(guard) => push_mcp_root_from_startup_state(&mut roots, guard.as_ref().cloned()),
-        Err(_) => push_mcp_root_on_read_failure(&mut roots),
+    match read_mcp_startup_cwd() {
+        Ok(startup) => push_mcp_root_from_startup_state(&mut roots, startup),
+        Err(()) => push_mcp_root_on_read_failure(&mut roots),
     }
     if let Ok(configured) = std::env::var(MCP_FILE_ROOTS_ENV) {
         roots.extend(
@@ -180,8 +215,8 @@ mod tests {
     use super::{
         ensure_mcp_upload_allowed, initialize_mcp_file_policy, mcp_file_uploads_enabled,
         push_mcp_root_from_startup_state, push_mcp_root_on_read_failure,
-        reset_mcp_file_policy_for_tests, should_set_startup_cwd, upload_item_attachment,
-        validate_image_path, AttachmentUpload,
+        reset_mcp_file_policy_for_tests, set_test_mcp_read_err, set_test_mcp_write_err,
+        should_set_startup_cwd, upload_item_attachment, validate_image_path, AttachmentUpload,
     };
     use crate::api::ApiClient;
     use crate::test_env::{register_mock_server, with_env_vars};
@@ -216,7 +251,7 @@ mod tests {
         (ApiClient::for_tests(&base_url), handle)
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn validates_supported_non_empty_files_and_rejects_unsafe_inputs() {
         let root = std::env::temp_dir().join(format!("kramli-attachment-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
@@ -235,7 +270,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn upload_item_attachment_posts_multipart_with_optional_fields() {
         let root = std::env::temp_dir().join(format!("kramli-upload-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
@@ -274,7 +309,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn validate_image_path_accepts_common_extensions() {
         let root = std::env::temp_dir().join(format!("kramli-mime-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
@@ -295,7 +330,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn initialize_mcp_file_policy_is_idempotent() {
         reset_mcp_file_policy_for_tests();
         let cwd = std::env::current_dir().expect("cwd");
@@ -313,7 +348,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn ensure_mcp_upload_allowed_uses_current_dir_when_startup_cwd_unset() {
         reset_mcp_file_policy_for_tests();
         let cwd = std::env::current_dir().expect("cwd");
@@ -329,7 +364,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn mcp_file_policy_allows_startup_paths_and_rejects_outside_roots() {
         let cwd = std::env::current_dir().expect("cwd");
         let root = cwd.join(format!("kramli-mcp-policy-{}", std::process::id()));
@@ -377,7 +412,7 @@ mod tests {
         let _ = fs::remove_dir_all(forbidden_root);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn mcp_upload_root_helpers_cover_startup_and_read_failure_paths() {
         let mut roots = Vec::new();
         push_mcp_root_from_startup_state(&mut roots, None);
@@ -394,14 +429,40 @@ mod tests {
         assert_eq!(roots.len(), 1);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn should_set_startup_cwd_only_when_unset() {
         assert!(should_set_startup_cwd(None));
         let cwd = std::env::current_dir().expect("cwd");
         assert!(!should_set_startup_cwd(Some(&cwd)));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
+    fn initialize_mcp_file_policy_skips_write_when_test_hook_reports_error() {
+        reset_mcp_file_policy_for_tests();
+        set_test_mcp_write_err(true);
+        initialize_mcp_file_policy();
+        set_test_mcp_write_err(false);
+        reset_mcp_file_policy_for_tests();
+    }
+
+    #[kramli_test_macros::test]
+    fn ensure_mcp_upload_allowed_uses_cwd_when_test_hook_reports_read_error() {
+        reset_mcp_file_policy_for_tests();
+        set_test_mcp_read_err(true);
+        let cwd = std::env::current_dir().expect("cwd");
+        let root = cwd.join(format!("kramli-mcp-read-hook-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let png = root.join("allowed.png");
+        fs::write(&png, [1, 2, 3]).unwrap();
+        with_env_vars(&[("KRAMLI_MCP_ALLOW_FILE_UPLOADS", "1")], || {
+            assert!(ensure_mcp_upload_allowed(&png).is_ok());
+        });
+        set_test_mcp_read_err(false);
+        let _ = fs::remove_dir_all(root);
+        reset_mcp_file_policy_for_tests();
+    }
+
+    #[kramli_test_macros::test]
     fn initialize_mcp_file_policy_records_startup_cwd_once() {
         reset_mcp_file_policy_for_tests();
         let cwd = std::env::current_dir().expect("cwd");

@@ -1318,7 +1318,7 @@ mod tests {
         output
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn env_helper_restores_existing_values() {
         const TEST_ENV: &str = "KRAMLI_MCP_TEST_TMP";
         crate::test_env::with_env_vars_async(&[(TEST_ENV, "before")], || async {
@@ -1334,7 +1334,7 @@ mod tests {
         assert!(std::env::var(TEST_ENV).is_err());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parses_content_length_message() {
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
         let mut buffer = format!("Content-Length: {}\r\n\r\n{}", body.len(), body).into_bytes();
@@ -1348,7 +1348,7 @@ mod tests {
         assert!(buffer.is_empty());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parses_json_line_message() {
         let mut buffer = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n".to_vec();
         let message = try_parse_message(&mut buffer)
@@ -1357,12 +1357,12 @@ mod tests {
         assert_eq!(message.value["method"], "ping");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn reads_content_length_case_insensitively() {
         assert_eq!(content_length("content-length: 12").unwrap(), 12);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn trace_names_are_low_cardinality() {
         assert_eq!(mcp_method_trace_name("tools/call"), "tools_call");
         assert_eq!(mcp_method_trace_name("initialize"), "initialize");
@@ -1380,7 +1380,7 @@ mod tests {
         assert_eq!(mcp_tool_trace_name("custom_user_input"), "unknown");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handles_protocol_messages_without_tool_api() {
         with_env_vars_async(&[("KRAMLI_API_KEY", ""), ("KRAMLI_URL", "")], || async {
             assert!(handle_message(json!({"jsonrpc": "2.0", "method": "ping"}))
@@ -1428,7 +1428,7 @@ mod tests {
         .await;
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn reminder_details_enable_reminders_by_default() {
         let args = json!({"reminder_time": "09:00"})
             .as_object()
@@ -1445,7 +1445,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn explicit_false_reminder_stays_false_with_details() {
         let args = json!({"reminder": false, "travel_time_minutes": 15})
             .as_object()
@@ -1459,7 +1459,7 @@ mod tests {
         assert_eq!(body.get("travel_time_minutes"), Some(&Value::from(15)));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn travel_time_does_not_enable_reminder_by_default() {
         let args = json!({"travel_time_minutes": 15})
             .as_object()
@@ -1473,7 +1473,7 @@ mod tests {
         assert_eq!(body.get("travel_time_minutes"), Some(&Value::from(15)));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn create_item_schema_has_schedule_descriptions() {
         let properties = schedule_properties_for_tool("create_item");
 
@@ -1546,7 +1546,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn update_item_schema_has_schedule_descriptions() {
         let properties = schedule_properties_for_tool("update_item");
 
@@ -1583,7 +1583,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn list_tool_schemas_expose_note_mutations_without_mutable_type() {
         let create = schedule_properties_for_tool("create_list");
         let update = schedule_properties_for_tool("update_list");
@@ -1594,7 +1594,7 @@ mod tests {
         assert!(!update.contains_key("list_type"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn list_tools_dispatch_note_create_and_safe_update() {
         let current = json!({
             "id": 7,
@@ -1660,7 +1660,7 @@ mod tests {
         assert!(requests[2].contains("\"note_delta\":\"[{\\\"insert\\\":\\\"New\\\\n\\\"}]\""));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn update_list_accepts_null_folder_id() {
         let (api, requests) = api_with_responses(vec![
             json!({"id": 7, "name": "Groceries", "folder_id": null}).to_string(),
@@ -1681,7 +1681,7 @@ mod tests {
         assert!(requests[0].contains("\"folder_id\":null"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn create_item_rejects_note_lists_before_posting() {
         let (api, requests) = api_with_responses(vec![
             json!({"id": 7, "name": "Notes", "list_type": "note"}).to_string(),
@@ -1701,7 +1701,7 @@ mod tests {
         assert!(requests[0].starts_with("GET /api/lists/7 HTTP/1.1"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn reminder_offsets_also_enable_reminders_by_default() {
         let args = json!({"reminder_offsets": [15, 60]})
             .as_object()
@@ -1718,7 +1718,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn reminder_days_before_enable_reminders_by_default() {
         let args = json!({"reminder_days_before": 2})
             .as_object()
@@ -1732,7 +1732,7 @@ mod tests {
         assert_eq!(body.get("reminder_days_before"), Some(&Value::from(2)));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn argument_parsers_cover_valid_null_and_error_paths() {
         let args = json!({
             "int": "42",
@@ -1806,7 +1806,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn optional_body_helpers_cover_insert_and_reminder_errors() {
         let args = json!({"name": " Kramli ", "clear": "   ", "bad_reminder": "yes"})
             .as_object()
@@ -1826,7 +1826,7 @@ mod tests {
         assert!(insert_reminder_fields(&bad, &mut Map::new()).is_err());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn response_helpers_shape_json_rpc_and_tool_results() {
         let tool = tool_result(json!({"ok": true}), false);
         assert!(!tool["isError"].as_bool().unwrap_or(true));
@@ -1845,7 +1845,7 @@ mod tests {
         assert_eq!(err["error"]["message"], "nope");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn create_item_schema_required_fields_are_stable() {
         let tool = tools()
             .into_iter()
@@ -1869,7 +1869,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn update_item_schema_required_fields_are_stable() {
         let tool = tools()
             .into_iter()
@@ -1887,7 +1887,7 @@ mod tests {
         assert_eq!(required, vec![Value::String("id".into())]);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn writes_json_line_response_for_json_line_message() {
         let mut output = Vec::new();
         write_message(
@@ -1902,7 +1902,7 @@ mod tests {
         assert!(!output.starts_with(b"Content-Length:"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn reads_messages_until_complete_or_eof() {
         let mut reader = b"  \n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n".as_slice();
         let mut buffer = Vec::new();
@@ -1928,7 +1928,7 @@ mod tests {
             .is_err());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parser_reports_header_and_json_errors() {
         let body = b"not-json";
         let mut invalid_body = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
@@ -1956,7 +1956,7 @@ mod tests {
         assert!(content_length("Content-Length: nope").is_err());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn writes_content_length_response_for_header_framing() {
         let mut output = Vec::new();
 
@@ -1974,7 +1974,7 @@ mod tests {
         assert!(text.contains("\"ok\":true"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn list_items_and_item_mutations_cover_api_paths() {
         let (api, requests) = api_with_responses(vec![
             json!([
@@ -2149,7 +2149,7 @@ mod tests {
         assert!(requests[4].contains("\"color\":\"\""));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn io_loop_and_tool_dispatch_cover_remaining_paths() {
         let (stream_client, stream_server) = tokio::io::duplex(4096);
         let (mut reader, mut writer) = tokio::io::split(stream_server);
@@ -2207,7 +2207,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn list_lists_and_handle_tool_call_cover_success_path() {
         let (api, requests) = api_with_responses(vec![
             json!([
@@ -2268,7 +2268,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn list_items_and_update_tags_cover_remaining_filter_and_body_paths() {
         let (api, requests) = api_with_responses(vec![
             json!([
@@ -2337,7 +2337,7 @@ mod tests {
         assert!(requests[2].contains("\"tags\":[\"one\",\"two\"]"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn structured_tool_result_keeps_compatibility_text_exact() {
         let value = json!({"id": 7, "text": "https://kramli.de/privacy"});
         let expected = serde_json::to_string_pretty(&value).unwrap();
@@ -2347,7 +2347,7 @@ mod tests {
         assert_eq!(result["structuredContent"]["link_previews"], json!([]));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn get_list_tool_returns_note_previews_without_posting() {
         let original = json!({
             "id": 7,
@@ -2391,7 +2391,7 @@ mod tests {
         assert!(requests.iter().all(|request| request.starts_with("GET ")));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn primary_read_result_returns_when_optional_preview_exceeds_budget() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2445,7 +2445,7 @@ mod tests {
             .expect("slow preview handler should finish");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn invite_tools_require_confirmation_and_never_accept_during_inspection() {
         let (api, requests) = api_with_responses(vec![
             json!({
@@ -2515,7 +2515,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn explicit_invite_tool_surfaces_auth_and_expiry_failures() {
         for (status, body) in [
             (401, r#"{"error":"authentication required"}"#),
@@ -2551,7 +2551,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn upload_attachment_tool_requires_explicit_opt_in() {
         let cwd = std::env::current_dir().expect("cwd");
         let denied = cwd.join(format!("mcp-upload-denied-{}", std::process::id()));
@@ -2581,7 +2581,7 @@ mod tests {
         let _ = fs::remove_dir_all(denied);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn upload_attachment_tool_posts_multipart_when_enabled() {
         let cwd = std::env::current_dir().expect("cwd");
         let root = cwd.join(format!("kramli-mcp-upload-{}", std::process::id()));
@@ -2630,7 +2630,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn update_list_tool_accepts_integer_folder_id() {
         let (api, requests) = api_with_responses(vec![
             json!({"id": 7, "name": "Groceries", "folder_id": 3}).to_string(),
@@ -2649,7 +2649,7 @@ mod tests {
         assert!(requests[0].contains("\"folder_id\":3"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn update_list_tool_rejects_empty_payload_without_note_content() {
         let args = json!({"id": 7}).as_object().cloned().unwrap();
         let api = ApiClient::for_tests("http://127.0.0.1:9");
@@ -2659,7 +2659,7 @@ mod tests {
         assert!(!err.is_empty());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn get_item_tool_user_texts_include_attachment_fields() {
         let value = json!({
             "text": "Item",
@@ -2673,7 +2673,7 @@ mod tests {
         assert!(texts.iter().any(|text| text.contains("Receipt photo")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn every_enriched_tool_extracts_only_its_user_text_fields() {
         let link = "https://kramli.de/privacy";
         let cases = [
@@ -2705,7 +2705,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn new_read_tools_use_expected_get_contracts() {
         let (api, requests) = api_with_responses(vec![
             json!({"id": 5, "text": "Item"}).to_string(),
@@ -2740,7 +2740,7 @@ mod tests {
         assert!(requests.iter().all(|request| request.starts_with("GET ")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parser_waits_for_full_content_length_body_and_skips_header_lines_without_colon() {
         let body = b"{}";
         let mut incomplete = b"HeaderWithoutColon\r\nContent-Length: 2\r\n\r\n{".to_vec();
@@ -2762,7 +2762,7 @@ mod tests {
         assert_eq!(body.len(), 2);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_stdio_loop_exits_on_eof() {
         let result = tokio::time::timeout(Duration::from_secs(20), async {
             // Do not call run_stdio() with process stdin: the blocking stdin read is
@@ -2779,14 +2779,14 @@ mod tests {
         result.expect("run_with_io EOF test should finish within 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_stdio_test_entrypoint_exits_on_eof() {
         run_stdio()
             .await
             .expect("test run_stdio wrapper should exit on EOF");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn optional_preserved_and_clearable_string_parsers_reject_non_strings() {
         let bad = json!({"value": 1}).as_object().cloned().unwrap();
         assert!(optional_clearable_string(&bad, "value").is_err());
@@ -2801,7 +2801,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn create_list_tool_posts_optional_folder_type_and_note_content() {
         let (api, requests) =
             api_with_responses(vec![json!({"id": 9, "name": "Notes"}).to_string()]).await;
@@ -2824,7 +2824,7 @@ mod tests {
         assert!(requests[0].contains("\"note_content\":\"  keep spacing  \""));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn inspect_invite_tool_wraps_structured_preview_payload() {
         let (base_url, requests) = server_with_status(
             200,
@@ -2861,7 +2861,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn tool_user_texts_search_covers_array_and_grouped_hits() {
         let grouped = json!({
             "lists": [{"name": "Groceries"}],
@@ -2877,7 +2877,7 @@ mod tests {
         assert!(flat_texts.iter().any(|text| text.contains("Task")));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_with_io_emits_length_prefixed_response() {
         let result = tokio::time::timeout(Duration::from_secs(20), async {
             let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
@@ -2895,12 +2895,12 @@ mod tests {
         result.expect("run_with_io ping response test should finish within 20s");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn tool_user_texts_is_empty_for_unknown_tool_name() {
         assert!(super::tool_user_texts("unknown_tool", &json!({"text": "ignored"})).is_empty());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn api_with_responses_awaits_mock_server_registration() {
         let result = tokio::time::timeout(Duration::from_secs(20), async {
             let (api, requests) =
@@ -2927,7 +2927,7 @@ mod tests {
         result.expect("mcp mock server registration test should finish within 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn with_env_vars_async_unlocked_restores_unset_vars() {
         const TEST_ENV: &str = "KRAMLI_MCP_ABSENT_ENV";
         std::env::remove_var(TEST_ENV);
@@ -2938,7 +2938,7 @@ mod tests {
         assert!(std::env::var(TEST_ENV).is_err());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn preview_budget_waits_for_slow_preview_handler() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2997,7 +2997,7 @@ mod tests {
             .expect("slow preview handler should finish");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn io_loop_ignores_notifications_and_replies_to_requests() {
         let result = tokio::time::timeout(Duration::from_secs(20), async {
             let input = concat!(
@@ -3018,7 +3018,7 @@ mod tests {
         result.expect("notification io loop test should finish within 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn handle_tool_call_routes_item_and_read_tools() {
         let result = tokio::time::timeout(Duration::from_secs(20), async {
             let base_url = {
@@ -3170,7 +3170,7 @@ mod tests {
         result.expect("handle_tool_call routing test should finish within 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn api_with_responses_skips_registration_gate_for_empty_response_list() {
         let result = tokio::time::timeout(Duration::from_secs(20), async {
             let (_api, requests) = api_with_responses(vec![]).await;
@@ -3181,7 +3181,7 @@ mod tests {
         result.expect("mcp empty-response registration gate test should finish within 20s");
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn api_with_responses_waits_for_mock_server_registration() {
         let result = tokio::time::timeout(Duration::from_secs(20), async {
             let (api, requests) =
