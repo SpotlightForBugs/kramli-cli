@@ -14750,4 +14750,677 @@ mod tests {
             .await
             .expect("event loop should exit after redraw");
     }
+
+
+    #[tokio::test]
+    async fn init_terminal_factory_uses_real_stdout_when_available() {
+        if !std::io::IsTerminal::is_terminal(&io::stdout()) {
+            return;
+        }
+        run_tui_with_terminal_factory(
+            ApiClient::for_tests("https://kramli.test"),
+            true,
+            init_terminal,
+            restore_terminal,
+            |app| {
+                app.beta_consent_pending = false;
+                app.should_quit = true;
+            },
+        )
+        .await
+        .expect("injected init_terminal factory should succeed on a real stdout tty");
+    }
+
+    #[test]
+    fn footer_attach_shortcut_and_shift_modifier_labels_are_exposed() {
+        assert_eq!(FooterAction::Attach.chip_shortcut(), "P");
+        assert_eq!(key_binding_modifier_label(KeyModifiers::SHIFT), "S+");
+        assert_eq!(
+            key_binding_modifier_label(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT),
+            "C+A+S+"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_beta_consent_shows_legal_pending_and_starts_initial_load() {
+        let mut app = test_app();
+        app.beta_consent_pending = true;
+        app.legal_consent_pending = true;
+        app.legal_pending_docs = vec!["agb".to_string(), "privacy".to_string()];
+        app.initial_load_started = false;
+
+        app.accept_beta_consent();
+
+        assert!(!app.beta_consent_pending);
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("agb")));
+        assert!(app.initial_load_started);
+    }
+
+    #[test]
+    fn legal_consent_mouse_decline_is_ignored_while_submitting() {
+        let mut app = test_app();
+        app.legal_consent_pending = true;
+        app.legal_accepting = true;
+        app.should_quit = false;
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = beta_consent_layout(area);
+        app.handle_legal_consent_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.decline.x + 1,
+                layout.decline.y + 1,
+            ),
+            area,
+        );
+        assert!(!app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn drain_load_messages_applies_note_detail_and_stale_link_previews() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.selected_list = 0;
+        app.preview_generation = 1;
+        let owner = note_preview_owner(1);
+        let stale_identity = PreviewRequestIdentity {
+            generation: 0,
+            fingerprint: 1,
+        };
+        app.pending_link_previews
+            .insert(owner.clone(), stale_identity);
+
+        app.tx
+            .send(LoadMessage::NoteDetail {
+                list_id: 1,
+                result: Ok(json!({"note_content": "Loaded note"})),
+            })
+            .expect("note detail message should enqueue");
+        app.tx
+            .send(LoadMessage::LinkPreviews {
+                owner: owner.clone(),
+                identity: stale_identity,
+                previews: vec![test_link_preview(
+                    "https://kramli.de/privacy",
+                    Some(LinkPreviewActionKind::Open),
+                    None,
+                )],
+            })
+            .expect("stale preview message should enqueue");
+
+        assert!(app.drain_load_messages());
+        assert_eq!(
+            app.note_detail_cache
+                .get(&1)
+                .and_then(note_content)
+                .as_deref(),
+            Some("Loaded note")
+        );
+        assert!(!app.link_previews.contains_key(&owner));
+    }
+
+    #[test]
+    fn calendar_defaults_and_navigation_sync_selected_items() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.calendar_selected_date = Some(SimpleDate {
+            year: 2026,
+            month: 8,
+            day: 3,
+        });
+        assert_eq!(
+            app.default_calendar_date(),
+            SimpleDate {
+                year: 2026,
+                month: 8,
+                day: 3,
+            }
+        );
+
+        app.calendar_selected_date = None;
+        app.items = vec![sample_item(1, "Due soon")];
+        app.items[0].due_date = Some("2026-09-12".to_string());
+        app.selected_item = 0;
+        app.move_calendar_date_selection(1);
+        assert_eq!(app.calendar_selected_date.map(|date| date.day), Some(13));
+        assert_eq!(app.selected_item, 0);
+
+        app.calendar_selected_date = None;
+        app.calendar_visible_month = None;
+        app.move_calendar_month_selection(1);
+        assert!(app.calendar_visible_month.is_some());
+    }
+
+    #[tokio::test]
+    async fn save_editor_create_note_and_blocked_paths_cover_remaining_modes() {
+        let (api, create_requests) = api_with_responses(vec![serde_json::json!({
+            "id": 42,
+            "list_id": 1,
+            "text": "New task",
+            "is_done": false,
+            "progress": "Open"
+        })
+        .to_string()])
+        .await;
+        let mut app = App::new(api, true);
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Existing")];
+        app.selected_list = 0;
+        app.open_add_editor().unwrap();
+        app.editor.as_mut().unwrap().text = "New task".to_string();
+        app.editor.as_mut().unwrap().due_date = "2026-08-01".to_string();
+        app.editor.as_mut().unwrap().progress = tr("tui-kanban-open");
+        app.save_editor().await.unwrap();
+        assert!(app.editor.is_none());
+        assert_eq!(app.items.last().map(|item| item.id), Some(42));
+
+        app.editor = Some(EditorState {
+            mode: EditorMode::Note,
+            item_id: Some(1),
+            text: "Draft".to_string(),
+            quantity: String::new(),
+            due_date: String::new(),
+            due_time: String::new(),
+            planned_date: String::new(),
+            planned_time: String::new(),
+            reminder: String::new(),
+            reminder_time: String::new(),
+            reminder_offsets: String::new(),
+            travel_time_minutes: String::new(),
+            priority: String::new(),
+            tags: String::new(),
+            progress: String::new(),
+            notes: String::new(),
+            active_field: EditorField::Text,
+        });
+        app.note_detail_cache.clear();
+        app.save_editor().await.unwrap();
+        assert_eq!(app.status, Some(tr("tui-note-loading")));
+
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note.clone()];
+        app.editor = Some(EditorState {
+            mode: EditorMode::Create,
+            item_id: None,
+            text: "Blocked".to_string(),
+            quantity: String::new(),
+            due_date: String::new(),
+            due_time: String::new(),
+            planned_date: String::new(),
+            planned_time: String::new(),
+            reminder: String::new(),
+            reminder_time: String::new(),
+            reminder_offsets: String::new(),
+            travel_time_minutes: String::new(),
+            priority: String::new(),
+            tags: String::new(),
+            progress: String::new(),
+            notes: String::new(),
+            active_field: EditorField::Text,
+        });
+        app.save_editor().await.unwrap();
+        assert!(app.editor.is_none());
+
+        app.note_detail_cache.insert(
+            1,
+            json!({
+                "id": 1,
+                "list_type": "note",
+                "note_content": "Bold",
+                "note_delta": "[{\"insert\":\"Bold\",\"attributes\":{\"bold\":true}}]",
+                "note_version": 1
+            }),
+        );
+        app.editor = Some(EditorState {
+            mode: EditorMode::Note,
+            item_id: Some(1),
+            text: "Changed".to_string(),
+            quantity: String::new(),
+            due_date: String::new(),
+            due_time: String::new(),
+            planned_date: String::new(),
+            planned_time: String::new(),
+            reminder: String::new(),
+            reminder_time: String::new(),
+            reminder_offsets: String::new(),
+            travel_time_minutes: String::new(),
+            priority: String::new(),
+            tags: String::new(),
+            progress: String::new(),
+            notes: String::new(),
+            active_field: EditorField::Text,
+        });
+        app.save_editor().await.unwrap();
+        assert_eq!(app.status, Some(tr("tui-note-rich-read-only")));
+
+        let requests = create_requests.await.expect("create save should request");
+        assert_eq!(requests, vec!["POST /api/lists/1/items HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn show_members_summary_truncates_long_member_lists() {
+        let (api, requests) = api_with_responses(vec![serde_json::json!([
+            {"display_name": "Ada"},
+            {"display_name": "Ben"},
+            {"display_name": "Cy"},
+            {"display_name": "Dee"},
+            {"email": "eve@example.test"}
+        ])
+        .to_string()])
+        .await;
+        let mut app = App::new(api, true);
+        app.lists = vec![test_list()];
+        app.show_members_summary().await.unwrap();
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("+2")));
+        let requests = requests.await.expect("members request should finish");
+        assert_eq!(requests, vec!["GET /api/lists/1/members HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn handle_key_alt_scroll_and_link_preview_activation_cover_branches() {
+        let (api, requests) = api_with_responses(Vec::new()).await;
+        let mut app = App::new(api, false);
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Preview host")];
+        app.link_previews.insert(
+            item_preview_owner(1),
+            vec![test_link_preview(
+                "https://kramli.de/privacy",
+                Some(LinkPreviewActionKind::Open),
+                None,
+            )],
+        );
+        app.detail_scroll = 4;
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::ALT,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(app.detail_scroll, 3);
+        app.handle_key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::ALT,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(app.detail_scroll, 4);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.status, Some(tr("link-preview-open")));
+
+        app.link_previews.clear();
+        app.activate_link_preview().await.unwrap();
+        assert_eq!(app.status, Some(tr("link-preview-unresolved")));
+
+        assert!(requests.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_list_from_preview_selects_known_list_or_queues_reload() {
+        let mut app = test_app();
+        app.lists = vec![test_list(), test_shopping_list(9, "Other", None, None, None, false)];
+        app.selected_list = 1;
+
+        app.open_list_from_preview(1, Some(3));
+        assert_eq!(app.selected_list, 0);
+        assert_eq!(app.pending_open_item_id, Some(3));
+
+        app.open_list_from_preview(99, None);
+        assert_eq!(app.pending_open_list_id, Some(99));
+    }
+
+    #[test]
+    fn push_editor_char_rejects_invalid_due_date_and_progress_prefixes() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Milk")];
+        app.open_editor().unwrap();
+        app.editor.as_mut().unwrap().active_field = EditorField::DueDate;
+        app.push_editor_char('@');
+        assert!(app.editor.as_ref().unwrap().due_date.is_empty());
+        assert!(app.status.as_deref().is_some_and(|status| status.contains("YYYY-MM-DD")));
+
+        app.editor.as_mut().unwrap().active_field = EditorField::Progress;
+        app.editor.as_mut().unwrap().progress.clear();
+        app.push_editor_char('Z');
+        assert!(app.editor.as_ref().unwrap().progress.is_empty());
+        assert!(app.status.as_deref().is_some_and(|status| {
+            status.contains(tr("label-state").trim_end_matches(':'))
+        }));
+    }
+
+    #[tokio::test]
+    async fn handle_mouse_routes_scroll_tabs_footer_and_clears_drag_outside_content() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.lists[0].states = Some(vec![
+            ApiListState {
+                name: Some("Inbox".to_string()),
+                color: None,
+                is_done: Some(false),
+            },
+            ApiListState {
+                name: Some("Done".to_string()),
+                color: None,
+                is_done: Some(true),
+            },
+        ]);
+        app.items = vec![sample_item(1, "Drag me")];
+        app.items[0].progress = Some("Inbox".to_string());
+        app.mode = ViewMode::Kanban;
+        app.focus = FocusPane::Items;
+        app.kanban_drag_item = Some(0);
+        let area = Rect::new(0, 0, 120, 40);
+
+        app.handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            area,
+        )
+        .await
+        .unwrap();
+        assert!(app.kanban_drag_item.is_none());
+
+        app.handle_mouse(
+            mouse(MouseEventKind::ScrollDown, 10, 10),
+            area,
+        )
+        .await
+        .unwrap();
+
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::SHIFT,
+            },
+            area,
+        )
+        .await
+        .unwrap();
+
+        app.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), 10, 10),
+            area,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn note_mode_lines_without_cache_shows_loading_placeholder() {
+        let mut app = test_app();
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.note_detail_cache.clear();
+        let lines = note_mode_lines(&app);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans[0].content.as_ref(), tr("tui-note-loading"));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_icon_cache_persists_successful_fetches() {
+        crate::test_env::with_env_lock_async(|| async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("test server should bind");
+            let addr = listener.local_addr().expect("test server should have addr");
+            let base_url = format!("http://{addr}");
+            let ready = crate::test_env::register_mock_server(base_url.clone());
+            let svg = r#"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path fill='currentColor' d='M0 0h16v16H0z'/></svg>"#;
+            let svg_bytes = svg.as_bytes().to_vec();
+            let expected_bytes = svg_bytes.clone();
+            let handle = tokio::spawn(async move {
+                let _ = ready.await;
+                let (mut stream, _) = listener.accept().await.expect("request should connect");
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: image/svg+xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    svg_bytes.len()
+                );
+                stream.write_all(header.as_bytes()).await.unwrap();
+                stream.write_all(&svg_bytes).await.unwrap();
+            });
+
+            let icon_name = format!("cache-test-{}", std::process::id());
+            std::env::set_var(KRAMLI_BOOTSTRAP_ICON_BASE_URL_ENV, base_url);
+            fetch_bootstrap_icon_image(&icon_name)
+                .await
+                .expect("fetch should succeed");
+            let cache_path = bootstrap_icon_cache_path(&icon_name).expect("cache path should exist");
+            assert!(cache_path.exists());
+            let cached = tokio::fs::read(&cache_path).await.expect("cache file should read");
+            assert_eq!(cached, expected_bytes);
+            let _ = tokio::fs::remove_file(&cache_path).await;
+            std::env::remove_var(KRAMLI_BOOTSTRAP_ICON_BASE_URL_ENV);
+            handle.await.expect("server task should finish");
+        })
+        .await;
+    }
+
+    #[test]
+    fn build_image_picker_auto_probe_can_upgrade_halfblocks_to_iterm() {
+        crate::test_env::with_env_lock(|| {
+            let previous_images = std::env::var_os(KRAMLI_TUI_IMAGES_ENV);
+            let previous_term = std::env::var_os(TERM_ENV);
+            let previous_program = std::env::var_os(TERM_PROGRAM_ENV);
+            let previous_lc_terminal = std::env::var_os(LC_TERMINAL_ENV);
+            let previous_iterm = std::env::var_os(ITERM_SESSION_ID_ENV);
+
+            std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
+            std::env::set_var(TERM_ENV, "xterm-256color");
+            std::env::set_var(TERM_PROGRAM_ENV, "iTerm.app");
+            std::env::set_var(LC_TERMINAL_ENV, "iTerm2");
+            std::env::set_var(ITERM_SESSION_ID_ENV, "session");
+
+            let (picker, inline_enabled, summary, debug) =
+                build_image_picker(ImageProtocolPreference::Auto);
+            assert!(inline_enabled);
+            assert!(
+                summary.contains("probe+iterm") || picker.protocol_type() == ProtocolType::Iterm2
+            );
+            assert!(debug.iter().any(|line| line.contains("imgcat") || line.contains("iterm")));
+
+            match previous_images {
+                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
+                None => std::env::remove_var(KRAMLI_TUI_IMAGES_ENV),
+            }
+            match previous_term {
+                Some(value) => std::env::set_var(TERM_ENV, value),
+                None => std::env::remove_var(TERM_ENV),
+            }
+            match previous_program {
+                Some(value) => std::env::set_var(TERM_PROGRAM_ENV, value),
+                None => std::env::remove_var(TERM_PROGRAM_ENV),
+            }
+            match previous_lc_terminal {
+                Some(value) => std::env::set_var(LC_TERMINAL_ENV, value),
+                None => std::env::remove_var(LC_TERMINAL_ENV),
+            }
+            match previous_iterm {
+                Some(value) => std::env::set_var(ITERM_SESSION_ID_ENV, value),
+                None => std::env::remove_var(ITERM_SESSION_ID_ENV),
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn kanban_mouse_drag_moves_item_into_done_column() {
+        let (api, requests) = api_with_responses(vec![
+            serde_json::json!({
+                "id": 1,
+                "list_id": 1,
+                "text": "Move me",
+                "is_done": false,
+                "progress": "Done"
+            })
+            .to_string(),
+            serde_json::json!({
+                "id": 1,
+                "list_id": 1,
+                "text": "Move me",
+                "is_done": true,
+                "progress": "Done"
+            })
+            .to_string(),
+        ])
+        .await;
+        let mut app = App::new(api, true);
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Move me")];
+        app.items[0].progress = Some(tr("tui-kanban-open"));
+        app.mode = ViewMode::Kanban;
+        app.focus = FocusPane::Items;
+        app.selected_item = 0;
+
+        let (_, buckets) = app.kanban_buckets();
+        let done_column = buckets.len().saturating_sub(1);
+        app.kanban_drag_item = Some(0);
+        app.kanban_drag_source_column = Some(0);
+        app.kanban_drag_started = true;
+        app.kanban_drag_target_column = Some(done_column);
+        assert!(
+            app.finish_kanban_drag(Some(done_column))
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(app.items[0].is_done, Some(true));
+        let requests = requests.await.expect("kanban drag should persist");
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn calendar_mouse_drag_updates_target_before_drop() {
+        let (api, requests) = api_with_responses(vec![serde_json::json!({
+            "id": 1,
+            "list_id": 1,
+            "text": "Move me",
+            "is_done": false,
+            "due_date": "2026-07-21"
+        })
+        .to_string()])
+        .await;
+        let mut app = App::new(api, true);
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Move me")];
+        app.items[0].due_date = Some("2026-07-20".to_string());
+        app.mode = ViewMode::Calendar;
+        app.focus = FocusPane::Items;
+        app.calendar_selected_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 20,
+        });
+        app.calendar_visible_month = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 1,
+        });
+        app.start_calendar_item_drag(0);
+        assert_eq!(app.calendar_drag_item, Some(0));
+
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = ui_layout(area, shows_list_mode_tabs(&app));
+        let calendar = app.calendar_layout(layout.content);
+        let drag_target = calendar
+            .date_hits
+            .iter()
+            .find(|hit| hit.date.day == 21)
+            .map(|hit| hit.rect)
+            .expect("calendar should expose a target day cell");
+
+        app.handle_calendar_mode_mouse(
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                drag_target.x + 1,
+                drag_target.y + 1,
+            ),
+            layout.content,
+            false,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(app.calendar_drag_started);
+        assert!(app.calendar_drag_target_date.is_some());
+
+        app.handle_calendar_mode_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                drag_target.x + 1,
+                drag_target.y + 1,
+            ),
+            layout.content,
+            false,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(app.items[0].due_date.as_deref(), Some("2026-07-20"));
+        let requests = requests.await.expect("calendar drag should persist");
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn filter_editor_save_via_handle_key_applies_visible_selection() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![
+            sample_item(1, "Alpha"),
+            sample_item(2, "Beta"),
+        ];
+        app.open_filter_editor().unwrap();
+        app.editor.as_mut().unwrap().text = "beta".to_string();
+        app.handle_editor_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.editor.is_none());
+        assert_eq!(app.item_filter, "beta");
+        assert_eq!(app.selected_item, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_comments_result_refreshes_previews_for_selected_item() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(7, "Main")];
+        app.selected_item = 0;
+        app.apply_comments_result(
+            7,
+            Ok(vec![ItemComment {
+                id: 1,
+                text: Some("See https://kramli.de/privacy".to_string()),
+                user_id: None,
+                user_name: None,
+                user_email: None,
+                created_at: None,
+            }]),
+        );
+        assert_eq!(app.comments_cache.get(&7).map(Vec::len), Some(1));
+        assert!(app
+            .pending_link_previews
+            .contains_key(&item_preview_owner(7)));
+    }
 }

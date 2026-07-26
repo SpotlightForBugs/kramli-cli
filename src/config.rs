@@ -26,6 +26,13 @@ const KRAMLI_LOAD_BOOTSTRAP_ICONS_ENV: &str = "KRAMLI_LOAD_BOOTSTRAP_ICONS";
 #[cfg(test)]
 static TEST_KEYCHAIN_API_KEY: Mutex<Option<Result<Option<String>, String>>> = Mutex::new(None);
 
+#[cfg(test)]
+pub(crate) fn reset_test_keychain_api_key() {
+    *TEST_KEYCHAIN_API_KEY
+        .lock()
+        .expect("keychain test lock poisoned") = None;
+}
+
 // ── On-disk config: non-sensitive settings only ──
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -280,17 +287,37 @@ impl Config {
 
     /// Store an API key in the OS keychain.
     pub(crate) fn set_api_key(&self, key: &str) -> Result<(), String> {
-        Self::keyring_entry(KEYRING_API_KEY)?
-            .set_password(key)
-            .map_err(|e| tr_args("config-store-key-error", &[("error", e.to_string())]))
+        #[cfg(test)]
+        {
+            *TEST_KEYCHAIN_API_KEY
+                .lock()
+                .expect("keychain test lock poisoned") = Some(Ok(Some(key.to_string())));
+            return Ok(());
+        }
+        #[cfg(not(test))]
+        {
+            Self::keyring_entry(KEYRING_API_KEY)?
+                .set_password(key)
+                .map_err(|e| tr_args("config-store-key-error", &[("error", e.to_string())]))
+        }
     }
 
     /// Delete the stored API key from the OS keychain.
     pub(crate) fn delete_api_key(&self) -> Result<(), String> {
-        if let Ok(entry) = Self::keyring_entry(KEYRING_API_KEY) {
-            let _ = entry.delete_credential();
+        #[cfg(test)]
+        {
+            *TEST_KEYCHAIN_API_KEY
+                .lock()
+                .expect("keychain test lock poisoned") = Some(Ok(None));
+            return Ok(());
         }
-        Ok(())
+        #[cfg(not(test))]
+        {
+            if let Ok(entry) = Self::keyring_entry(KEYRING_API_KEY) {
+                let _ = entry.delete_credential();
+            }
+            Ok(())
+        }
     }
 
     /// Return an API key or an actionable login error.

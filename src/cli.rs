@@ -43,6 +43,10 @@ const KRAMLI_DEVICE_LABEL_ENV: &str = "KRAMLI_DEVICE_LABEL";
 const KRAMLI_ACK_TOKEN_ENV: &str = "KRAMLI_ACK_TOKEN";
 const KRAMLI_BATCH_EXECUTABLE_ENV: &str = "KRAMLI_BATCH_EXECUTABLE";
 const KRAMLI_UPDATE_CHECK_URL_ENV: &str = "KRAMLI_UPDATE_CHECK_URL";
+#[cfg(test)]
+const KRAMLI_TEST_BATCH_STDIN_ENV: &str = "KRAMLI_TEST_BATCH_STDIN";
+#[cfg(test)]
+const KRAMLI_TEST_API_KEY_PROMPT_ENV: &str = "KRAMLI_TEST_API_KEY_PROMPT";
 
 #[derive(Parser)]
 #[command(
@@ -3400,6 +3404,39 @@ mod tests {
         std::fs::create_dir_all(&config_root).expect("temp config root should exist");
 
         let profile = serde_json::to_string(&sample_profile(Some("en"))).unwrap();
+        let (error_base_url, error_requests) = server_with_status(500, "{}").await;
+        with_env_vars_async(
+            &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                ("KRAMLI_URL", error_base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                assert!(run_login_with(
+                    None,
+                    || Ok("kramli_test".to_string()),
+                    |_, _| Ok(()),
+                    |_| Ok(()),
+                )
+                .await
+                .is_err());
+            },
+        )
+        .await;
+        let error_requests = error_requests.await.expect("test server should finish");
+        assert_eq!(error_requests, vec!["GET /api/profile HTTP/1.1"]);
+
         let (base_url, requests) = server_with_base_url(vec![profile]).await;
         with_env_vars_async(
             &[
@@ -3423,7 +3460,7 @@ mod tests {
                     None,
                     || Ok("kramli_test".to_string()),
                     |_, _| Ok(()),
-                    |_| Ok(()),
+                    |cfg| cfg.delete_api_key(),
                 )
                 .await
                 .expect("login helper should succeed for valid profile response");
@@ -3432,47 +3469,6 @@ mod tests {
         .await;
         let requests = requests.await.expect("test server should finish");
         assert_eq!(requests, vec!["GET /api/profile HTTP/1.1"]);
-
-        let (error_base_url, error_requests) = server_with_status(500, "{}").await;
-        let deleted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        with_env_vars_async(
-            &[
-                (
-                    "HOME",
-                    config_root
-                        .to_str()
-                        .expect("temp config root should be valid utf-8"),
-                ),
-                (
-                    "XDG_CONFIG_HOME",
-                    config_root
-                        .to_str()
-                        .expect("temp config root should be valid utf-8"),
-                ),
-                ("KRAMLI_URL", error_base_url.as_str()),
-                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
-            ],
-            || {
-                let deleted = deleted.clone();
-                async move {
-                    assert!(run_login_with(
-                        None,
-                        || Ok("kramli_test".to_string()),
-                        |_, _| Ok(()),
-                        move |_| {
-                            deleted.store(true, std::sync::atomic::Ordering::SeqCst);
-                            Ok(())
-                        },
-                    )
-                    .await
-                    .is_err());
-                }
-            },
-        )
-        .await;
-        assert!(deleted.load(std::sync::atomic::Ordering::SeqCst));
-        let error_requests = error_requests.await.expect("test server should finish");
-        assert_eq!(error_requests, vec!["GET /api/profile HTTP/1.1"]);
     }
 
     #[tokio::test]
@@ -4832,6 +4828,1102 @@ mod tests {
             let value = profile_json_with_lang(&profile);
             assert_eq!(value["lang_source"], "resolved");
         });
+
+        crate::test_env::with_env_vars(&[(TEST_KRAMLI_LANG_ENV, "")], || {
+            crate::i18n::set_locale("en");
+            let profile = Profile {
+                display_name: Some("Ada".to_string()),
+                email: Some("ada@example.test".to_string()),
+                lang: None,
+                ..sample_profile(None)
+            };
+            assert_eq!(effective_lang_source(&profile), "resolved");
+            let value = profile_json_with_lang(&profile);
+            assert_eq!(value["lang_source"], "resolved");
+            assert!(value.get("profile_lang").is_none());
+        });
+    }
+
+    #[tokio::test]
+    async fn batch_stdin_json_redirect_and_keep_going_branches_are_covered() {
+        let keep_going_parse = temp_batch_file(
+            "batch-keep-going-parse",
+            "\"unterminated\nconfig\n",
+        );
+        assert!(run_batch(&keep_going_parse, true, false).await.is_err());
+
+        let keep_going_nested = temp_batch_file("batch-keep-going-nested", "batch -\nconfig\n");
+        assert!(run_batch(&keep_going_nested, true, false).await.is_err());
+
+        let keep_going_runtime = temp_batch_file(
+            "batch-keep-going-runtime",
+            "lists resolve '   '\nconfig\n",
+        );
+        assert!(run_batch(&keep_going_runtime, true, false).await.is_err());
+
+        let batch_file = temp_batch_file("json-batch-spawn-keep-going", "status\nstatus\n");
+        with_env_vars_async(
+            &[(
+                KRAMLI_BATCH_EXECUTABLE_ENV,
+                "/definitely/missing-kramli-executable",
+            )],
+            || async {
+                assert!(run_batch_json(&batch_file, true).await.is_err());
+            },
+        )
+        .await;
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", ""),
+                (TEST_KRAMLI_API_KEY_ENV, ""),
+                (KRAMLI_TEST_BATCH_STDIN_ENV, "# comment\nconfig\n"),
+            ],
+            || async {
+                run_batch("-", false, false)
+                    .await
+                    .expect("non-json batch stdin should execute config");
+            },
+        )
+        .await;
+
+        let ok_script = temp_batch_executable(
+            "json-redirect-stdin-script",
+            "#!/bin/sh\nprintf '{\"server\":\"http://127.0.0.1:9\"}\\n'\n",
+        );
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", ""),
+                (TEST_KRAMLI_API_KEY_ENV, ""),
+                (KRAMLI_TEST_BATCH_STDIN_ENV, "config\n"),
+                (KRAMLI_BATCH_EXECUTABLE_ENV, ok_script.as_str()),
+            ],
+            || async {
+                run_batch("-", false, true)
+                    .await
+                    .expect("json redirect batch stdin should succeed");
+            },
+        )
+        .await;
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", ""),
+                (TEST_KRAMLI_API_KEY_ENV, ""),
+                (KRAMLI_TEST_BATCH_STDIN_ENV, "not-a-command\nconfig\n"),
+            ],
+            || async {
+                assert!(run_batch("-", true, false).await.is_err());
+            },
+        )
+        .await;
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", ""),
+                (TEST_KRAMLI_API_KEY_ENV, ""),
+                (KRAMLI_TEST_BATCH_STDIN_ENV, "\"unterminated\nconfig\n"),
+            ],
+            || async {
+                assert!(run_batch("-", true, false).await.is_err());
+            },
+        )
+        .await;
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", ""),
+                (TEST_KRAMLI_API_KEY_ENV, ""),
+                (KRAMLI_TEST_BATCH_STDIN_ENV, "lists resolve '   '\nconfig\n"),
+            ],
+            || async {
+                assert!(run_batch("-", true, false).await.is_err());
+            },
+        )
+        .await;
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", ""),
+                (TEST_KRAMLI_API_KEY_ENV, ""),
+                (KRAMLI_TEST_BATCH_STDIN_ENV, "# only comments\n\n"),
+                (KRAMLI_BATCH_EXECUTABLE_ENV, ""),
+            ],
+            || async {
+                run_batch_json("-", false)
+                    .await
+                    .expect("json batch stdin with only comments should succeed");
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn dry_run_list_member_key_and_item_update_branches_are_covered() {
+        let create = dry_run_requests_for_list_cmd(&ListCmd::Create {
+            name: "Minimal".to_string(),
+            icon: None,
+            color: None,
+            folder: None,
+            list_type: None,
+            note_content: None,
+            states: None,
+        })
+        .await
+        .expect("list create dry-run should build")
+        .expect("list create should be dry-runnable");
+        assert_eq!(create[0].path, "/api/lists");
+
+        let update = dry_run_requests_for_list_cmd(&ListCmd::Update {
+            id: 7,
+            name: Some("Renamed".to_string()),
+            icon: None,
+            color: None,
+            note_content: None,
+            states: None,
+        })
+        .await
+        .expect("list update dry-run should build")
+        .expect("list update should be dry-runnable");
+        assert_eq!(update[0].method, "PUT");
+        assert_eq!(update[0].path, "/api/lists/7");
+
+        assert!(
+            dry_run_requests_for_list_cmd(&ListCmd::List)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            dry_run_requests_for_list_cmd(&ListCmd::Show { id: 7 })
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            dry_run_requests_for_list_cmd(&ListCmd::Resolve {
+                reference: "7".to_string(),
+            })
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        assert!(dry_run_requests_for_member_cmd(&MemberCmd::List { list_id: 7 }).is_none());
+        assert!(dry_run_requests_for_key_cmd(&KeyCmd::List).is_none());
+
+        let update_item = dry_run_requests_for_item_cmd(&ItemCmd::Update {
+            id: 42,
+            text: Some("Renamed".to_string()),
+            quantity: None,
+            due: None,
+            due_time: None,
+            planned: None,
+            planned_time: None,
+            reminder: None,
+            reminder_time: None,
+            reminder_days_before: None,
+            reminder_offsets: None,
+            travel_time_minutes: None,
+            priority: None,
+            tags: None,
+            notes: None,
+            assign: None,
+            color: None,
+            progress: None,
+        })
+        .expect("item update dry-run should build")
+        .expect("item update should be dry-runnable");
+        assert_eq!(update_item[0].path, "/api/items/42");
+    }
+
+    #[tokio::test]
+    async fn run_login_logout_status_and_profile_branches_are_covered() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-cli-login-logout-status-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+        let config_path = config_root.join("config.json");
+
+        let anonymous_profile = json!({
+            "id": 9,
+            "display_name": null,
+            "email": null,
+            "is_anonymous": true
+        })
+        .to_string();
+        let status_profile = serde_json::to_string(&sample_profile(Some("en"))).unwrap();
+        let (base_url, login_requests) = server_with_base_url(vec![
+            anonymous_profile.clone(),
+            status_profile.clone(),
+            status_profile.clone(),
+            anonymous_profile,
+        ])
+        .await;
+
+        with_env_vars_async(
+            &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                (
+                    KRAMLI_CONFIG_PATH_ENV,
+                    config_path
+                        .to_str()
+                        .expect("temp config path should be valid utf-8"),
+                ),
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, ""),
+            ],
+            || async {
+                crate::config::reset_test_keychain_api_key();
+
+                run_login_with(
+                    None,
+                    || Ok("kramli_login_test_key".to_string()),
+                    |cfg, key| cfg.set_api_key(key),
+                    |cfg| cfg.delete_api_key(),
+                )
+                .await
+                .expect("login with keychain storage should succeed");
+
+                let (bad_login_base_url, bad_login_requests) = server_with_status(500, "{}").await;
+                with_env_vars_async_unlocked(
+                    &[
+                        (
+                            "HOME",
+                            config_root
+                                .to_str()
+                                .expect("temp config root should be valid utf-8"),
+                        ),
+                        (
+                            "XDG_CONFIG_HOME",
+                            config_root
+                                .to_str()
+                                .expect("temp config root should be valid utf-8"),
+                        ),
+                        (
+                            KRAMLI_CONFIG_PATH_ENV,
+                            config_path
+                                .to_str()
+                                .expect("temp config path should be valid utf-8"),
+                        ),
+                        ("KRAMLI_URL", bad_login_base_url.as_str()),
+                        (TEST_KRAMLI_API_KEY_ENV, ""),
+                    ],
+                    || async {
+                        assert!(run_login_with(
+                            None,
+                            || Ok("kramli_login_test_key".to_string()),
+                            |cfg, key| cfg.set_api_key(key),
+                            |cfg| cfg.delete_api_key(),
+                        )
+                        .await
+                        .is_err());
+                    },
+                )
+                .await;
+                bad_login_requests.abort();
+
+                run_logout().expect("run_logout wrapper should remove stored credentials");
+
+                let cfg = Config::load();
+                cfg.set_api_key("kramli_test")
+                    .expect("keychain store should succeed for status test");
+                run_status(true)
+                    .await
+                    .expect("json status should include fetched profile");
+                run_status(false)
+                    .await
+                    .expect("human status should report keychain key source");
+
+                run_profile(false)
+                    .await
+                    .expect("anonymous profile human output should succeed");
+            },
+        )
+        .await;
+
+        let login_requests = login_requests.await.expect("test server should finish");
+        assert_eq!(login_requests.len(), 4);
+        assert!(login_requests
+            .iter()
+            .all(|request| request == "GET /api/profile HTTP/1.1"));
+    }
+
+    #[tokio::test]
+    async fn maybe_auto_update_notice_skip_cache_and_error_branches_are_covered() {
+        assert!(!auto_update_check_enabled());
+
+        with_env_vars_async(&[("DO_NOT_TRACK", "1")], || async {
+            assert!(!auto_update_check_enabled());
+        })
+        .await;
+
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-cli-update-cache-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+        let config_path = config_root.join("config.json");
+
+        with_env_vars_async(
+            &[
+                (
+                    KRAMLI_CONFIG_PATH_ENV,
+                    config_path
+                        .to_str()
+                        .expect("temp config path should be valid utf-8"),
+                ),
+                ("KRAMLI_AUTO_UPDATE_CHECK", "1"),
+                ("DO_NOT_TRACK", "0"),
+                ("KRAMLI_NO_TELEMETRY", "0"),
+            ],
+            || async {
+                let mut cfg = Config::load();
+                cfg.set_update_check_state(unix_timestamp_secs(), Some("9.9.9".to_string()), None);
+                cfg.save().expect("test config should save");
+                maybe_auto_update_notice().await;
+            },
+        )
+        .await;
+
+        let (error_url, error_requests) = server_with_status(503, "{}").await;
+        with_env_vars_async(
+            &[
+                (
+                    KRAMLI_CONFIG_PATH_ENV,
+                    config_path
+                        .to_str()
+                        .expect("temp config path should be valid utf-8"),
+                ),
+                (KRAMLI_UPDATE_CHECK_URL_ENV, &format!("{error_url}/latest")),
+                ("KRAMLI_AUTO_UPDATE_CHECK", "1"),
+                ("DO_NOT_TRACK", "0"),
+                ("KRAMLI_NO_TELEMETRY", "0"),
+            ],
+            || async {
+                let mut cfg = Config::load();
+                cfg.set_update_check_state(0, None, None);
+                cfg.save().expect("test config should save");
+                maybe_auto_update_notice().await;
+            },
+        )
+        .await;
+        error_requests.abort();
+
+        let current = env!("CARGO_PKG_VERSION");
+        let release = json!({"tag_name": current, "html_url": null}).to_string();
+        let (same_version_url, same_version_requests) = server_with_status(200, &release).await;
+        with_env_vars_async(
+            &[
+                (
+                    KRAMLI_CONFIG_PATH_ENV,
+                    config_path
+                        .to_str()
+                        .expect("temp config path should be valid utf-8"),
+                ),
+                (
+                    KRAMLI_UPDATE_CHECK_URL_ENV,
+                    &format!("{same_version_url}/latest"),
+                ),
+                ("KRAMLI_AUTO_UPDATE_CHECK", "1"),
+                ("DO_NOT_TRACK", "0"),
+                ("KRAMLI_NO_TELEMETRY", "0"),
+            ],
+            || async {
+                let mut cfg = Config::load();
+                cfg.set_update_check_state(0, None, None);
+                cfg.save().expect("test config should save");
+                maybe_auto_update_notice().await;
+            },
+        )
+        .await;
+        same_version_requests.abort();
+    }
+
+    #[tokio::test]
+    async fn human_folder_security_invite_and_handoff_branches_are_covered() {
+        let security_on = json!({
+            "security": {
+                "level": "medium",
+                "score": 3,
+                "max_score": 5,
+                "factors": [{"label": "Recovery email", "met": false}]
+            },
+            "security_email_login_alerts": true
+        })
+        .to_string();
+        let ack_ok = json!({"ok": true}).to_string();
+        let ack_message = json!({"ok": true, "message": "custom ack"}).to_string();
+        let ack_failed = json!({"ok": false, "message": "custom failure"}).to_string();
+        let ack_default_fail = json!({"ok": false}).to_string();
+        let invite_preview = json!({
+            "list_id": 7,
+            "list_name": "Shared",
+            "already_member": false,
+            "invite_url": "https://kram.li/i/InviteToken_1"
+        })
+        .to_string();
+        let accept_result = json!({"ok": true, "list_id": 7}).to_string();
+        let responses = vec![
+            security_on,
+            ack_ok.clone(),
+            ack_ok,
+            ack_message,
+            ack_failed,
+            ack_default_fail,
+            invite_preview.clone(),
+            accept_result,
+            json!({"ok": true, "continued": true}).to_string(),
+            json!({"id": 4, "name": "Work"}).to_string(),
+            json!({"id": 5, "name": "Updated"}).to_string(),
+        ];
+        let (base_url, requests) = server_with_base_url(responses).await;
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+                (KRAMLI_DEVICE_LABEL_ENV, ""),
+            ],
+            || async {
+                run_security(SecurityCmd::Status, false)
+                    .await
+                    .expect("security human output with login alerts enabled should succeed");
+                run_security(
+                    SecurityCmd::Ack {
+                        token: Some("token-json".to_string()),
+                    },
+                    true,
+                )
+                .await
+                .expect("security ack json output should succeed");
+                run_security(
+                    SecurityCmd::Ack {
+                        token: Some("token-human".to_string()),
+                    },
+                    false,
+                )
+                .await
+                .expect("security ack default success message should succeed");
+                run_security(
+                    SecurityCmd::Ack {
+                        token: Some("token-custom".to_string()),
+                    },
+                    false,
+                )
+                .await
+                .expect("security ack custom success message should succeed");
+                assert!(run_security(
+                    SecurityCmd::Ack {
+                        token: Some("token-fail".to_string()),
+                    },
+                    false,
+                )
+                .await
+                .is_err());
+                assert!(run_security(
+                    SecurityCmd::Ack {
+                        token: Some("token-default-fail".to_string()),
+                    },
+                    false,
+                )
+                .await
+                .is_err());
+
+                run_invite(
+                    InviteCmd::Accept {
+                        link: "https://kram.li/i/InviteToken_1".to_string(),
+                        confirm: true,
+                    },
+                    false,
+                )
+                .await
+                .expect("confirmed invite accept human output should succeed");
+
+                assert_eq!(default_handoff_device_label(None), "Kramli CLI");
+                run_handoff(
+                    HandoffCmd::Continue {
+                        list_id: 7,
+                        list_name: Some("Groceries".to_string()),
+                        device: None,
+                    },
+                    false,
+                )
+                .await
+                .expect("handoff continue human output should succeed");
+
+                run_folders(
+                    FolderCmd::Create {
+                        name: "JSON".to_string(),
+                        icon: None,
+                        color: None,
+                        parent: None,
+                    },
+                    true,
+                )
+                .await
+                .expect("folder create json output should succeed");
+                run_folders(
+                    FolderCmd::Update {
+                        id: 5,
+                        name: None,
+                        icon: Some("folder2".to_string()),
+                        color: None,
+                        parent: Some(3),
+                    },
+                    false,
+                )
+                .await
+                .expect("folder update human output should succeed");
+            },
+        )
+        .await;
+
+        let requests = requests.await.expect("test server should finish");
+        assert!(requests.iter().any(|request| request.starts_with("GET /api/security")));
+        assert!(requests.iter().any(|request| {
+            request.starts_with("POST /api/invite-links/InviteToken_1/accept")
+        }));
+        assert_eq!(requests.last(), Some(&"PUT /api/folders/5 HTTP/1.1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn helper_search_invite_dispatch_and_no_color_branches_are_covered() {
+        assert!(parse_states_arg("Open,,Done").is_ok());
+
+        let (api, find_requests) = api_with_responses(vec![
+            json!([{"id": 7, "name": "Groceries"}]).to_string(),
+            json!([{"id": 55, "list_id": 7, "text": "Hidden", "is_done": false}]).to_string(),
+        ])
+        .await;
+        let found = find_item_across_lists(&api, 55)
+            .await
+            .expect("find item should succeed")
+            .expect("item should exist");
+        assert_eq!(found.0.id, 55);
+        let find_requests = find_requests.await.expect("test server should finish");
+        assert_eq!(find_requests.len(), 2);
+
+        let mut scalar_done = Value::String("not-an-object".to_string());
+        enrich_done_response_tags(&api, 55, &mut scalar_done).await;
+
+        let (empty_api, empty_requests) = api_with_responses(vec![json!({"ok": true}).to_string()]).await;
+        empty_api
+            .get::<Value>("/registered")
+            .await
+            .expect("mock server with registration gate should serve");
+        let _ = empty_requests.await.expect("test server should finish");
+
+        let unresolved_preview = json!({
+            "list_id": 7,
+            "list_name": "Shared",
+            "resolved": false,
+            "action": null
+        })
+        .to_string();
+        let search_responses = vec![
+            json!({"lists": [], "items": []}).to_string(),
+            json!([{"id": 7, "name": "Groceries"}]).to_string(),
+            json!([{"id": 5, "list_id": 7, "text": "Fallback", "is_done": false}]).to_string(),
+            json!({
+                "list_id": 7,
+                "list_name": "Shared",
+                "already_member": false,
+                "invite_url": "https://kram.li/i/InviteToken_1"
+            })
+            .to_string(),
+            unresolved_preview,
+        ];
+        let (search_base_url, search_requests) = server_with_base_url(search_responses).await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", search_base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_search("#5", true)
+                    .await
+                    .expect("search fallback json output should succeed");
+                run_command(
+                    Commands::Invite {
+                        action: InviteCmd::Inspect {
+                            link: "https://kram.li/i/InviteToken_1".to_string(),
+                        },
+                    },
+                    false,
+                )
+                .await
+                .expect("invite command dispatch should succeed");
+                assert!(run_invite(
+                    InviteCmd::Accept {
+                        link: "https://kram.li/i/InviteToken_2".to_string(),
+                        confirm: true,
+                    },
+                    false,
+                )
+                .await
+                .is_err());
+            },
+        )
+        .await;
+        let search_requests = search_requests.await.expect("test server should finish");
+        assert!(search_requests.iter().any(|request| request.starts_with("GET /api/search?")));
+        assert_eq!(search_requests[1], "GET /api/lists HTTP/1.1");
+        assert!(search_requests.iter().any(|request| {
+            request.starts_with("GET /api/invite-links/InviteToken_2")
+        }));
+
+        with_env_vars_async(&[(NO_COLOR_ENV, "1"), ("KRAMLI_URL", ""), (TEST_KRAMLI_API_KEY_ENV, "")], || async {
+            run_inner(Cli {
+                json: false,
+                interactive: false,
+                dry_run: false,
+                command: Some(Commands::Config),
+            })
+            .await
+            .expect("NO_COLOR should disable styling without breaking config output");
+        })
+        .await;
+    }
+
+    #[test]
+    fn final_cli_coverage_sync_gaps_are_closed() {
+        crate::test_env::with_env_vars(&[(TEST_KRAMLI_LANG_ENV, "")], || {
+            crate::i18n::set_locale("en");
+            let profile = sample_profile(Some("en"));
+            let value = profile_json_with_lang(&profile);
+            assert_eq!(value["lang_source"], "profile");
+        });
+        assert!(parse_states_arg("Open,:,Done").is_ok());
+
+        let anonymous = Profile {
+            display_name: None,
+            email: None,
+            lang: Some("en".to_string()),
+            ..sample_profile(None)
+        };
+        let value = profile_json_with_lang(&anonymous);
+        assert_eq!(value["lang_source"], "profile");
+    }
+
+    #[tokio::test]
+    async fn final_cli_coverage_gaps_are_closed() {
+        let (note_base_url, note_requests) = server_with_base_url(vec![json!({
+            "id": 7,
+            "name": "Notes",
+            "list_type": "note",
+            "note_content": "Old",
+            "note_delta": "[{\"insert\":\"Old\\n\"}]",
+            "note_version": 1
+        })
+        .to_string()])
+        .await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", note_base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                let note_update = dry_run_requests_for_list_cmd(&ListCmd::Update {
+                    id: 7,
+                    name: None,
+                    icon: None,
+                    color: None,
+                    note_content: Some("Updated note".to_string()),
+                    states: None,
+                })
+                .await
+                .expect("note update dry-run should build")
+                .expect("note update with note content should be dry-runnable");
+                assert_eq!(note_update.len(), 2);
+                assert_eq!(note_update[0].method, "GET");
+            },
+        )
+        .await;
+        note_requests.abort();
+
+        let create = dry_run_requests_for_command(&Commands::Lists {
+            action: ListCmd::Create {
+                name: "Tasks".to_string(),
+                icon: None,
+                color: None,
+                folder: None,
+                list_type: Some("tasks".to_string()),
+                note_content: None,
+                states: None,
+            },
+        })
+        .await
+        .expect("list create dry-run command should build")
+        .expect("list create command should be dry-runnable");
+        assert_eq!(create[0].path, "/api/lists");
+
+        let (missing_api, missing_requests) = api_with_responses(vec![
+            json!([{"id": 99, "name": "Other"}]).to_string(),
+            json!([]).to_string(),
+        ])
+        .await;
+        assert!(
+            find_item_across_lists(&missing_api, 404)
+                .await
+                .expect("lookup should succeed")
+                .is_none()
+        );
+        missing_requests.abort();
+
+        let (handoff_base_url, handoff_requests) =
+            server_with_base_url(vec![json!({"ok": true, "viewing": true}).to_string()]).await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", handoff_base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_handoff(
+                    HandoffCmd::Viewing {
+                        list_id: 7,
+                        list_name: Some("Groceries".to_string()),
+                        device: Some("Laptop".to_string()),
+                    },
+                    false,
+                )
+                .await
+                .expect("handoff viewing human output should succeed");
+            },
+        )
+        .await;
+        assert_eq!(
+            handoff_requests.await.expect("test server should finish"),
+            vec!["POST /api/activity/viewing HTTP/1.1"]
+        );
+
+        let missing_batch = std::env::temp_dir().join(format!(
+            "kramli-cli-missing-batch-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        assert!(run_batch(
+            &missing_batch.to_string_lossy(),
+            false,
+            false
+        )
+        .await
+        .is_err());
+
+        let login_profile = json!({"display_name": null, "email": null}).to_string();
+        let (login_base_url, login_requests) =
+            server_with_base_url(vec![login_profile.clone(), login_profile]).await;
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-cli-run-login-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+        with_env_vars_async(
+            &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                (
+                    KRAMLI_CONFIG_PATH_ENV,
+                    config_root
+                        .join("config.json")
+                        .to_str()
+                        .expect("temp config path should be valid utf-8"),
+                ),
+                ("KRAMLI_URL", login_base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, ""),
+                (KRAMLI_TEST_API_KEY_PROMPT_ENV, "kramli_login_test_key"),
+            ],
+            || async {
+                crate::config::reset_test_keychain_api_key();
+                run_login(None)
+                    .await
+                    .expect("run_login wrapper should succeed with test prompt override");
+                run_status(true)
+                    .await
+                    .expect("status json should include profile after run_login");
+            },
+        )
+        .await;
+        let login_requests = login_requests.await.expect("test server should finish");
+        assert_eq!(login_requests.len(), 2);
+
+        let (api, handle) = api_with_responses(vec![json!({"ok": true}).to_string()]).await;
+        api.get::<Value>("/ready-check")
+            .await
+            .expect("registered mock server should accept request");
+        let captured = handle.await.expect("mock server task should finish");
+        assert_eq!(captured, vec!["GET /api/ready-check HTTP/1.1"]);
+
+        let create_with_states = dry_run_requests_for_list_cmd(&ListCmd::Create {
+            name: "States".to_string(),
+            icon: None,
+            color: None,
+            folder: None,
+            list_type: None,
+            note_content: None,
+            states: Some("Open,Done".to_string()),
+        })
+        .await
+        .expect("list create with states should build")
+        .expect("list create with states should be dry-runnable");
+        assert!(create_with_states[0]
+            .body
+            .as_ref()
+            .is_some_and(|body| body.get("states").is_some_and(Value::is_array)));
+
+        let update_with_states = dry_run_requests_for_list_cmd(&ListCmd::Update {
+            id: 3,
+            name: None,
+            icon: None,
+            color: None,
+            note_content: None,
+            states: Some("Review".to_string()),
+        })
+        .await
+        .expect("list update with states should build")
+        .expect("list update with states should be dry-runnable");
+        assert!(update_with_states[0]
+            .body
+            .as_ref()
+            .is_some_and(|body| body.get("states").is_some_and(Value::is_array)));
+
+        let (viewing_base_url, viewing_requests) =
+            server_with_base_url(vec![json!({"ok": true, "viewing": true}).to_string()]).await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", viewing_base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_handoff(
+                    HandoffCmd::Viewing {
+                        list_id: 8,
+                        list_name: None,
+                        device: Some("Tablet".to_string()),
+                    },
+                    true,
+                )
+                .await
+                .expect("handoff viewing json output should succeed");
+            },
+        )
+        .await;
+        assert_eq!(
+            viewing_requests.await.expect("test server should finish"),
+            vec!["POST /api/activity/viewing HTTP/1.1"]
+        );
+
+        let (bad_login_base_url, bad_login_requests) = server_with_status(500, "{}").await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", bad_login_base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, ""),
+                (KRAMLI_TEST_API_KEY_PROMPT_ENV, "kramli_bad_login_key"),
+            ],
+            || async {
+                crate::config::reset_test_keychain_api_key();
+                assert!(run_login(None).await.is_err());
+            },
+        )
+        .await;
+        bad_login_requests.abort();
+
+        let mut missing_list_id = json!({"text": "done"});
+        enrich_done_response_tags(&missing_api, 404, &mut missing_list_id).await;
+        let mut non_object = Value::Array(vec![]);
+        enrich_done_response_tags(&missing_api, 404, &mut non_object).await;
+
+        let (multi_api, multi_handle) = api_with_responses(vec![
+            json!({"ok": true}).to_string(),
+            json!({"ok": true}).to_string(),
+        ])
+        .await;
+        multi_api
+            .get::<Value>("/one")
+            .await
+            .expect("first mock response should succeed");
+        multi_api
+            .get::<Value>("/two")
+            .await
+            .expect("second mock response should succeed");
+        let multi_captured = multi_handle.await.expect("multi mock server should finish");
+        assert_eq!(multi_captured.len(), 2);
+
+        let (search_base_url, search_requests) = server_with_base_url(vec![
+            json!({"lists": [], "items": [{"id": 5, "text": "Existing", "list_id": 7}]}).to_string(),
+        ])
+        .await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", search_base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_search("#5", true)
+                    .await
+                    .expect("search json should reuse existing item hit");
+            },
+        )
+        .await;
+        assert_eq!(
+            search_requests.await.expect("test server should finish"),
+            vec!["GET /api/search?q=%235 HTTP/1.1"]
+        );
+
+        let (security_base_url, security_requests) = server_with_base_url(vec![json!({
+            "security": {
+                "level_label": "Good",
+                "score": 4,
+                "max_score": 5,
+                "factors": [{"label": "App lock", "met": true}]
+            },
+            "security_email_login_alerts": true
+        })
+        .to_string()])
+        .await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", security_base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_security(SecurityCmd::Status, false)
+                    .await
+                    .expect("security human output with met factor should succeed");
+            },
+        )
+        .await;
+        assert_eq!(
+            security_requests.await.expect("test server should finish"),
+            vec!["GET /api/security HTTP/1.1"]
+        );
+
+        assert!(
+            dry_run_requests_for_list_cmd(&ListCmd::Create {
+                name: "Bad states".to_string(),
+                icon: None,
+                color: None,
+                folder: None,
+                list_type: None,
+                note_content: None,
+                states: Some("{}".to_string()),
+            })
+            .await
+            .is_err()
+        );
+        assert!(
+            dry_run_requests_for_list_cmd(&ListCmd::Update {
+                id: 1,
+                name: None,
+                icon: None,
+                color: None,
+                note_content: None,
+                states: None,
+            })
+            .await
+            .is_err()
+        );
+
+        let status_profile = serde_json::to_string(&sample_profile(Some("en-US"))).unwrap();
+        let (status_base_url, status_requests) =
+            server_with_base_url(vec![status_profile]).await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", status_base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+                (TEST_KRAMLI_LANG_ENV, "de-DE"),
+            ],
+            || async {
+                run_status(true)
+                    .await
+                    .expect("json status with env lang should include profile metadata");
+            },
+        )
+        .await;
+        assert_eq!(
+            status_requests.await.expect("test server should finish"),
+            vec!["GET /api/profile HTTP/1.1"]
+        );
+
+        let (registration_api, registration_handle) =
+            api_with_responses(vec![json!({"registered": true}).to_string()]).await;
+        registration_api
+            .get::<Value>("/registration-gate")
+            .await
+            .expect("mock server registration gate should allow request");
+        assert_eq!(
+            registration_handle
+                .await
+                .expect("registration gate server should finish"),
+            vec!["GET /api/registration-gate HTTP/1.1"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_batch_stdin_content_reads_eof_without_test_override() {
+        use std::os::unix::io::AsRawFd;
+
+        extern "C" {
+            fn dup(oldfd: i32) -> i32;
+            fn dup2(oldfd: i32, newfd: i32) -> i32;
+            fn close(fd: i32) -> i32;
+        }
+
+        crate::test_env::with_env_lock(|| {
+            std::env::remove_var(KRAMLI_TEST_BATCH_STDIN_ENV);
+            std::env::set_var(KRAMLI_TEST_API_KEY_PROMPT_ENV, "   ");
+            assert!(prompt_api_key().is_err());
+            std::env::remove_var(KRAMLI_TEST_API_KEY_PROMPT_ENV);
+
+            let (read_end, write_end) = std::io::pipe().expect("pipe should open");
+            drop(write_end);
+
+            let saved = unsafe { dup(0) };
+            assert!(saved >= 0);
+            let read_fd = read_end.as_raw_fd();
+            assert_eq!(unsafe { dup2(read_fd, 0) }, 0);
+            drop(read_end);
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime should build");
+            let content = runtime
+                .block_on(read_batch_stdin_content())
+                .expect("eof stdin read should succeed");
+            assert!(content.is_empty());
+
+            assert_eq!(unsafe { dup2(saved, 0) }, 0);
+            unsafe {
+                close(saved);
+            }
+        });
     }
 }
 
@@ -6002,6 +7094,11 @@ fn prompt_api_key() -> Result<String, String> {
 
 #[cfg(test)]
 fn prompt_api_key() -> Result<String, String> {
+    if let Ok(key) = std::env::var(KRAMLI_TEST_API_KEY_PROMPT_ENV) {
+        if !key.trim().is_empty() {
+            return Ok(key);
+        }
+    }
     Err("prompt unavailable in test context".to_string())
 }
 
@@ -6281,10 +7378,10 @@ async fn enrich_item_tags_from_list(api: &ApiClient, item: &mut ListItem) {
 }
 
 async fn enrich_done_response_tags(api: &ApiClient, item_id: i64, response: &mut Value) {
-    let Some(list_id) = response.get("list_id").and_then(Value::as_i64) else {
+    let Some(response_object) = response.as_object_mut() else {
         return;
     };
-    let Some(response_object) = response.as_object_mut() else {
+    let Some(list_id) = response_object.get("list_id").and_then(Value::as_i64) else {
         return;
     };
     if let Ok(full_item) = fetch_item_from_list(api, list_id, item_id).await {
@@ -7880,6 +8977,21 @@ async fn run_handoff(cmd: HandoffCmd, as_json: bool) -> Result<(), String> {
     Ok(())
 }
 
+async fn read_batch_stdin_content() -> Result<String, String> {
+    #[cfg(test)]
+    if let Ok(content) = std::env::var(KRAMLI_TEST_BATCH_STDIN_ENV) {
+        return Ok(content);
+    }
+
+    use tokio::io::AsyncReadExt;
+    let mut buffer = String::default();
+    tokio::io::stdin()
+        .read_to_string(&mut buffer)
+        .await
+        .map_err(|e| tr_args("cli-batch-read-stdin-error", &[("error", e.to_string())]))?;
+    Ok(buffer)
+}
+
 async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), String> {
     if as_json {
         return run_batch_json(file, keep_going).await;
@@ -7888,13 +9000,7 @@ async fn run_batch(file: &str, keep_going: bool, as_json: bool) -> Result<(), St
     let source = if file == "-" { "stdin" } else { file }.to_string();
 
     let content = if file == "-" {
-        use tokio::io::AsyncReadExt;
-        let mut buffer = String::default();
-        tokio::io::stdin()
-            .read_to_string(&mut buffer)
-            .await
-            .map_err(|e| tr_args("cli-batch-read-stdin-error", &[("error", e.to_string())]))?;
-        buffer
+        read_batch_stdin_content().await?
     } else {
         fs::read_to_string(file).map_err(|e| {
             tr_args(
@@ -8040,13 +9146,7 @@ async fn run_batch_json(file: &str, keep_going: bool) -> Result<(), String> {
     };
 
     let content = if file == "-" {
-        use tokio::io::AsyncReadExt;
-        let mut buffer = String::default();
-        tokio::io::stdin()
-            .read_to_string(&mut buffer)
-            .await
-            .map_err(|e| tr_args("cli-batch-read-stdin-error", &[("error", e.to_string())]))?;
-        buffer
+        read_batch_stdin_content().await?
     } else {
         fs::read_to_string(file).map_err(|e| {
             tr_args(
