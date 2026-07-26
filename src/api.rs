@@ -909,6 +909,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{ApiClient, ResourceRequestKind, MAX_RESOURCE_BYTES};
+    use crate::config::Config;
 
     struct TestResponse {
         status: u16,
@@ -1373,5 +1374,43 @@ mod tests {
     async fn api_get_reports_network_errors() {
         let api = test_client("http://127.0.0.1:1");
         assert!(api.get::<Value>("/missing").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn api_post_multipart_reports_network_errors() {
+        let api = test_client("http://127.0.0.1:1");
+        let result: Result<Value, String> = api
+            .post_multipart(
+                "/items/1/attachments",
+                "photo.png",
+                "image/png",
+                vec![1, 2, 3],
+                &[],
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn api_returns_rate_limited_response_after_max_retries() {
+        let responses = (0..4)
+            .map(|_| TestResponse {
+                status: 429,
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .collect();
+        let (api, server) = api_with_responses(responses).await;
+        assert!(api.get::<Value>("/limited").await.is_err());
+        let requests = server.await.expect("server finished");
+        assert_eq!(requests.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn api_client_new_rejects_foreign_test_tasks() {
+        let result = tokio::spawn(async { ApiClient::new(&Config::load()) })
+            .await
+            .expect("spawn should finish");
+        assert!(result.is_err());
     }
 }

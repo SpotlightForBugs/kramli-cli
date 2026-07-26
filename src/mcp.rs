@@ -1646,6 +1646,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_list_accepts_null_folder_id() {
+        let (api, requests) = api_with_responses(vec![
+            json!({"id": 7, "name": "Groceries", "folder_id": null}).to_string(),
+        ])
+        .await;
+        let args = json!({"id": 7, "folder_id": null})
+            .as_object()
+            .unwrap()
+            .clone();
+
+        let updated = super::update_list(&api, &args)
+            .await
+            .expect("null folder_id should update");
+        assert!(updated["folder_id"].is_null());
+
+        let requests = requests.await.unwrap();
+        assert!(requests[0].starts_with("PUT /api/lists/7 HTTP/1.1"));
+        assert!(requests[0].contains("\"folder_id\":null"));
+    }
+
+    #[tokio::test]
     async fn create_item_rejects_note_lists_before_posting() {
         let (api, requests) = api_with_responses(vec![
             json!({"id": 7, "name": "Notes", "list_type": "note"}).to_string(),

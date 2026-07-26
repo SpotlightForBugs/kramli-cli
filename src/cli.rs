@@ -1753,6 +1753,124 @@ mod tests {
             .expect("redo dry-run should build")
             .expect("redo should be dry-runnable");
         assert_eq!(redo[0].path, "/api/lists/9/redo");
+
+        let folder_delete = dry_run_requests_for_command(&Commands::Folders {
+            action: FolderCmd::Delete { id: 4 },
+        })
+        .await
+        .expect("folder delete dry-run should build")
+        .expect("folder delete should be dry-runnable");
+        assert_eq!(folder_delete[0].path, "/api/folders/4");
+
+        let security = with_env_vars_async(
+            &[("KRAMLI_ACK_TOKEN", "ack-test-token")],
+            || async {
+                dry_run_requests_for_command(&Commands::Security {
+                    action: SecurityCmd::Ack { token: None },
+                })
+                .await
+                .expect("security dry-run should build")
+                .expect("security ack should be dry-runnable")
+            },
+        )
+        .await;
+        assert_eq!(security[0].path, "/api/security/login-ack");
+
+        let accept_terms = dry_run_requests_for_command(&Commands::AcceptTerms { docs: None })
+            .await
+            .expect("accept terms dry-run should build")
+            .expect("accept terms should be dry-runnable");
+        assert_eq!(accept_terms[0].path, "/api/accept-terms");
+
+        let privacy = dry_run_requests_for_command(&Commands::Privacy {
+            action: PrivacyCmd::Reset,
+        })
+        .await
+        .expect("privacy dry-run should build")
+        .expect("privacy reset should be dry-runnable");
+        assert_eq!(privacy[0].path, "config://privacy/reset");
+
+        let logout = dry_run_requests_for_command(&Commands::Logout)
+            .await
+            .expect("logout dry-run should build")
+            .expect("logout should be dry-runnable");
+        assert_eq!(logout[0].path, "config://logout");
+
+        let handoff_continue = dry_run_requests_for_command(&Commands::Handoff {
+            action: HandoffCmd::Continue {
+                list_id: 5,
+                list_name: Some("Groceries".to_string()),
+                device: Some("phone".to_string()),
+            },
+        })
+        .await
+        .expect("handoff continue dry-run should build")
+        .expect("handoff continue should be dry-runnable");
+        assert_eq!(handoff_continue[0].path, "/api/activity/continue-on-device");
+
+        let handoff_clear = dry_run_requests_for_command(&Commands::Handoff {
+            action: HandoffCmd::Clear,
+        })
+        .await
+        .expect("handoff clear dry-run should build")
+        .expect("handoff clear should be dry-runnable");
+        assert_eq!(handoff_clear[0].path, "/api/activity/clear");
+
+        let member_remove = dry_run_requests_for_command(&Commands::Members {
+            action: MemberCmd::Remove {
+                list_id: 7,
+                user_id: 3,
+            },
+        })
+        .await
+        .expect("member remove dry-run should build")
+        .expect("member remove should be dry-runnable");
+        assert_eq!(member_remove[0].path, "/api/lists/7/members/3");
+
+        let key_revoke = dry_run_requests_for_command(&Commands::Keys {
+            action: KeyCmd::Revoke { key_id: 12 },
+        })
+        .await
+        .expect("key revoke dry-run should build")
+        .expect("key revoke should be dry-runnable");
+        assert_eq!(key_revoke[0].path, "/api/api-keys/12");
+
+        let list_update = dry_run_requests_for_command(&Commands::Lists {
+            action: ListCmd::Update {
+                id: 9,
+                name: Some("Renamed".to_string()),
+                icon: None,
+                color: None,
+                note_content: None,
+                states: None,
+            },
+        })
+        .await
+        .expect("list update dry-run should build")
+        .expect("list update should be dry-runnable");
+        assert_eq!(list_update[0].path, "/api/lists/9");
+    }
+
+    #[tokio::test]
+    async fn dry_run_human_preview_prints_request_summary() {
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", "http://127.0.0.1:9"),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_command_with_context(
+                    Commands::Undo { list_id: 3 },
+                    CommandContext {
+                        as_json: false,
+                        dry_run: true,
+                    },
+                )
+                .await
+                .expect("human dry-run preview should succeed");
+            },
+        )
+        .await;
     }
 
     #[tokio::test]

@@ -8777,6 +8777,7 @@ mod tests {
     use super::*;
     use crate::api::ApiClient;
     use serde_json::json;
+    use std::fs;
 
     fn sample_item(id: i64, text: &str) -> ListItem {
         ListItem {
@@ -9462,6 +9463,59 @@ mod tests {
             .as_deref()
             .is_some_and(|status| !status.is_empty()));
         assert_eq!(requests.await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_attachment_editor_requires_selected_item() {
+        let mut app = test_app();
+        app.items.clear();
+        app.open_attachment_editor().unwrap();
+        assert!(app.editor.is_none());
+        assert_eq!(app.status, Some(tr("output-no-items")));
+    }
+
+    #[tokio::test]
+    async fn attachment_editor_uploads_selected_item_file() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let root = cwd.join(format!("kramli-tui-attach-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let png = root.join("item.png");
+        fs::write(&png, [137, 80, 78, 71]).unwrap();
+
+        let (api, requests) = api_with_responses(vec![json!({
+            "attachment": {
+                "id": 3,
+                "filename": "item.png",
+                "original_filename": "item.png"
+            }
+        })
+        .to_string()])
+        .await;
+        let mut app = App::new(api, false);
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(5, "Milk")];
+        app.selected_item = 0;
+
+        app.open_attachment_editor().unwrap();
+        app.editor.as_mut().unwrap().text = png.to_str().expect("png path utf-8").to_string();
+        app.save_editor().await.unwrap();
+
+        assert!(app.editor.is_none());
+        assert!(app.status.is_some());
+        let requests = requests.await.unwrap();
+        assert!(requests[0].contains("POST /api/items/5/attachments"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn attachment_editor_requires_non_empty_path() {
+        let mut app = test_app();
+        app.items = vec![sample_item(5, "Milk")];
+        app.selected_item = 0;
+        app.open_attachment_editor().unwrap();
+        app.save_editor().await.unwrap();
+        assert!(app.editor.is_some());
+        assert_eq!(app.status, Some(tr("attachment-path-required")));
     }
 
     fn test_attachment(id: i64, filename: Option<&str>, mime_type: Option<&str>) -> Attachment {
