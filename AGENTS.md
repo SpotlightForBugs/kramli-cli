@@ -44,3 +44,13 @@ The script updates both `Cargo.toml` and `Cargo.lock` together and prevents comm
 - Use Conventional Commits (`feat:`, `fix:`, `chore:`, `docs:`, etc.).
 - Keep subject line clear and specific.
 - For release/process changes, include a short body with rationale and impact.
+
+## Pull request hygiene
+
+Keep pull requests free of Cursor/Bugbot branding:
+
+- Do **not** add `Co-authored-by: Cursor <cursoragent@cursor.com>` trailers (`.githooks/commit-msg` strips them locally; run `git config core.hooksPath .githooks` after clone).
+- Use `work/<topic>-<suffix>` branch names, not `cursor/...`.
+- Cloud-agent PR bodies must not include `CURSOR_AGENT_PR_BODY_*` wrappers, `cursor.com/agents/...` links, or Bugbot upsell text.
+
+The `clean-pr` GitHub Actions workflow scrubs those artifacts from PR descriptions and deletes Bugbot comments posted by the `cursor` bot. It cannot rewrite commit authorship on already-pushed commits.

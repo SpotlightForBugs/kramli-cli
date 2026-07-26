@@ -1,0 +1,85 @@
+name: Clean PR cursor mentions
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Optional single PR number to clean
+        required: false
+        type: string
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  clean:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'pull_request_target' ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        (
+          github.event.comment.user.login == 'cursor' ||
+          github.event.comment.user.login == 'cursoragent' ||
+          github.event.comment.user.login == 'cursor-agent'
+        )
+      )
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Resolve pull request number
+        id: pr
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER_INPUT: ${{ github.event.inputs.pr_number }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request_target)
+              echo "number=$PULL_REQUEST_NUMBER" >> "$GITHUB_OUTPUT"
+              ;;
+            issue_comment)
+              echo "number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+              ;;
+            workflow_dispatch)
+              if [[ -n "${PR_NUMBER_INPUT:-}" ]]; then
+                echo "number=$PR_NUMBER_INPUT" >> "$GITHUB_OUTPUT"
+              else
+                echo "all_open=true" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+            schedule)
+              echo "all_open=true" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Scrub Cursor/Bugbot noise from pull requests
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 scripts/clean_pr_cursor_mentions.py --self-test
+          if [[ "${{ steps.pr.outputs.all_open }}" == "true" ]]; then
+            python3 scripts/clean_pr_cursor_mentions.py --all-open
+          else
+            python3 scripts/clean_pr_cursor_mentions.py --pr "${{ steps.pr.outputs.number }}"
+          fi
