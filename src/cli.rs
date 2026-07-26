@@ -1762,17 +1762,14 @@ mod tests {
         .expect("folder delete should be dry-runnable");
         assert_eq!(folder_delete[0].path, "/api/folders/4");
 
-        let security = with_env_vars_async(
-            &[("KRAMLI_ACK_TOKEN", "ack-test-token")],
-            || async {
-                dry_run_requests_for_command(&Commands::Security {
-                    action: SecurityCmd::Ack { token: None },
-                })
-                .await
-                .expect("security dry-run should build")
-                .expect("security ack should be dry-runnable")
-            },
-        )
+        let security = with_env_vars_async(&[("KRAMLI_ACK_TOKEN", "ack-test-token")], || async {
+            dry_run_requests_for_command(&Commands::Security {
+                action: SecurityCmd::Ack { token: None },
+            })
+            .await
+            .expect("security dry-run should build")
+            .expect("security ack should be dry-runnable")
+        })
         .await;
         assert_eq!(security[0].path, "/api/security/login-ack");
 
