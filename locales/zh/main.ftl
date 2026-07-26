@@ -357,3 +357,4 @@ tui-invite-confirm-body = 加入“{ $list }”？
 tui-invite-confirm-hint = Enter：接受   Esc：取消
 tui-invite-accepting = 正在接受邀请...
 tui-help-actions-5 =   v 打开/接受链接   V 下一个链接   Alt+↑/↓ 滚动详情
+tui-help-note-links =   ↑/↓ 选择 Kramli 链接   Enter 打开/接受   v/V 也可用

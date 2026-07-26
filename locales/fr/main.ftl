@@ -357,3 +357,4 @@ tui-invite-confirm-body = Rejoindre « { $list } » ?
 tui-invite-confirm-hint = Entrée : accepter   Échap : annuler
 tui-invite-accepting = Acceptation de l’invitation...
 tui-help-actions-5 =   v Ouvrir/accepter le lien   V Lien suivant   Alt+↑/↓ Faire défiler
+tui-help-note-links =   ↑/↓ Choisir un lien Kramli   Entrée Ouvrir/accepter   v/V aussi

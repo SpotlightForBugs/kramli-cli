@@ -48,6 +48,58 @@ pub(crate) fn note_content(payload: &Value) -> Option<&str> {
     payload.get("note_content").and_then(Value::as_str)
 }
 
+const KRAMLI_LINK_PREVIEW_TYPE: &str = "kramli-link-preview";
+
+/// Collect note text fragments that may contain Kramli URLs for link-preview resolution.
+pub(crate) fn collect_note_link_sources(payload: &Value) -> Vec<String> {
+    let mut texts = Vec::new();
+    if let Some(content) = note_content(payload) {
+        if !content.trim().is_empty() {
+            texts.push(content.to_string());
+        }
+    }
+    let Some(delta) = payload.get("note_delta").and_then(Value::as_str) else {
+        return texts;
+    };
+    if delta.is_empty() {
+        return texts;
+    }
+    let Ok(operations) = serde_json::from_str::<Vec<Value>>(delta) else {
+        return texts;
+    };
+    for operation in operations {
+        let Some(object) = operation.as_object() else {
+            continue;
+        };
+        if let Some(insert) = object.get("insert") {
+            if let Some(text) = insert.as_str() {
+                if !text.trim().is_empty() {
+                    texts.push(text.to_string());
+                }
+            } else if let Some(embed) = insert.as_object() {
+                if embed.get("_type").and_then(Value::as_str) == Some(KRAMLI_LINK_PREVIEW_TYPE) {
+                    if let Some(source) = embed.get("source").and_then(Value::as_str) {
+                        texts.push(source.to_string());
+                    }
+                    if let Some(uri) = embed.get("uri").and_then(Value::as_str) {
+                        texts.push(uri.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(attrs) = object.get("attributes").and_then(Value::as_object) {
+            for key in ["a", "link"] {
+                if let Some(url) = attrs.get(key).and_then(Value::as_str) {
+                    if url.starts_with("http://") || url.starts_with("https://") {
+                        texts.push(url.to_string());
+                    }
+                }
+            }
+        }
+    }
+    texts
+}
+
 pub(crate) fn validate_plain_note(payload: &Value) -> Result<PlainNote, String> {
     if !is_note_payload(payload) {
         return Err(tr("cli-note-metadata-required"));
@@ -166,6 +218,28 @@ mod tests {
         ] {
             assert!(validate_plain_note(&unsafe_note).is_err());
         }
+    }
+
+    #[test]
+    fn collects_link_sources_from_note_delta() {
+        let payload = json!({
+            "list_type": "note",
+            "note_content": "Visible https://kramli.de/privacy",
+            "note_delta": "[\
+                {\"insert\":\"Title\\n\"},\
+                {\"insert\":\"Link\",\"attributes\":{\"a\":\"https://kram.li/i/InviteToken_1\"}},\
+                {\"insert\":{\"_type\":\"kramli-link-preview\",\"source\":\"https://kram.li/PvxNDHrxliG3YtBaq-k1fg.json\"}}\
+            ]",
+            "note_version": 1
+        });
+        let sources = collect_note_link_sources(&payload);
+        assert!(sources.iter().any(|text| text.contains("kramli.de/privacy")));
+        assert!(sources.iter().any(|text| text.contains("kram.li/i/InviteToken_1")));
+        assert!(
+            sources
+                .iter()
+                .any(|text| text.contains("PvxNDHrxliG3YtBaq-k1fg.json"))
+        );
     }
 
     #[test]

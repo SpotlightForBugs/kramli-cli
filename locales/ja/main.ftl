@@ -357,3 +357,4 @@ tui-invite-confirm-body = 「{ $list }」に参加しますか？
 tui-invite-confirm-hint = Enter: 参加   Esc: キャンセル
 tui-invite-accepting = 招待を処理中...
 tui-help-actions-5 =   v リンクを開く/参加   V 次のリンク   Alt+↑/↓ 詳細をスクロール
+tui-help-note-links =   ↑/↓ Kramliリンクを選択   Enter 開く/参加   v/Vも可

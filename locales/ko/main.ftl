@@ -357,3 +357,4 @@ tui-invite-confirm-body = “{ $list }”에 참여할까요?
 tui-invite-confirm-hint = Enter: 수락   Esc: 취소
 tui-invite-accepting = 초대 수락 중...
 tui-help-actions-5 =   v 링크 열기/수락   V 다음 링크   Alt+↑/↓ 세부 정보 스크롤
+tui-help-note-links =   ↑/↓ Kramli 링크 선택   Enter 열기/수락   v/V도 가능

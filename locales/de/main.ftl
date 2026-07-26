@@ -357,3 +357,4 @@ tui-invite-confirm-body = „{ $list }“ beitreten?
 tui-invite-confirm-hint = Eingabe: annehmen   Esc: abbrechen
 tui-invite-accepting = Einladung wird angenommen...
 tui-help-actions-5 =   v Link öffnen/annehmen   V Nächster Link   Alt+↑/↓ Details scrollen
+tui-help-note-links =   ↑/↓ Kramli-Link wählen   Enter Öffnen/Annehmen   v/V ebenfalls

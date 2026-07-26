@@ -357,3 +357,4 @@ tui-invite-confirm-body = Dołączyć do „{ $list }”?
 tui-invite-confirm-hint = Enter: zaakceptuj   Esc: anuluj
 tui-invite-accepting = Akceptowanie zaproszenia...
 tui-help-actions-5 =   v Otwórz/zaakceptuj link   V Następny link   Alt+↑/↓ Przewiń szczegóły
+tui-help-note-links =   ↑/↓ Wybierz link Kramli   Enter Otwórz/zaakceptuj   też v/V

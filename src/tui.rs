@@ -38,7 +38,7 @@ use crate::internal_links::{LinkPreview, LinkPreviewActionKind, LinkPreviewResol
 use crate::models::{
     Attachment, ItemComment, ListItem, ListState as ApiListState, Profile, ShoppingList,
 };
-use crate::note::{note_content, safe_update_payload, validate_plain_note};
+use crate::note::{collect_note_link_sources, note_content, safe_update_payload, validate_plain_note};
 
 const ACCENT: Color = Color::Rgb(126, 200, 255);
 const STATUS_COLOR: Color = Color::Rgb(126, 231, 155);
@@ -1927,8 +1927,8 @@ impl App {
         if let Some(list) = self.lists.iter().find(|list| list.id == list_id) {
             texts.push(list.name.clone());
         }
-        if let Some(content) = self.note_detail_cache.get(&list_id).and_then(note_content) {
-            texts.push(content.to_string());
+        if let Some(detail) = self.note_detail_cache.get(&list_id) {
+            texts.extend(collect_note_link_sources(detail));
         }
         self.load_link_previews(note_preview_owner(list_id), texts);
     }
@@ -1974,17 +1974,34 @@ impl App {
     }
 
     fn cycle_link_preview(&mut self) {
+        self.select_link_preview(1);
+    }
+
+    fn select_link_preview(&mut self, delta: isize) {
         let count = self.current_link_previews().len();
-        if count > 0 {
-            self.selected_link_preview = (self.selected_link_preview + 1) % count;
-            self.status = Some(tr_args(
-                "tui-link-preview-selected",
-                &[
-                    ("index", (self.selected_link_preview + 1).to_string()),
-                    ("count", count.to_string()),
-                ],
-            ));
+        if count == 0 {
+            return;
         }
+        let next = if delta < 0 {
+            (self.selected_link_preview + count - 1) % count
+        } else {
+            (self.selected_link_preview + 1) % count
+        };
+        self.selected_link_preview = next;
+        self.status = Some(tr_args(
+            "tui-link-preview-selected",
+            &[
+                ("index", (self.selected_link_preview + 1).to_string()),
+                ("count", count.to_string()),
+            ],
+        ));
+    }
+
+    fn note_link_navigation_active(&self) -> bool {
+        !self.current_link_previews().is_empty()
+            && self
+                .selected_list()
+                .is_some_and(ShoppingList::is_note)
     }
 
     async fn activate_link_preview(&mut self) -> Result<(), String> {
@@ -3059,6 +3076,24 @@ impl App {
             return Ok(());
         }
 
+        if self.editor.is_none() && self.note_link_navigation_active() {
+            match key.code {
+                KeyCode::Up if !key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.select_link_preview(-1);
+                    return Ok(());
+                }
+                KeyCode::Down if !key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.select_link_preview(1);
+                    return Ok(());
+                }
+                KeyCode::Enter => {
+                    self.activate_link_preview().await?;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
         if self.editor.is_none()
             && !self.current_link_previews().is_empty()
             && matches!(key.code, KeyCode::Char('v'))
@@ -3116,9 +3151,16 @@ impl App {
         let mut item_changed = false;
 
         match navigation_action_for_key(key.code) {
-            NavigationAction::NextMode => self.switch_mode(self.mode.next()),
-            NavigationAction::PreviousMode => self.switch_mode(self.mode.prev()),
-            NavigationAction::SwitchMode(mode) => self.switch_mode(mode),
+            NavigationAction::NextMode if shows_list_mode_tabs(self) => {
+                self.switch_mode(self.mode.next())
+            }
+            NavigationAction::PreviousMode if shows_list_mode_tabs(self) => {
+                self.switch_mode(self.mode.prev())
+            }
+            NavigationAction::SwitchMode(mode) if shows_list_mode_tabs(self) => {
+                self.switch_mode(mode)
+            }
+            NavigationAction::NextMode | NavigationAction::PreviousMode | NavigationAction::SwitchMode(_) => {}
             NavigationAction::MoveMonth(delta) => self.move_month_if_calendar_items(delta),
             NavigationAction::MoveHorizontal { delta, fallback } => {
                 self.move_horizontal_or_focus(delta, fallback);
@@ -3444,7 +3486,7 @@ impl App {
             return Ok(());
         };
         let previous_item = self.selected_item;
-        let layout = ui_layout(area);
+        let layout = ui_layout(area, shows_list_mode_tabs(self));
 
         if buttons.left_up && !rect_contains(layout.content, mouse.column, mouse.row) {
             self.clear_drag_state();
@@ -3526,6 +3568,9 @@ impl App {
     }
 
     fn handle_tab_mouse(&mut self, mouse: MouseEvent, layout: &UiLayout, left_down: bool) -> bool {
+        if !shows_list_mode_tabs(self) || layout.tab_chunks[0].height == 0 {
+            return false;
+        }
         if !left_down {
             return false;
         }
@@ -5381,24 +5426,36 @@ fn editor_field_hint(field: EditorField, mode: EditorMode) -> String {
     }
 }
 
-fn ui_layout(area: Rect) -> UiLayout {
+fn shows_list_mode_tabs(app: &App) -> bool {
+    !app
+        .selected_list()
+        .is_some_and(ShoppingList::is_note)
+}
+
+fn ui_layout(area: Rect, show_mode_tabs: bool) -> UiLayout {
+    let tab_height = if show_mode_tabs { 3 } else { 0 };
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(tab_height),
             Constraint::Min(6),
             Constraint::Length(5),
         ])
         .split(area);
 
-    let tab_chunks_vec = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-        ])
-        .split(vertical[0]);
+    let tab_chunks = if show_mode_tabs {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(33),
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+            ])
+            .split(vertical[0]);
+        [chunks[0], chunks[1], chunks[2]]
+    } else {
+        [Rect::default(), Rect::default(), Rect::default()]
+    };
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
@@ -5409,7 +5466,7 @@ fn ui_layout(area: Rect) -> UiLayout {
         lists: body[0],
         content: body[1],
         footer: vertical[2],
-        tab_chunks: [tab_chunks_vec[0], tab_chunks_vec[1], tab_chunks_vec[2]],
+        tab_chunks,
     }
 }
 
@@ -5618,9 +5675,12 @@ fn centered_popup(
 }
 
 fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
-    let layout = ui_layout(frame.area());
+    let show_mode_tabs = shows_list_mode_tabs(app);
+    let layout = ui_layout(frame.area(), show_mode_tabs);
 
-    draw_mode_tabs(frame, app, &layout);
+    if show_mode_tabs {
+        draw_mode_tabs(frame, app, &layout);
+    }
 
     draw_lists_panel(frame, app, layout.lists);
 
@@ -6844,6 +6904,7 @@ fn draw_help_overlay(frame: &mut Frame<'_>) {
         Line::from(tr("tui-help-actions-3")),
         Line::from(tr("tui-help-actions-4")),
         Line::from(tr("tui-help-actions-5")),
+        Line::from(tr("tui-help-note-links")),
         Line::from(""),
         Line::from(vec![Span::styled(
             tr("tui-help-editor"),
@@ -8880,6 +8941,63 @@ mod tests {
         assert!(text.contains("Plan https://kramli.de/privacy"));
         assert!(text.contains(&tr("link-preview-open")));
         assert!(app.items.is_empty());
+    }
+
+    #[test]
+    fn note_lists_hide_list_mode_tabs() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.note_detail_cache
+            .insert(1, json!({"note_content": "Plain note"}));
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        let text = terminal_text(&terminal);
+        assert!(!text.contains(&tr("view-board")));
+        assert!(!text.contains(&tr("view-calendar")));
+    }
+
+    #[tokio::test]
+    async fn note_link_previews_are_keyboard_selectable() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.apply_note_detail_result(
+            1,
+            Ok(json!({
+                "note_content": "One",
+                "note_delta": "[{\"insert\":\"https://kram.li/PvxNDHrxliG3YtBaq-k1fg.json\\n\"}]"
+            })),
+        );
+        app.link_previews.insert(
+            note_preview_owner(1),
+            vec![
+                test_link_preview(
+                    "https://kramli.de/lists/s/PvxNDHrxliG3YtBaq-k1fg",
+                    Some(LinkPreviewActionKind::Open),
+                    Some(46),
+                ),
+                test_link_preview(
+                    "https://kramli.de/privacy",
+                    Some(LinkPreviewActionKind::Open),
+                    None,
+                ),
+            ],
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.selected_link_preview, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.selected_link_preview, 0);
     }
 
     #[tokio::test]
@@ -11865,7 +11983,7 @@ mod tests {
         assert!(!app.handle_mouse_scroll(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1)));
 
         let area = Rect::new(0, 0, 120, 40);
-        let layout = ui_layout(area);
+        let layout = ui_layout(area, shows_list_mode_tabs(&app));
         assert!(!app.handle_tab_mouse(
             mouse(
                 MouseEventKind::Down(MouseButton::Left),
@@ -11923,7 +12041,7 @@ mod tests {
         app.items = vec![sample_item(1, "One"), sample_item(2, "Two")];
         app.items_cache.insert(1, app.items.clone());
         let area = Rect::new(0, 0, 120, 40);
-        let layout = ui_layout(area);
+        let layout = ui_layout(area, shows_list_mode_tabs(&app));
 
         app.show_help = true;
         assert!(app.handle_help_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1)));

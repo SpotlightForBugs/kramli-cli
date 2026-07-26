@@ -357,3 +357,4 @@ tui-invite-confirm-body = Join "{ $list }"?
 tui-invite-confirm-hint = Enter: accept   Esc: cancel
 tui-invite-accepting = Accepting invitation...
 tui-help-actions-5 =   v Open/accept link   V Select next link   Alt+↑/↓ Scroll details
+tui-help-note-links =   ↑/↓ Select Kramli link   Enter Open/accept   v/V also work
