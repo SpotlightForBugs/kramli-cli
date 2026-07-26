@@ -49,8 +49,13 @@ The script updates both `Cargo.toml` and `Cargo.lock` together and prevents comm
 
 Keep pull requests free of Cursor/Bugbot branding:
 
-- Do **not** add `Co-authored-by: Cursor <cursoragent@cursor.com>` trailers (`.githooks/commit-msg` strips them locally; run `git config core.hooksPath .githooks` after clone).
+- Do **not** add `Co-authored-by: Cursor <cursoragent@cursor.com>` trailers. The `.githooks/commit-msg` hook strips them locally, but **Cursor does not run repo hooks** unless you manually run `git config core.hooksPath .githooks` and Cursor happens to honor it (cloud agents generally do not).
 - Use `work/<topic>-<suffix>` branch names, not `cursor/...`.
 - Cloud-agent PR bodies must not include `CURSOR_AGENT_PR_BODY_*` wrappers, `cursor.com/agents/...` links, or Bugbot upsell text.
 
-The `clean-pr` GitHub Actions workflow scrubs those artifacts from PR descriptions and deletes Bugbot comments posted by the `cursor` bot. It cannot rewrite commit authorship on already-pushed commits.
+The `clean-pr` GitHub Actions workflow enforces this server-side:
+
+- **`fix-commits` job** — rewrites any `cursoragent@cursor.com` commits on the PR branch (author taken from a human `Co-authored-by` trailer or the PR opener), strips Cursor co-author lines, and force-pushes the branch.
+- **`clean` job** — scrubs PR descriptions and deletes Bugbot comments from the `cursor` bot.
+
+Fork PRs may not be rewriteable by `GITHUB_TOKEN` (same-repo branches only).
