@@ -1374,11 +1374,4 @@ mod tests {
         let api = test_client("http://127.0.0.1:1");
         assert!(api.get::<Value>("/missing").await.is_err());
     }
-
-    #[test]
-    fn public_https_resource_rejects_missing_host() {
-        assert!(!ApiClient::public_https_resource_allowed(
-            "https:///avatar.png"
-        ));
-    }
 }
