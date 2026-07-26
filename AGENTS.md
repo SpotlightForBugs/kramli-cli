@@ -59,3 +59,7 @@ The `clean-pr` GitHub Actions workflow enforces this server-side:
 - **`clean` job** — scrubs PR descriptions and deletes Bugbot comments from the `cursor` bot.
 
 Fork PRs may not be rewriteable by `GITHUB_TOKEN` (same-repo branches only).
+
+## Workflow verification
+
+PRs opened to validate `clean-pr` should include at least one `cursoragent@cursor.com` commit so the `fix-commits` job has something to rewrite.
