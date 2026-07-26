@@ -492,6 +492,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_search_response_object_skips_empty_grouped_wrapper() {
+        let parsed = SearchResponse::from_value(serde_json::json!({
+            "lists": null,
+            "items": null,
+            "type": "list",
+            "id": 5,
+            "name": "Weekend"
+        }))
+        .expect("empty grouped wrapper should fall back to flat hit");
+        match parsed {
+            SearchResponse::Flat(hits) => {
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].id, 5);
+            }
+            other => panic!("expected flat hit, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_search_response_accepts_flat_hits() {
         let value = serde_json::json!([
             {

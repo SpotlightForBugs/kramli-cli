@@ -1407,10 +1407,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_delete_ok_reports_network_errors() {
+        let api = test_client("http://127.0.0.1:1");
+        assert!(api.delete_ok("/items/1").await.is_err());
+    }
+
+    #[tokio::test]
     async fn api_client_new_rejects_foreign_test_tasks() {
         let result = tokio::spawn(async { ApiClient::new(&Config::load()) })
             .await
             .expect("spawn should finish");
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn api_request_helpers_report_network_errors_for_all_verbs() {
+        let api = test_client("http://127.0.0.1:1");
+        assert!(api.get::<Value>("/missing").await.is_err());
+        assert!(api.get_query::<Value>("/search", &[("q", "milk")]).await.is_err());
+        assert!(api
+            .post::<Value, Value>("/items", &json!({"text": "Milk"}))
+            .await
+            .is_err());
+        assert!(api
+            .put::<Value, Value>("/items/1", &json!({"text": "Eggs"}))
+            .await
+            .is_err());
+        assert!(api
+            .patch_json::<Value, Value>("/items/1/done", &json!({}))
+            .await
+            .is_err());
+        assert!(api.delete::<Value>("/items/1").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn api_retry_delay_honors_retry_after_header() {
+        let (api, server) = api_with_responses(vec![
+            TestResponse {
+                status: 429,
+                headers: vec![("Retry-After", "not-a-number")],
+                body: Vec::new(),
+            },
+            TestResponse::json(json!({"ok": true})),
+        ])
+        .await;
+        let got: Value = api.get("/ok").await.unwrap();
+        assert!(got["ok"].as_bool().unwrap_or(false));
+        let requests = server.await.expect("server finished");
+        assert_eq!(requests.len(), 2);
     }
 }

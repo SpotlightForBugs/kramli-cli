@@ -863,4 +863,33 @@ mod tests {
         assert!(exc.thread_id.is_none());
         assert!(exc.mechanism.is_none());
     }
+
+    #[test]
+    fn body_prefix_strips_response_body_lines() {
+        assert_eq!(
+            body_prefix("Request failed\nBody: {\"secret\":\"value\"}"),
+            "Request failed"
+        );
+        assert_eq!(body_prefix("No body here"), "No body here");
+    }
+
+    #[test]
+    fn trace_span_helpers_are_safe_without_active_client() {
+        let span = TraceSpan::child("test.child", "test.child");
+        span.set_tag("operation", "demo");
+        span.set_tag("bad tag!", "value");
+        span.set_data_i64("count", 3);
+        span.set_status(true);
+        span.finish();
+    }
+
+    #[test]
+    fn trace_transaction_finish_handles_error_capture_branches() {
+        with_env_var(KRAMLI_CAPTURE_COMMAND_ERRORS_ENV, Some("yes"), || {
+            let tx = TraceTransaction::start("test.command", "test.command");
+            tx.set_tag("command", "demo");
+            tx.set_data_i64("cli.has_command", 0);
+            tx.finish(false);
+        });
+    }
 }

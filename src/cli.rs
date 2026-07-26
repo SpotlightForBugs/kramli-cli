@@ -3938,6 +3938,793 @@ mod tests {
             .iter()
             .all(|request| !request.starts_with("POST /api/invite-links/")));
     }
+
+    fn temp_attachment_png(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "kramli-cli-{name}-{}-{}.png",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::write(&path, [137, 80, 78, 71]).expect("attachment png should write");
+        path
+    }
+
+    #[tokio::test]
+    async fn dry_run_item_mutation_contracts_cover_remaining_branches() {
+        let add = dry_run_requests_for_command(&Commands::Items {
+            action: Box::new(ItemCmd::Add {
+                list_id: 7,
+                text: "Bread".to_string(),
+                quantity: Some("2".to_string()),
+                due: Some("2026-12-31".to_string()),
+                due_time: Some("09:00".to_string()),
+                planned: Some("2026-12-30".to_string()),
+                planned_time: Some("08:00".to_string()),
+                reminder: Some(true),
+                reminder_time: Some("08:30".to_string()),
+                reminder_days_before: Some(1),
+                reminder_offsets: Some(vec![30, 60]),
+                travel_time_minutes: Some(20),
+                priority: Some("high".to_string()),
+                tags: Some("bakery,fresh".to_string()),
+                notes: Some("whole grain".to_string()),
+                parent: Some(3),
+                assign: Some("1,2".to_string()),
+                color: Some("#aabbcc".to_string()),
+                progress: Some("planned".to_string()),
+            }),
+        })
+        .await
+        .expect("item add dry-run should build")
+        .expect("item add should be dry-runnable");
+        assert_eq!(add[0].method, "POST");
+        assert_eq!(add[0].path, "/api/lists/7/items");
+        assert!(add[0].body.as_ref().is_some_and(|body| body.get("text").is_some()));
+
+        let done = dry_run_requests_for_command(&Commands::Items {
+            action: Box::new(ItemCmd::Done { id: 11 }),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(done[0].path, "/api/items/11/done");
+
+        let vote = dry_run_requests_for_command(&Commands::Items {
+            action: Box::new(ItemCmd::Vote { id: 11 }),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(vote[0].path, "/api/items/11/upvote");
+
+        let delete = dry_run_requests_for_command(&Commands::Items {
+            action: Box::new(ItemCmd::Delete { id: 11 }),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(delete[0].method, "DELETE");
+        assert_eq!(delete[0].path, "/api/items/11");
+
+        let comment = dry_run_requests_for_command(&Commands::Items {
+            action: Box::new(ItemCmd::Comment {
+                id: 11,
+                text: "Needs salt".to_string(),
+            }),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(comment[0].path, "/api/items/11/comments");
+        assert_eq!(
+            comment[0].body.as_ref().and_then(|body| body.get("text")),
+            Some(&Value::String("Needs salt".to_string()))
+        );
+
+        let check_all = dry_run_requests_for_command(&Commands::Items {
+            action: Box::new(ItemCmd::CheckAll { list_id: 7 }),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(check_all[0].path, "/api/lists/7/check-all");
+
+        let clear_done = dry_run_requests_for_command(&Commands::Items {
+            action: Box::new(ItemCmd::ClearDone { list_id: 7 }),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(clear_done[0].path, "/api/lists/7/clear-done");
+
+        assert!(
+            dry_run_requests_for_command(&Commands::Items {
+                action: Box::new(ItemCmd::List {
+                    list_id: 7,
+                    open: false,
+                    completed: false,
+                    state: None,
+                    contains: None,
+                    newest: false,
+                    oldest: false,
+                    limit: None,
+                }),
+            })
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            dry_run_requests_for_command(&Commands::Items {
+                action: Box::new(ItemCmd::Show { id: 5 }),
+            })
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            dry_run_requests_for_command(&Commands::Items {
+                action: Box::new(ItemCmd::DoneList { list_id: 7 }),
+            })
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_json_preview_prints_structured_request_payload() {
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", "http://127.0.0.1:9"),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_command_with_context(
+                    Commands::Items {
+                        action: Box::new(ItemCmd::Add {
+                            list_id: 7,
+                            text: "Preview".to_string(),
+                            quantity: None,
+                            due: None,
+                            due_time: None,
+                            planned: None,
+                            planned_time: None,
+                            reminder: None,
+                            reminder_time: None,
+                            reminder_days_before: None,
+                            reminder_offsets: None,
+                            travel_time_minutes: None,
+                            priority: None,
+                            tags: None,
+                            notes: Some("dry-run body".to_string()),
+                            parent: None,
+                            assign: None,
+                            color: None,
+                            progress: None,
+                        }),
+                    },
+                    CommandContext {
+                        as_json: true,
+                        dry_run: true,
+                    },
+                )
+                .await
+                .expect("json dry-run preview should succeed");
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn dry_run_human_preview_prints_request_body_summary() {
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", "http://127.0.0.1:9"),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_command_with_context(
+                    Commands::Items {
+                        action: Box::new(ItemCmd::Comment {
+                            id: 4,
+                            text: "human preview".to_string(),
+                        }),
+                    },
+                    CommandContext {
+                        as_json: false,
+                        dry_run: true,
+                    },
+                )
+                .await
+                .expect("human dry-run preview with body should succeed");
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn dry_run_without_preview_falls_through_to_dispatch() {
+        let profile = serde_json::to_string(&sample_profile(Some("en"))).unwrap();
+        let (base_url, requests) = server_with_base_url(vec![
+            json!({"lists": [], "items": []}).to_string(),
+            profile.clone(),
+            json!([]).to_string(),
+        ])
+        .await;
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+                (TEST_KRAMLI_AUTO_HANDOFF_ENV, "false"),
+            ],
+            || async {
+                run_command_with_context(
+                    Commands::Search {
+                        query: "milk".to_string(),
+                    },
+                    CommandContext {
+                        as_json: true,
+                        dry_run: true,
+                    },
+                )
+                .await
+                .expect("search dry-run should dispatch");
+                run_command_with_context(
+                    Commands::Status,
+                    CommandContext {
+                        as_json: true,
+                        dry_run: true,
+                    },
+                )
+                .await
+                .expect("status dry-run should dispatch");
+                run_command_with_context(
+                    Commands::Items {
+                        action: Box::new(ItemCmd::List {
+                            list_id: 7,
+                            open: false,
+                            completed: false,
+                            state: None,
+                            contains: None,
+                            newest: false,
+                            oldest: false,
+                            limit: None,
+                        }),
+                    },
+                    CommandContext {
+                        as_json: true,
+                        dry_run: true,
+                    },
+                )
+                .await
+                .expect("items list dry-run should dispatch");
+                run_command_with_context(
+                    Commands::Login { url: None },
+                    CommandContext {
+                        as_json: false,
+                        dry_run: true,
+                    },
+                )
+                .await
+                .expect("login dry-run should dispatch through test stub");
+                run_command_with_context(
+                    Commands::Logout,
+                    CommandContext {
+                        as_json: false,
+                        dry_run: true,
+                    },
+                )
+                .await
+                .expect("logout dry-run should dispatch through test stub");
+            },
+        )
+        .await;
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests[0], "GET /api/search?q=milk HTTP/1.1");
+        assert_eq!(requests[1], "GET /api/profile HTTP/1.1");
+        assert_eq!(requests[2], "GET /api/lists/7/items HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn dry_run_item_attach_has_no_preview_and_executes_upload() {
+        let png = temp_attachment_png("dry-run-attach");
+        let upload_response =
+            json!({"attachment": {"id": 12, "filename": "photo.png"}}).to_string();
+        let (base_url, requests) = server_with_base_url(vec![upload_response]).await;
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                assert!(
+                    dry_run_requests_for_command(&Commands::Items {
+                        action: Box::new(ItemCmd::Attach {
+                            id: 9,
+                            files: vec![png.clone()],
+                            sensitive: true,
+                        }),
+                    })
+                    .await
+                    .unwrap()
+                    .is_none()
+                );
+
+                run_command_with_context(
+                    Commands::Items {
+                        action: Box::new(ItemCmd::Attach {
+                            id: 9,
+                            files: vec![png],
+                            sensitive: true,
+                        }),
+                    },
+                    CommandContext {
+                        as_json: true,
+                        dry_run: true,
+                    },
+                )
+                .await
+                .expect("attach dry-run should fall through to upload");
+            },
+        )
+        .await;
+
+        let request = requests.await.expect("test server should finish");
+        assert_eq!(request.len(), 1);
+        assert!(
+            request[0].starts_with("POST /api/items/9/attachments"),
+            "unexpected request: {}",
+            request[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_member_and_folder_partial_update_contracts_are_stable() {
+        let role = dry_run_requests_for_command(&Commands::Members {
+            action: MemberCmd::Role {
+                list_id: 7,
+                user_id: 2,
+                role: "viewer".to_string(),
+            },
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(role[0].path, "/api/lists/7/members/2");
+
+        let unshare = dry_run_requests_for_command(&Commands::Members {
+            action: MemberCmd::Unshare { list_id: 7 },
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(unshare[0].path, "/api/lists/7/share");
+
+        let leave = dry_run_requests_for_command(&Commands::Members {
+            action: MemberCmd::Leave { list_id: 7 },
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(leave[0].path, "/api/lists/7/leave");
+
+        let folder_update = dry_run_requests_for_command(&Commands::Folders {
+            action: FolderCmd::Update {
+                id: 5,
+                name: None,
+                icon: Some("archive".to_string()),
+                color: Some("#112233".to_string()),
+                parent: Some(2),
+            },
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(folder_update[0].path, "/api/folders/5");
+        let body = folder_update[0].body.as_ref().expect("body should exist");
+        assert_eq!(body.get("icon"), Some(&Value::String("archive".to_string())));
+        assert_eq!(body.get("color"), Some(&Value::String("#112233".to_string())));
+        assert_eq!(body.get("parent_folder_id"), Some(&Value::from(2)));
+
+        let accept_docs = dry_run_requests_for_command(&Commands::AcceptTerms {
+            docs: Some(vec!["agb".to_string(), "privacy".to_string()]),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(accept_docs[0].path, "/api/accept-terms");
+        assert!(accept_docs[0]
+            .body
+            .as_ref()
+            .and_then(|body| body.get("docs"))
+            .is_some_and(Value::is_array));
+    }
+
+    #[tokio::test]
+    async fn api_with_responses_waits_for_mock_registration_before_accepting() {
+        let (api, requests) = api_with_responses(vec![json!({"ok": true}).to_string()]).await;
+        api.get::<Value>("/ping")
+            .await
+            .expect("mock server should respond");
+        let captured = requests.await.expect("test server should finish");
+        assert_eq!(captured, vec!["GET /api/ping HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn with_env_vars_async_unlocked_removes_vars_that_were_unset() {
+        let probe = format!(
+            "{TEST_ENV_FLAG_ENV}_{}_{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        );
+        std::env::remove_var(&probe);
+        with_env_vars_async_unlocked(&[(probe.as_str(), "temporary")], || async {
+            assert_eq!(std::env::var(&probe).ok(), Some("temporary".to_string()));
+        })
+        .await;
+        assert!(std::env::var(&probe).is_err());
+    }
+
+    #[tokio::test]
+    async fn run_batch_keep_going_executes_remaining_lines_after_failure() {
+        let file = temp_batch_file("batch-keep-going", "not-a-command\nconfig\n");
+        assert!(run_batch(&file, true, false).await.is_err());
+
+        let empty_argv = temp_batch_file("batch-empty-argv", "kramli\nconfig\n");
+        run_batch(&empty_argv, false, false)
+            .await
+            .expect("empty argv line should be skipped and config should succeed");
+    }
+
+    #[tokio::test]
+    async fn run_batch_json_keep_going_continues_after_child_and_parse_errors() {
+        let batch_file = temp_batch_file("json-batch-keep-going", "batch -\nstatus\n");
+        let ok_script = temp_batch_executable(
+            "json-batch-keep-script",
+            "#!/bin/sh\nif [ \"$1\" = \"status\" ]; then printf '{\"logged_in\":true}\\n'; exit 0; fi\nprintf 'not-json\\n'; exit 1\n",
+        );
+
+        with_env_vars_async(
+            &[(KRAMLI_BATCH_EXECUTABLE_ENV, ok_script.as_str())],
+            || async {
+                assert!(run_batch_json(&batch_file, false).await.is_err());
+                assert!(
+                    run_batch_json(&batch_file, true)
+                        .await
+                        .is_err(),
+                    "keep-going should still report failure after continuing"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn run_login_command_dispatch_paths_are_covered_under_cfg_test() {
+        with_env_vars_async(
+            &[("KRAMLI_URL", ""), (TEST_KRAMLI_API_KEY_ENV, "")],
+            || async {
+                run_login_command(None)
+                    .await
+                    .expect("test login command stub should succeed");
+                run_logout_command().expect("test logout command stub should succeed");
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn run_items_attach_dispatches_multipart_upload() {
+        let png = temp_attachment_png("attach-dispatch");
+        let upload_response =
+            json!({"attachment": {"id": 3, "filename": "photo.png"}}).to_string();
+        let (base_url, requests) = server_with_base_url(vec![upload_response]).await;
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_items(
+                    ItemCmd::Attach {
+                        id: 9,
+                        files: vec![png],
+                        sensitive: false,
+                    },
+                    true,
+                )
+                .await
+                .expect("items attach should dispatch");
+            },
+        )
+        .await;
+
+        let request = requests.await.expect("test server should finish");
+        assert_eq!(request.len(), 1);
+        assert!(request[0].starts_with("POST /api/items/9/attachments"));
+    }
+
+    #[tokio::test]
+    async fn invite_undo_redo_and_dispatch_cover_remaining_branches() {
+        let invite_preview = json!({
+            "list_id": 7,
+            "list_name": "Shared",
+            "already_member": false,
+            "invite_url": "https://kram.li/i/InviteToken_1"
+        })
+        .to_string();
+        let member_preview = json!({
+            "list_id": 8,
+            "list_name": "Member",
+            "already_member": true,
+            "invite_url": "https://kram.li/i/MemberToken_1"
+        })
+        .to_string();
+        let accept_result = json!({"ok": true, "list_id": 7}).to_string();
+        let (base_url, requests) = server_with_base_url(vec![
+            invite_preview.clone(),
+            member_preview,
+            invite_preview.clone(),
+            accept_result,
+            json!({"ok": true}).to_string(),
+            json!({"ok": true}).to_string(),
+            json!({"ok": true}).to_string(),
+        ])
+        .await;
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_invite(
+                    InviteCmd::Inspect {
+                        link: "https://kram.li/i/InviteToken_1".to_string(),
+                    },
+                    false,
+                )
+                .await
+                .expect("invite inspect human output should succeed");
+                run_invite(
+                    InviteCmd::Inspect {
+                        link: "https://kram.li/i/MemberToken_1".to_string(),
+                    },
+                    true,
+                )
+                .await
+                .expect("already-member invite inspect json should succeed");
+                assert!(run_invite(
+                    InviteCmd::Accept {
+                        link: "https://kram.li/i/InviteToken_1".to_string(),
+                        confirm: false,
+                    },
+                    false,
+                )
+                .await
+                .is_err());
+                run_invite(
+                    InviteCmd::Accept {
+                        link: "https://kram.li/i/InviteToken_1".to_string(),
+                        confirm: true,
+                    },
+                    true,
+                )
+                .await
+                .expect("confirmed invite accept should succeed");
+                run_command(Commands::Undo { list_id: 9 }, false)
+                    .await
+                    .expect("undo dispatch should succeed");
+                run_command(Commands::Redo { list_id: 9 }, false)
+                    .await
+                    .expect("redo dispatch should succeed");
+            },
+        )
+        .await;
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests.len(), 7);
+        assert!(requests.iter().any(|request| {
+            request == "POST /api/invite-links/InviteToken_1/accept HTTP/1.1"
+        }));
+        assert_eq!(requests[5], "POST /api/lists/9/undo HTTP/1.1");
+        assert_eq!(requests[6], "POST /api/lists/9/redo HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn dry_run_member_invite_and_list_move_contracts_are_stable() {
+        let invite = dry_run_requests_for_command(&Commands::Members {
+            action: MemberCmd::Invite {
+                list_id: 7,
+                email: "ada@example.test".to_string(),
+                role: "viewer".to_string(),
+            },
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(invite[0].path, "/api/lists/7/invite");
+
+        let invite_link = dry_run_requests_for_command(&Commands::Members {
+            action: MemberCmd::InviteLink { list_id: 7 },
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(invite_link[0].path, "/api/lists/7/invite-link");
+
+        let list_move = dry_run_requests_for_command(&Commands::Lists {
+            action: ListCmd::Move {
+                id: 9,
+                folder_id: Some(3),
+            },
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(list_move[0].path, "/api/lists/9");
+        assert_eq!(
+            list_move[0].body.as_ref().and_then(|body| body.get("folder_id")),
+            Some(&Value::from(3))
+        );
+    }
+
+    #[tokio::test]
+    async fn item_vote_removed_attach_human_and_empty_done_list_outputs_are_covered() {
+        let png = temp_attachment_png("vote-attach-empty");
+        let responses = vec![
+            json!({"upvoted_by_me": false, "upvote_count": 0}).to_string(),
+            json!({"attachment": {"id": 1, "filename": "photo.png"}}).to_string(),
+            list_response(7, "Groceries"),
+            json!([]).to_string(),
+        ];
+        let (api, requests) = api_with_responses(responses).await;
+
+        run_items_vote(&api, false, 9)
+            .await
+            .expect("vote removed human output should succeed");
+        run_items_attach(&api, false, 9, vec![png], false)
+            .await
+            .expect("attach human output should succeed");
+        run_items_done_list(&api, false, 7)
+            .await
+            .expect("empty done list human output should succeed");
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests[0], "PATCH /api/items/9/upvote HTTP/1.1");
+        assert!(requests[1].starts_with("POST /api/items/9/attachments"));
+        assert_eq!(requests[2], "GET /api/lists/7 HTTP/1.1");
+        assert_eq!(requests[3], "GET /api/lists/7/items HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn run_config_human_output_covers_disabled_setting_branches() {
+        let temp_config_root = std::env::temp_dir().join(format!(
+            "kramli-cli-config-human-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&temp_config_root).expect("temp config dir should be created");
+        with_env_vars_async(
+            &[
+                (
+                    "HOME",
+                    temp_config_root
+                        .to_str()
+                        .expect("temp config dir should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    temp_config_root
+                        .to_str()
+                        .expect("temp config dir should be valid utf-8"),
+                ),
+                ("KRAMLI_URL", "http://127.0.0.1:9"),
+                (TEST_KRAMLI_API_KEY_ENV, ""),
+                ("KRAMLI_TELEMETRY", "0"),
+                ("KRAMLI_BOOTSTRAP_ICONS", "0"),
+                ("KRAMLI_AUTO_UPDATE_CHECK", "0"),
+            ],
+            || async {
+                run_config(false).expect("human config should render disabled branches");
+                run_config(true).expect("json config should render");
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn api_with_responses_without_mock_registration_still_serves() {
+        let (api, requests) = api_with_responses(vec![json!({"ok": true}).to_string()]).await;
+        api.get::<Value>("/ready")
+            .await
+            .expect("server should accept without registration delay");
+        let captured = requests.await.expect("test server should finish");
+        assert_eq!(captured, vec!["GET /api/ready HTTP/1.1"]);
+    }
+
+    #[test]
+    fn batch_child_args_rejects_empty_command_after_json_strip() {
+        assert!(batch_child_args("--json").is_err());
+    }
+
+    #[tokio::test]
+    async fn run_traced_entrypoint_covers_missing_command_branch() {
+        with_env_vars_async(&[("KRAMLI_URL", ""), (TEST_KRAMLI_API_KEY_ENV, "")], || async {
+            run(Cli {
+                json: false,
+                interactive: false,
+                dry_run: false,
+                command: None,
+            })
+            .await
+            .expect("missing command should print help through traced entrypoint");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn run_update_check_and_privacy_command_stubs_are_reachable() {
+        with_env_vars_async(&[("KRAMLI_URL", ""), (TEST_KRAMLI_API_KEY_ENV, "")], || async {
+            run_update_check_command(true)
+                .await
+                .expect("test update-check stub should succeed");
+            run_privacy_command(PrivacyCmd::Reset, false)
+                .expect("test privacy stub should succeed");
+            run_mcp_command()
+                .await
+                .expect("test mcp stub should succeed");
+            run_tui_command()
+                .await
+                .expect("test tui stub should succeed");
+        })
+        .await;
+    }
+
+    #[test]
+    fn default_handoff_device_label_uses_explicit_and_env_values() {
+        assert_eq!(
+            default_handoff_device_label(Some("  Phone  ".to_string())),
+            "Phone"
+        );
+        crate::test_env::with_env_vars(&[(KRAMLI_DEVICE_LABEL_ENV, "Desk")], || {
+            assert_eq!(default_handoff_device_label(None), "Desk");
+        });
+    }
+
+    #[tokio::test]
+    async fn security_status_human_output_covers_disabled_login_alerts() {
+        let (base_url, requests) = server_with_base_url(vec![json!({
+            "security": {
+                "level_label": "Good",
+                "score": 80,
+                "max_score": 100,
+                "factors": [{"label": "2FA", "met": true}]
+            },
+            "security_email_login_alerts": false
+        })
+        .to_string()])
+        .await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_security(SecurityCmd::Status, false)
+                    .await
+                    .expect("security human output with disabled login alerts should succeed");
+            },
+        )
+        .await;
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["GET /api/security HTTP/1.1"]);
+    }
 }
 
 #[derive(Subcommand)]

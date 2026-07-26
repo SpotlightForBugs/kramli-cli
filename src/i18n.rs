@@ -265,6 +265,15 @@ mod tests {
     }
 
     #[test]
+    fn try_parse_supported_locale_rejects_unsupported_primary_language() {
+        assert!(try_parse_supported_locale("haw-US").is_none());
+        assert_eq!(
+            try_parse_supported_locale("de-XX").unwrap().to_string(),
+            "de-XX"
+        );
+    }
+
+    #[test]
     fn extract_keys_skips_blank_and_continuation_lines() {
         let keys = extract_keys("valid = Value\n   continuation\n\n# comment\n = blank\n");
         assert_eq!(keys, vec!["valid".to_string()]);

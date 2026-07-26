@@ -1241,8 +1241,8 @@ mod tests {
         color_dot, colorize_bold_text, colorize_text, date_with_time, display_icon, fallback_icon,
         folder_path_parts, human_size, item_status_parts, list_display_name_with_folder,
         list_folder_parts, map_bootstrap_icon_emoji, map_bootstrap_icon_label, member_type_label,
-        parse_hex_color, print_activity, print_folders, print_item_detail, print_items,
-        print_items_for_list, print_list_detail, print_lists, print_members, print_search,
+        parse_hex_color, print_activity,         print_folders, print_item_detail, print_items,
+        print_items_for_list, print_link_previews, print_list_detail, print_lists, print_members, print_search,
         print_wrapped_item_line, reminder_offsets_label, role_label, schedule_lines, strip_html,
         view_mode_label, visible_width_ansi, wrap_ansi_with_prefix, IconStyle, ItemComments,
     };
@@ -1889,5 +1889,42 @@ mod tests {
 
         item.notes = Some("<p>  </p>".to_string());
         print_item_detail(&item, &[]);
+    }
+
+    #[test]
+    fn print_link_previews_cover_invite_and_accept_actions() {
+        use crate::internal_links::{LinkPreview, LinkPreviewAction, LinkPreviewActionKind};
+
+        print_link_previews(&[LinkPreview {
+            kind: crate::internal_links::InternalLinkKind::Invite,
+            canonical_url: "https://kram.li/i/InviteToken_1".to_string(),
+            display_url: "https://kram.li/i/InviteToken_1".to_string(),
+            resolved: true,
+            list_id: Some(7),
+            item_id: None,
+            list_name: Some("Shared".to_string()),
+            list_icon: None,
+            list_color: None,
+            list_type: None,
+            item_text: None,
+            folder_name: None,
+            folder_icon: None,
+            folder_color: None,
+            role: None,
+            invited_by: Some("Ada".to_string()),
+            action: Some(LinkPreviewAction {
+                kind: LinkPreviewActionKind::Accept,
+                target_url: "https://kram.li/i/InviteToken_1".to_string(),
+                requires_confirmation: true,
+            }),
+        }]);
+    }
+
+    #[test]
+    fn bootstrap_icon_asset_name_parses_inline_class_icons() {
+        assert_eq!(
+            bootstrap_icon_asset_name(r#"<i class="bi bi-cart-fill"></i>"#),
+            Some("cart-fill".to_string())
+        );
     }
 }

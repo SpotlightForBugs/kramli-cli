@@ -480,4 +480,39 @@ mod tests {
             },
         );
     }
+
+    #[test]
+    fn first_run_preferences_skip_save_when_both_answers_already_saved() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-main-no-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0_u128, |value| value.as_nanos())
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+        let config_path = config_root.join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{"telemetry_enabled":true,"bootstrap_icons_enabled":true}"#,
+        )
+        .expect("seed config");
+
+        crate::test_env::with_env_vars(
+            &[(
+                crate::config::KRAMLI_CONFIG_PATH_ENV,
+                config_path
+                    .to_str()
+                    .expect("config path should be valid utf-8"),
+            )],
+            || {
+                let cli = cli_for(Some(Commands::Status));
+                ensure_first_run_preferences_with(&cli, true, true, |_, _| {
+                    panic!("configured preferences should not prompt")
+                })
+                .expect("configured preferences should not prompt");
+            },
+        );
+        let _ = std::fs::remove_dir_all(config_root);
+    }
 }

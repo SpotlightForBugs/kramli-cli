@@ -291,6 +291,32 @@ mod tests {
     }
 
     #[test]
+    fn collect_note_link_sources_reads_embed_source_and_uri() {
+        let delta = json!({
+            "list_type": "note",
+            "note_delta": "[{\"insert\":{\"_type\":\"kramli-link-preview\",\"source\":\"https://kramli.de/source\",\"uri\":\"https://kramli.de/uri\"}}]"
+        });
+        let sources = collect_note_link_sources(&delta);
+        assert!(sources.contains(&"https://kramli.de/source".to_string()));
+        assert!(sources.contains(&"https://kramli.de/uri".to_string()));
+    }
+
+    #[test]
+    fn collect_note_link_sources_reads_anchor_attributes() {
+        let delta = json!({
+            "list_type": "note",
+            "note_delta": "[{\"insert\":\"docs\",\"attributes\":{\"a\":\"https://kramli.de/docs\"}}]"
+        });
+        assert_eq!(
+            collect_note_link_sources(&delta),
+            vec![
+                "docs".to_string(),
+                "https://kramli.de/docs".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn validate_plain_note_accepts_empty_delta_operations() {
         let payload = json!({
             "list_type": "note",

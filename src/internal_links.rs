@@ -1268,4 +1268,31 @@ mod tests {
         assert!(page.resolved);
         assert_eq!(page.action.unwrap().kind, LinkPreviewActionKind::Open);
     }
+
+    #[tokio::test]
+    async fn resolve_url_strict_returns_none_for_external_urls() {
+        let api = ApiClient::for_tests("http://127.0.0.1:9");
+        let mut resolver = LinkPreviewResolver::new(api);
+        assert!(
+            resolver
+                .resolve_url_strict("https://example.test/lists/42")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_texts_uses_cache_for_duplicate_links_in_one_pass() {
+        let (mut resolver, server) = resolver_with_responses(vec![TestResponse {
+            status: 200,
+            body: json!({"resolved": true, "list_name": "Cached"}),
+        }])
+        .await;
+        let text = "https://kramli.de/lists/42 and https://kramli.de/lists/42";
+        let previews = resolver.resolve_texts([text]).await;
+        assert_eq!(previews.len(), 1);
+        assert!(previews[0].resolved);
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
 }

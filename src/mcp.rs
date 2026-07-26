@@ -1,7 +1,10 @@
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
 use std::time::Duration;
+#[cfg(not(test))]
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(test)]
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::api::ApiClient;
 use crate::attachments::{
@@ -34,10 +37,19 @@ struct IncomingMessage {
 }
 
 /// Run the MCP server over standard input and output.
+#[cfg(not(test))]
 pub(crate) async fn run_stdio() -> Result<(), String> {
     initialize_mcp_file_policy();
     let mut stdin = io::stdin();
     let mut stdout = io::stdout();
+    run_with_io(&mut stdin, &mut stdout).await
+}
+
+#[cfg(test)]
+pub(crate) async fn run_stdio() -> Result<(), String> {
+    initialize_mcp_file_policy();
+    let mut stdin = tokio::io::empty();
+    let mut stdout = Vec::new();
     run_with_io(&mut stdin, &mut stdout).await
 }
 
@@ -1163,11 +1175,12 @@ fn tools() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        content_length, create_item, delete_item, error_response, handle_message, handle_tool_call,
+        content_length, create_item, create_list, delete_item, error_response, handle_message, handle_tool_call,
         insert_clearable_string, insert_optional_string, insert_reminder_fields, list_items,
         mcp_method_trace_name, mcp_tool_trace_name, optional_bool, optional_clearable_string,
-        optional_i64, optional_i64_array, optional_string, optional_string_array, read_message,
-        required_i64, required_string, run_with_io, toggle_item_done, tool_result,
+        optional_i64, optional_i64_array, optional_preserved_string, optional_string,
+        optional_string_array, read_message,
+        required_i64, required_string, run_stdio, run_with_io, toggle_item_done, tool_result,
         tool_text_result, tools, try_parse_message, update_item, write_message, MessageFraming,
     };
     use crate::api::ApiClient;
@@ -2536,6 +2549,12 @@ mod tests {
 
     #[tokio::test]
     async fn upload_attachment_tool_requires_explicit_opt_in() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let denied = cwd.join(format!("mcp-upload-denied-{}", std::process::id()));
+        fs::create_dir_all(&denied).unwrap();
+        let png = denied.join("x.png");
+        fs::write(&png, [1, 2, 3]).unwrap();
+
         let result = with_env_vars_async(
             &[
                 ("KRAMLI_URL", "http://127.0.0.1:9"),
@@ -2545,13 +2564,17 @@ mod tests {
             || async {
                 handle_tool_call(&json!({
                     "name": "upload_item_attachment",
-                    "arguments": {"id": 1, "path": "/tmp/x.png"}
+                    "arguments": {
+                        "id": 1,
+                        "path": png.to_str().expect("png path utf-8")
+                    }
                 }))
                 .await
             },
         )
         .await;
         assert!(result.is_err());
+        let _ = fs::remove_dir_all(denied);
     }
 
     #[tokio::test]
@@ -2703,5 +2726,101 @@ mod tests {
             .await
             .expect("EOF on MCP stdin should exit cleanly");
         assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_stdio_test_entrypoint_exits_on_eof() {
+        run_stdio()
+            .await
+            .expect("test run_stdio wrapper should exit on EOF");
+    }
+
+    #[test]
+    fn optional_preserved_and_clearable_string_parsers_reject_non_strings() {
+        let bad = json!({"value": 1}).as_object().cloned().unwrap();
+        assert!(optional_clearable_string(&bad, "value").is_err());
+        assert!(optional_preserved_string(&bad, "value").is_err());
+        assert_eq!(
+            optional_preserved_string(
+                &json!({"value": " keep "}).as_object().cloned().unwrap(),
+                "value"
+            )
+            .unwrap(),
+            Some(" keep ".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_list_tool_posts_optional_folder_type_and_note_content() {
+        let (api, requests) = api_with_responses(vec![json!({"id": 9, "name": "Notes"}).to_string()])
+            .await;
+        let args = json!({
+            "name": "Notes",
+            "folder_id": 3,
+            "list_type": "note",
+            "note_content": "  keep spacing  "
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let created = create_list(&api, &args).await.expect("create_list should post");
+        assert_eq!(created["id"], 9);
+        let requests = requests.await.unwrap();
+        assert!(requests[0].starts_with("POST /api/lists HTTP/1.1"));
+        assert!(requests[0].contains("\"folder_id\":3"));
+        assert!(requests[0].contains("\"note_content\":\"  keep spacing  \""));
+    }
+
+    #[tokio::test]
+    async fn inspect_invite_tool_wraps_structured_preview_payload() {
+        let (base_url, requests) = server_with_status(
+            200,
+            &json!({
+                "list_id": 7,
+                "list_name": "Shared",
+                "already_member": false,
+                "invite_url": "https://kram.li/i/InviteToken_1"
+            })
+            .to_string(),
+        )
+        .await;
+        let result = with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                ("KRAMLI_API_KEY", "kramli_test"),
+            ],
+            || async {
+                handle_tool_call(&json!({
+                    "name": "inspect_invite",
+                    "arguments": {"token": "InviteToken_1"}
+                }))
+                .await
+                .unwrap()
+            },
+        )
+        .await;
+        let previews = result["structuredContent"]["link_previews"]
+            .as_array()
+            .expect("inspect_invite should attach preview payload");
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0]["action"]["kind"], "accept");
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn tool_user_texts_search_covers_array_and_grouped_hits() {
+        let grouped = json!({
+            "lists": [{"name": "Groceries"}],
+            "items": [{"text": "Milk"}]
+        });
+        let grouped_texts = super::tool_user_texts("search", &grouped);
+        assert!(grouped_texts.iter().any(|text| text.contains("Groceries")));
+        assert!(grouped_texts.iter().any(|text| text.contains("Milk")));
+
+        let flat = json!([{"name": "Folder"}, {"text": "Task"}]);
+        let flat_texts = super::tool_user_texts("search", &flat);
+        assert!(flat_texts.iter().any(|text| text.contains("Folder")));
+        assert!(flat_texts.iter().any(|text| text.contains("Task")));
     }
 }

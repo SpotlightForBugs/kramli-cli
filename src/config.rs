@@ -641,6 +641,13 @@ mod tests {
     }
 
     #[test]
+    fn save_to_path_reports_create_dir_errors() {
+        let path = std::path::PathBuf::from("/proc/kramli-config-unwritable/config.json");
+        let cfg = config_file(None, None);
+        assert!(cfg.save_to_path(&path).is_err());
+    }
+
+    #[test]
     fn set_and_delete_api_key_cover_keychain_paths() {
         with_clean_config_env(|| {
             let cfg = Config::load();

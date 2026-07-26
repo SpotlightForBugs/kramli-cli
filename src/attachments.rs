@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, RwLock};
 
 use serde::Deserialize;
 
@@ -10,7 +10,8 @@ use crate::models::Attachment;
 
 const MCP_UPLOADS_ENV: &str = "KRAMLI_MCP_ALLOW_FILE_UPLOADS";
 const MCP_FILE_ROOTS_ENV: &str = "KRAMLI_MCP_FILE_ROOTS";
-static MCP_STARTUP_CWD: OnceLock<PathBuf> = OnceLock::new();
+static MCP_STARTUP_CWD: LazyLock<RwLock<Option<PathBuf>>> =
+    LazyLock::new(|| RwLock::new(None));
 
 #[derive(Clone, Debug)]
 pub(crate) struct AttachmentUpload {
@@ -93,7 +94,18 @@ pub(crate) async fn upload_item_attachment(
 
 pub(crate) fn initialize_mcp_file_policy() {
     if let Ok(cwd) = std::env::current_dir() {
-        let _ = MCP_STARTUP_CWD.set(cwd);
+        if let Ok(mut guard) = MCP_STARTUP_CWD.write() {
+            if guard.is_none() {
+                *guard = Some(cwd);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_mcp_file_policy_for_tests() {
+    if let Ok(mut guard) = MCP_STARTUP_CWD.write() {
+        *guard = None;
     }
 }
 
@@ -105,8 +117,15 @@ pub(crate) fn ensure_mcp_upload_allowed(path: &Path) -> Result<(), String> {
         .canonicalize()
         .map_err(|_| tr_args("attachment-file-not-found", &[]))?;
     let mut roots = Vec::new();
-    if let Some(startup_cwd) = MCP_STARTUP_CWD.get() {
-        roots.push(startup_cwd.clone());
+    if let Ok(guard) = MCP_STARTUP_CWD.read() {
+        match guard.as_ref() {
+            Some(startup_cwd) => roots.push(startup_cwd.clone()),
+            None => {
+                if let Ok(cwd) = std::env::current_dir() {
+                    roots.push(cwd);
+                }
+            }
+        }
     } else if let Ok(cwd) = std::env::current_dir() {
         roots.push(cwd);
     }
@@ -151,7 +170,8 @@ mod tests {
 
     use super::{
         ensure_mcp_upload_allowed, initialize_mcp_file_policy, mcp_file_uploads_enabled,
-        upload_item_attachment, validate_image_path, AttachmentUpload,
+        reset_mcp_file_policy_for_tests, upload_item_attachment, validate_image_path,
+        AttachmentUpload,
     };
     use crate::api::ApiClient;
     use crate::test_env::{register_mock_server, with_env_vars};
@@ -266,6 +286,22 @@ mod tests {
     }
 
     #[test]
+    fn ensure_mcp_upload_allowed_uses_current_dir_when_startup_cwd_unset() {
+        reset_mcp_file_policy_for_tests();
+        let cwd = std::env::current_dir().expect("cwd");
+        let root = cwd.join(format!("kramli-mcp-no-init-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let png = root.join("local.png");
+        fs::write(&png, [1, 2, 3]).unwrap();
+
+        with_env_vars(&[("KRAMLI_MCP_ALLOW_FILE_UPLOADS", "1")], || {
+            assert!(ensure_mcp_upload_allowed(&png).is_ok());
+        });
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn mcp_file_policy_allows_startup_paths_and_rejects_outside_roots() {
         let cwd = std::env::current_dir().expect("cwd");
         let root = cwd.join(format!("kramli-mcp-policy-{}", std::process::id()));
@@ -283,6 +319,7 @@ mod tests {
         fs::write(&forbidden, [1, 2, 3]).unwrap();
 
         with_env_vars(&[("KRAMLI_MCP_ALLOW_FILE_UPLOADS", "1")], || {
+            reset_mcp_file_policy_for_tests();
             initialize_mcp_file_policy();
             assert!(mcp_file_uploads_enabled());
             assert!(ensure_mcp_upload_allowed(&png).is_ok());
