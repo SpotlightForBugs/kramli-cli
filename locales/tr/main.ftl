@@ -100,6 +100,7 @@ role-editor = Düzenleyici
 role-viewer = Görüntüleyici
 
 view-list = Liste
+view-note = Note
 view-board = Pano
 view-calendar = Takvim
 view-timeline = Zaman çizelgesi

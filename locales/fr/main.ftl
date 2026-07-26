@@ -100,6 +100,7 @@ role-editor = Éditeur
 role-viewer = Lecteur
 
 view-list = Liste
+view-note = Note
 view-board = Tableau
 view-calendar = Calendrier
 view-timeline = Chronologie

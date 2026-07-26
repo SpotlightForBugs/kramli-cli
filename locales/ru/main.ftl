@@ -100,6 +100,7 @@ role-editor = Редактор
 role-viewer = Наблюдатель
 
 view-list = Список
+view-note = Note
 view-board = Доска
 view-calendar = Календарь
 view-timeline = Таймлайн

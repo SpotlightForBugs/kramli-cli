@@ -100,6 +100,7 @@ role-editor = Bewerker
 role-viewer = Lezer
 
 view-list = Lijst
+view-note = Note
 view-board = Bord
 view-calendar = Kalender
 view-timeline = Tijdlijn

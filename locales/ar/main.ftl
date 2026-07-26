@@ -100,6 +100,7 @@ role-editor = المحرر
 role-viewer = المشاهد
 
 view-list = القائمة
+view-note = Note
 view-board = اللوحة
 view-calendar = التقويم
 view-timeline = المخطط الزمني

@@ -100,6 +100,7 @@ role-editor = 編集者
 role-viewer = 閲覧者
 
 view-list = リスト
+view-note = Note
 view-board = ボード
 view-calendar = カレンダー
 view-timeline = タイムライン

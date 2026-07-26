@@ -5959,10 +5959,15 @@ fn draw_lists_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .unwrap_or_else(|| tr("common-unknown"));
         let list_count = app.lists.len();
         let selected = app.selected_list_display_name();
+        let selected_label = if app.selected_list().is_some_and(ShoppingList::is_note) {
+            tr("view-note")
+        } else {
+            tr("view-list")
+        };
         let info = vec![
             Line::from(profile_text),
             Line::from(format!("{} {}", tr("label-lists"), list_count)),
-            Line::from(format!("{} {}", tr("view-list"), selected)),
+            Line::from(format!("{selected_label} {selected}")),
         ];
         let mut info = info;
         if cfg!(debug_assertions) {
@@ -8994,12 +8999,14 @@ mod tests {
     }
 
     #[test]
-    fn note_lists_hide_list_mode_tabs() {
+    fn note_lists_hide_view_mode_toolbar() {
         let mut app = test_app();
         app.beta_consent_pending = false;
         let mut note = test_list();
         note.list_type = Some("note".to_string());
         app.lists = vec![note];
+        assert!(!shows_list_mode_tabs(&app));
+
         app.note_detail_cache
             .insert(1, json!({"note_content": "Plain note"}));
 
@@ -9008,6 +9015,7 @@ mod tests {
         let text = terminal_text(&terminal);
         assert!(!text.contains(&tr("view-board")));
         assert!(!text.contains(&tr("view-calendar")));
+        assert!(text.contains(&tr("view-note")));
     }
 
     #[tokio::test]

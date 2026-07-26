@@ -100,6 +100,7 @@ role-editor = Editor
 role-viewer = Visualizador
 
 view-list = Lista
+view-note = Note
 view-board = Quadro
 view-calendar = Calendário
 view-timeline = Linha do tempo
