@@ -1220,25 +1220,12 @@ mod tests {
 
     #[test]
     fn list_update_cannot_convert_note_and_task_types() {
-        let body = update_list_body(
-            Some("Renamed".to_string()),
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("metadata-only update should build");
+        let body = update_list_body(Some("Renamed".to_string()), None, None, None, None)
+            .expect("metadata-only update should build");
         assert!(!body.contains_key("list_type"));
 
         // Clap no longer exposes --type on lists update (create-only).
-        let rejected = Cli::try_parse_from([
-            "kramli",
-            "lists",
-            "update",
-            "7",
-            "--type",
-            "note",
-        ]);
+        let rejected = Cli::try_parse_from(["kramli", "lists", "update", "7", "--type", "note"]);
         assert!(rejected.is_err());
 
         let fields = safe_update_payload(
@@ -1251,10 +1238,7 @@ mod tests {
             "New",
             {
                 let mut map = serde_json::Map::new();
-                map.insert(
-                    "list_type".to_string(),
-                    Value::String("tasks".to_string()),
-                );
+                map.insert("list_type".to_string(), Value::String("tasks".to_string()));
                 map
             },
         )

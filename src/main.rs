@@ -440,11 +440,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&config_root).expect("temp config root should exist");
         let config_path = config_root.join("config.json");
-        std::fs::write(
-            &config_path,
-            r#"{"telemetry_enabled":true}"#,
-        )
-        .expect("seed config");
+        std::fs::write(&config_path, r#"{"telemetry_enabled":true}"#).expect("seed config");
 
         crate::test_env::with_env_vars(
             &[

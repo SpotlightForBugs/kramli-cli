@@ -1362,7 +1362,8 @@ mod tests {
 
     #[tokio::test]
     async fn api_get_rejects_non_json_success_body() {
-        let (api, server) = api_with_responses(vec![TestResponse::status(200, b"plain text")]).await;
+        let (api, server) =
+            api_with_responses(vec![TestResponse::status(200, b"plain text")]).await;
         assert!(api.get::<Value>("/broken").await.is_err());
         let requests = server.await.expect("server finished");
         assert_eq!(requests[0], "GET /api/broken HTTP/1.1");
@@ -1376,6 +1377,8 @@ mod tests {
 
     #[test]
     fn public_https_resource_rejects_missing_host() {
-        assert!(!ApiClient::public_https_resource_allowed("https:///avatar.png"));
+        assert!(!ApiClient::public_https_resource_allowed(
+            "https:///avatar.png"
+        ));
     }
 }

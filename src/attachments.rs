@@ -167,11 +167,10 @@ mod tests {
         let ready = register_mock_server(base_url.clone());
         let handle = tokio::spawn(async move {
             let _ = ready.await;
-            let (mut stream, _) =
-                tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                    .await
-                    .expect("accept timed out")
-                    .expect("connection");
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("accept timed out")
+                .expect("connection");
             let mut buf = vec![0_u8; 16_384];
             let n = stream.read(&mut buf).await.expect("read request");
             let request = String::from_utf8_lossy(&buf[..n]).to_string();
@@ -184,10 +183,7 @@ mod tests {
             stream.write_all(payload.as_bytes()).await.unwrap();
             request
         });
-        (
-            ApiClient::for_tests(&base_url),
-            handle,
-        )
+        (ApiClient::for_tests(&base_url), handle)
     }
 
     #[test]

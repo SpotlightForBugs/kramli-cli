@@ -1167,11 +1167,11 @@ mod tests {
         insert_clearable_string, insert_optional_string, insert_reminder_fields, list_items,
         mcp_method_trace_name, mcp_tool_trace_name, optional_bool, optional_clearable_string,
         optional_i64, optional_i64_array, optional_string, optional_string_array, read_message,
-        required_i64, required_string, run_with_io, toggle_item_done, tool_result, tool_text_result,
-        tools, try_parse_message, update_item, write_message, MessageFraming,
+        required_i64, required_string, run_with_io, toggle_item_done, tool_result,
+        tool_text_result, tools, try_parse_message, update_item, write_message, MessageFraming,
     };
-    use crate::attachments::initialize_mcp_file_policy;
     use crate::api::ApiClient;
+    use crate::attachments::initialize_mcp_file_policy;
     use serde_json::{json, Map, Value};
     use std::fs;
     use std::future::Future;
@@ -2506,10 +2506,10 @@ mod tests {
                     || text.contains("auth")
                     || text.contains("expired")
             );
-        assert_eq!(
-            requests.await.unwrap(),
-            vec!["GET /api/invite-links/InviteToken_1 HTTP/1.1"]
-        );
+            assert_eq!(
+                requests.await.unwrap(),
+                vec!["GET /api/invite-links/InviteToken_1 HTTP/1.1"]
+            );
         }
     }
 
@@ -2541,16 +2541,14 @@ mod tests {
         let png = root.join("item.png");
         fs::write(&png, [137, 80, 78, 71]).unwrap();
 
-        let (api, requests) = api_with_responses(vec![
-            json!({
-                "attachment": {
-                    "id": 3,
-                    "filename": "item.png",
-                    "content_type": "image/png"
-                }
-            })
-            .to_string(),
-        ])
+        let (api, requests) = api_with_responses(vec![json!({
+            "attachment": {
+                "id": 3,
+                "filename": "item.png",
+                "content_type": "image/png"
+            }
+        })
+        .to_string()])
         .await;
         let base_url = api.base_url_for_tests().to_string();
 
