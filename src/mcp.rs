@@ -1206,6 +1206,8 @@ mod tests {
         let handle = tokio::spawn(async move {
             if let Some(ready) = ready {
                 let _ = ready.await;
+            } else {
+                ()
             }
             let mut requests = Vec::new();
             for body in responses {
@@ -2438,7 +2440,9 @@ mod tests {
         .await;
         assert!(elapsed < Duration::from_secs(2));
         assert_eq!(result["structuredContent"]["data"]["id"], 7);
-        server.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("slow preview handler should finish");
     }
 
     #[tokio::test]
@@ -2760,15 +2764,19 @@ mod tests {
 
     #[tokio::test]
     async fn run_stdio_loop_exits_on_eof() {
-        // Do not call run_stdio() with process stdin: the blocking stdin read is
-        // not reliably cancelled by tokio::time::timeout and can hang the suite.
-        initialize_mcp_file_policy();
-        let mut input = tokio::io::empty();
-        let mut output = Vec::new();
-        run_with_io(&mut input, &mut output)
-            .await
-            .expect("EOF on MCP stdin should exit cleanly");
-        assert!(output.is_empty());
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            // Do not call run_stdio() with process stdin: the blocking stdin read is
+            // not reliably cancelled by tokio::time::timeout and can hang the suite.
+            initialize_mcp_file_policy();
+            let mut input = tokio::io::empty();
+            let mut output = Vec::new();
+            run_with_io(&mut input, &mut output)
+                .await
+                .expect("EOF on MCP stdin should exit cleanly");
+            assert!(output.is_empty());
+        })
+        .await;
+        result.expect("run_with_io EOF test should finish within 20s");
     }
 
     #[tokio::test]
@@ -2867,5 +2875,323 @@ mod tests {
         let flat_texts = super::tool_user_texts("search", &flat);
         assert!(flat_texts.iter().any(|text| text.contains("Folder")));
         assert!(flat_texts.iter().any(|text| text.contains("Task")));
+    }
+
+    #[tokio::test]
+    async fn run_with_io_emits_length_prefixed_response() {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+            let input = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+            let mut reader = input.as_bytes();
+            let mut output = Vec::new();
+            run_with_io(&mut reader, &mut output)
+                .await
+                .expect("run_with_io should write a ping response");
+            let text = String::from_utf8(output).expect("response output should be utf8");
+            assert!(text.contains("Content-Length:"));
+            assert!(text.contains("\"result\":{}"));
+        })
+        .await;
+        result.expect("run_with_io ping response test should finish within 20s");
+    }
+
+    #[test]
+    fn tool_user_texts_is_empty_for_unknown_tool_name() {
+        assert!(super::tool_user_texts("unknown_tool", &json!({"text": "ignored"})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_with_responses_awaits_mock_server_registration() {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            let (api, requests) =
+                api_with_responses(vec![json!([{"id": 7, "name": "Groceries"}]).to_string()]).await;
+            tokio::task::yield_now().await;
+            let base_url = api.base_url_for_tests().to_string();
+            let listed = with_env_vars_async(
+                &[
+                    ("KRAMLI_URL", base_url.as_str()),
+                    ("KRAMLI_API_KEY", "kramli_test"),
+                ],
+                || async { super::list_lists(&api).await.expect("list_lists should succeed") },
+            )
+            .await;
+            assert_eq!(listed[0]["name"], "Groceries");
+            let requests = requests.await.expect("mock server should finish");
+            assert!(requests[0].starts_with("GET /api/lists HTTP/1.1"));
+        })
+        .await;
+        result.expect("mcp mock server registration test should finish within 20s");
+    }
+
+    #[tokio::test]
+    async fn with_env_vars_async_unlocked_restores_unset_vars() {
+        const TEST_ENV: &str = "KRAMLI_MCP_ABSENT_ENV";
+        std::env::remove_var(TEST_ENV);
+        with_env_vars_async_unlocked(&[(TEST_ENV, "during")], || async {
+            assert_eq!(std::env::var(TEST_ENV).as_deref(), Ok("during"));
+        })
+        .await;
+        assert!(std::env::var(TEST_ENV).is_err());
+    }
+
+    #[tokio::test]
+    async fn preview_budget_waits_for_slow_preview_handler() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        let ready = crate::test_env::register_mock_server(base_url.clone());
+        let (preview_connected, preview_connected_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let _ = ready.await;
+            let (mut primary, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4096];
+            let _ = primary.read(&mut buffer).await.unwrap();
+            let body = json!({
+                "id": 7,
+                "name": "Notes",
+                "note_content": "https://kramli.de/lists/42"
+            })
+            .to_string();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            primary.write_all(header.as_bytes()).await.unwrap();
+            primary.write_all(body.as_bytes()).await.unwrap();
+
+            let (mut preview, _) = listener.accept().await.unwrap();
+            let _ = preview.read(&mut buffer).await.unwrap();
+            let _ = preview_connected.send(());
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let (result, elapsed) = with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                ("KRAMLI_API_KEY", "kramli_test"),
+            ],
+            || async {
+                let started = tokio::time::Instant::now();
+                let result = handle_tool_call(&json!({
+                    "name": "get_list",
+                    "arguments": {"id": 7}
+                }))
+                .await
+                .unwrap();
+                (result, started.elapsed())
+            },
+        )
+        .await;
+        preview_connected_rx
+            .await
+            .expect("preview handler should accept before client returns");
+        assert!(elapsed < Duration::from_secs(2));
+        assert_eq!(result["structuredContent"]["data"]["id"], 7);
+        let _ = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("slow preview handler should finish");
+    }
+
+    #[tokio::test]
+    async fn io_loop_ignores_notifications_and_replies_to_requests() {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            let input = concat!(
+                "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n"
+            );
+            let mut reader = input.as_bytes();
+            let mut output = Vec::new();
+            run_with_io(&mut reader, &mut output)
+                .await
+                .expect("io loop should ignore notifications and answer ping");
+            let text = String::from_utf8(output).expect("response output should be utf8");
+            assert!(!text.contains("notifications/initialized"));
+            assert!(text.contains("\"id\":1"));
+            assert!(text.contains("\"result\":{}"));
+        })
+        .await;
+        result.expect("notification io loop test should finish within 20s");
+    }
+
+    #[tokio::test]
+    async fn handle_tool_call_routes_item_and_read_tools() {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            let base_url = {
+                let (api, requests) = api_with_responses(vec![
+                    json!([{"id": 1, "list_id": 7, "text": "Tea", "is_done": false}]).to_string(),
+                ])
+                .await;
+                let base_url = api.base_url_for_tests().to_string();
+                with_env_vars_async(
+                    &[
+                        ("KRAMLI_URL", base_url.as_str()),
+                        ("KRAMLI_API_KEY", "kramli_test"),
+                    ],
+                    || async {
+                        let listed = handle_tool_call(&json!({
+                            "name": "list_items",
+                            "arguments": {"list_id": 7}
+                        }))
+                        .await
+                        .expect("list_items tool should succeed");
+                        assert_eq!(listed["structuredContent"]["data"][0]["id"], 1);
+                    },
+                )
+                .await;
+                let requests = requests.await.expect("list_items server should finish");
+                assert!(requests[0].starts_with("GET /api/lists/7/items"));
+                base_url
+            };
+
+            let run_tool = |responses: Vec<String>, payload: Value, assert_fn: fn(&Value)| {
+                async move {
+                    let (api, requests) = api_with_responses(responses).await;
+                    let base_url = api.base_url_for_tests().to_string();
+                    with_env_vars_async(
+                        &[
+                            ("KRAMLI_URL", base_url.as_str()),
+                            ("KRAMLI_API_KEY", "kramli_test"),
+                        ],
+                        || async {
+                            let result = handle_tool_call(&payload)
+                                .await
+                                .expect("tool call should succeed");
+                            assert_fn(&result);
+                        },
+                    )
+                    .await;
+                    requests.await.expect("mock server should finish")
+                }
+            };
+
+            run_tool(
+                vec![
+                    json!({"id": 7, "name": "Tasks", "list_type": "tasks"}).to_string(),
+                    json!({"id": 9, "text": "Created"}).to_string(),
+                ],
+                json!({
+                    "name": "create_item",
+                    "arguments": {"list_id": 7, "text": "Created"}
+                }),
+                |result| assert_eq!(result["structuredContent"]["data"]["id"], 9),
+            )
+            .await;
+
+            run_tool(
+                vec![json!({"id": 9, "text": "Updated"}).to_string()],
+                json!({
+                    "name": "update_item",
+                    "arguments": {"id": 9, "text": "Updated"}
+                }),
+                |result| assert_eq!(result["structuredContent"]["data"]["text"], "Updated"),
+            )
+            .await;
+
+            run_tool(
+                vec![json!({"id": 9, "is_done": true}).to_string()],
+                json!({"name": "toggle_item_done", "arguments": {"id": 9}}),
+                |result| assert_eq!(result["structuredContent"]["data"]["is_done"], true),
+            )
+            .await;
+
+            run_tool(
+                vec![json!({"ok": true}).to_string()],
+                json!({"name": "delete_item", "arguments": {"id": 9}}),
+                |result| assert_eq!(result["structuredContent"]["data"]["ok"], true),
+            )
+            .await;
+
+            run_tool(
+                vec![
+                    json!({"id": 9, "text": "Item"}).to_string(),
+                    json!([]).to_string(),
+                ],
+                json!({"name": "get_item", "arguments": {"id": 9}}),
+                |result| assert_eq!(result["structuredContent"]["data"]["id"], 9),
+            )
+            .await;
+
+            run_tool(
+                vec![json!({"items": [{"id": 9, "text": "Item"}]}).to_string()],
+                json!({"name": "search", "arguments": {"query": "Item"}}),
+                |result| {
+                    assert!(result["structuredContent"]["data"]["items"].is_array());
+                },
+            )
+            .await;
+
+            run_tool(
+                vec![json!([{"id": 2, "detail": {"text": "Changed"}}]).to_string()],
+                json!({"name": "activity", "arguments": {"list_id": 7, "limit": 5}}),
+                |result| assert!(result["structuredContent"]["data"].is_array()),
+            )
+            .await;
+
+            let (api, requests) = api_with_responses(vec![
+                json!({
+                    "list_id": 7,
+                    "list_name": "Shared",
+                    "already_member": false,
+                    "invite_url": "https://kram.li/i/InviteToken_1"
+                })
+                .to_string(),
+                json!({"ok": true, "list_id": 7}).to_string(),
+            ])
+            .await;
+            with_env_vars_async(
+                &[
+                    ("KRAMLI_URL", api.base_url_for_tests()),
+                    ("KRAMLI_API_KEY", "kramli_test"),
+                ],
+                || async {
+                    let accepted = handle_tool_call(&json!({
+                        "name": "accept_invite",
+                        "arguments": {"token": "InviteToken_1", "confirmed": true}
+                    }))
+                    .await
+                    .expect("accept_invite tool should succeed");
+                    assert_eq!(accepted["structuredContent"]["data"]["ok"], true);
+                },
+            )
+            .await;
+            let requests = requests.await.expect("accept invite server should finish");
+            assert!(requests
+                .iter()
+                .any(|request| request.contains("POST /api/invite-links/InviteToken_1/accept")));
+
+            let _ = base_url;
+        })
+        .await;
+        result.expect("handle_tool_call routing test should finish within 20s");
+    }
+
+    #[tokio::test]
+    async fn api_with_responses_skips_registration_gate_for_empty_response_list() {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            let (_api, requests) = api_with_responses(vec![]).await;
+            let captured = requests.await.expect("empty-response server should finish");
+            assert!(captured.is_empty());
+        })
+        .await;
+        result.expect("mcp empty-response registration gate test should finish within 20s");
+    }
+
+    #[tokio::test]
+    async fn api_with_responses_waits_for_mock_server_registration() {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            let (api, requests) = api_with_responses(vec![json!({"ready": true}).to_string()]).await;
+            tokio::task::yield_now().await;
+            api.get::<Value>("/registration-check")
+                .await
+                .expect("mock server should respond after registration gate");
+            let captured = requests.await.expect("mock server should finish");
+            assert_eq!(
+                captured[0].lines().next().unwrap_or_default(),
+                "GET /api/registration-check HTTP/1.1"
+            );
+        })
+        .await;
+        result.expect("mcp mock server registration gate test should finish within 20s");
     }
 }

@@ -192,9 +192,7 @@ fn visible_width_ansi(input: &str) -> usize {
             continue;
         }
 
-        let Some(ch) = input[i..].chars().next() else {
-            break;
-        };
+        let ch = input[i..].chars().next().expect("utf-8 character boundary");
         i += ch.len_utf8();
         width += char_display_width(ch);
     }
@@ -237,9 +235,7 @@ fn wrap_ansi_with_prefix(
             continue;
         }
 
-        let Some(ch) = content[i..].chars().next() else {
-            break;
-        };
+        let ch = content[i..].chars().next().expect("utf-8 character boundary");
         i += ch.len_utf8();
 
         if ch == '\n' {
@@ -276,10 +272,8 @@ fn print_wrapped_item_line(first_prefix: &str, next_prefix: &str, content: &str)
     let width = crossterm::terminal::size()
         .map(|(w, _)| w as usize)
         .unwrap_or(120);
-    println!(
-        "{}",
-        wrap_ansi_with_prefix(content, first_prefix, next_prefix, width)
-    );
+    let rendered = wrap_ansi_with_prefix(content, first_prefix, next_prefix, width);
+    println!("{rendered}");
 }
 
 fn list_display_name_with_folder(list: &ShoppingList) -> String {
@@ -1236,6 +1230,8 @@ pub(crate) fn print_activity(entries: &[ActivityEntry]) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::IsTerminal;
+
     use super::{
         activity_action_label, activity_detail_text, bootstrap_icon_asset_name, char_display_width,
         color_dot, colorize_bold_text, colorize_text, date_with_time, display_icon, fallback_icon,
@@ -1983,6 +1979,58 @@ mod tests {
         print_note_for_list(None, None);
         print_note_for_list(None, Some("  "));
         print_note_for_list(Some(&sample_list(1, "Notes")), Some("Note body"));
+    }
+
+    #[test]
+    fn bootstrap_icon_asset_name_skips_invalid_inline_markers_before_valid_icon() {
+        assert_eq!(
+            bootstrap_icon_asset_name("prefix bi-!!! suffix bi-fire"),
+            Some("fire".to_string())
+        );
+    }
+
+    fn run_output_test_in_pseudo_terminal(test_name: &str) {
+        let exe = std::env::current_exe().expect("current test executable should be available");
+        let script = ["/usr/bin/script", "/bin/script"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).exists())
+            .expect("script binary should exist for pseudo-terminal coverage");
+        let command = format!(
+            "{} output::tests::{test_name} --exact --nocapture --test-threads=1 --ignored",
+            exe.display()
+        );
+        let status = std::process::Command::new(script)
+            .args(["-q", "-c", &command])
+            .arg("/dev/null")
+            .status()
+            .expect("pseudo-terminal subprocess should spawn");
+        assert!(
+            status.success(),
+            "pseudo-terminal test {test_name} failed with {status:?}"
+        );
+    }
+
+    #[test]
+    fn print_wrapped_item_line_uses_terminal_width_when_stdout_is_tty() {
+        run_output_test_in_pseudo_terminal("print_wrapped_item_line_tty_case");
+    }
+
+    #[test]
+    fn print_wrapped_item_line_skips_when_stdout_is_not_tty() {
+        assert!(
+            !std::io::stdout().is_terminal(),
+            "cargo test stdout should not be a terminal"
+        );
+        print_wrapped_item_line_tty_case();
+    }
+
+    #[test]
+    #[ignore = "runs in a pseudo-terminal subprocess"]
+    fn print_wrapped_item_line_tty_case() {
+        if !std::io::stdout().is_terminal() {
+            return;
+        }
+        print_wrapped_item_line("> ", "  ", "hello world with enough text to wrap");
     }
 
     #[test]

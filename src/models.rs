@@ -412,7 +412,14 @@ impl SearchResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiKey, ApiKeyScopes, Profile, SearchResponse};
+    use super::{ApiKey, ApiKeyScopes, Profile, SearchResponse, SearchResults};
+
+    fn expect_flat_hits(parsed: SearchResponse) -> Vec<super::SearchHit> {
+        match parsed {
+            SearchResponse::Flat(hits) => hits,
+            SearchResponse::Grouped(_) => panic!("expected flat search response"),
+        }
+    }
 
     #[test]
     fn parse_search_response_accepts_empty_array() {
@@ -475,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_search_response_object_skips_empty_grouped_wrapper_before_flat_hit() {
+    fn parse_search_response_prefers_flat_after_empty_grouped() {
         let parsed = SearchResponse::from_value(serde_json::json!({
             "unexpected_grouped_field": true,
             "type": "item",
@@ -483,34 +490,26 @@ mod tests {
             "text": "Fallback"
         }))
         .expect("non-grouped object should fall back to flat hit");
-        match parsed {
-            SearchResponse::Flat(hits) => {
-                assert_eq!(hits.len(), 1);
-                assert_eq!(hits[0].id, 12);
-            }
-            other => panic!("expected flat hit, got {other:?}"),
-        }
+        let hits = expect_flat_hits(parsed);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 12);
     }
 
     #[test]
-    fn parse_search_response_object_falls_back_to_flat_hit_when_grouped_fields_absent() {
+    fn parse_search_response_uses_flat_when_grouped_missing() {
         let parsed = SearchResponse::from_value(serde_json::json!({
             "type": "list",
             "id": 5,
             "name": "Weekend"
         }))
         .expect("flat object hit should parse");
-        match parsed {
-            SearchResponse::Flat(hits) => {
-                assert_eq!(hits.len(), 1);
-                assert_eq!(hits[0].id, 5);
-            }
-            other => panic!("expected flat hit, got {other:?}"),
-        }
+        let hits = expect_flat_hits(parsed);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 5);
     }
 
     #[test]
-    fn parse_search_response_object_skips_empty_grouped_wrapper() {
+    fn parse_search_response_flat_fallback_for_empty_grouped() {
         let parsed = SearchResponse::from_value(serde_json::json!({
             "lists": null,
             "items": null,
@@ -519,13 +518,35 @@ mod tests {
             "name": "Weekend"
         }))
         .expect("empty grouped wrapper should fall back to flat hit");
-        match parsed {
-            SearchResponse::Flat(hits) => {
-                assert_eq!(hits.len(), 1);
-                assert_eq!(hits[0].id, 5);
-            }
-            other => panic!("expected flat hit, got {other:?}"),
-        }
+        let hits = expect_flat_hits(parsed);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 5);
+    }
+
+    #[test]
+    fn parse_search_response_rejects_invalid_grouped_lists_field() {
+        assert!(SearchResponse::from_value(serde_json::json!({"lists": "bad"})).is_err());
+    }
+
+    #[test]
+    fn parse_search_response_falls_back_to_flat_after_empty_grouped_fields() {
+        let parsed = SearchResponse::from_value(serde_json::json!({
+            "lists": null,
+            "items": null,
+            "type": "item",
+            "id": 99,
+            "text": "Grouped wrapper"
+        }))
+        .expect("empty grouped wrapper should fall back to flat hit");
+        let hits = expect_flat_hits(parsed);
+        assert_eq!(hits[0].id, 99);
+        assert_eq!(hits[0].text.as_deref(), Some("Grouped wrapper"));
+    }
+
+    #[test]
+    #[should_panic(expected = "expected flat search response")]
+    fn flat_search_response_guard_rejects_grouped_variant() {
+        expect_flat_hits(SearchResponse::Grouped(SearchResults::default()));
     }
 
     #[test]
@@ -650,6 +671,33 @@ mod tests {
         .expect("api key with string scopes should parse");
 
         assert!(matches!(key.scopes, Some(ApiKeyScopes::Single(value)) if value == "all"));
+    }
+
+    #[test]
+    fn shopping_list_is_note_recognizes_note_type_aliases() {
+        use super::ShoppingList;
+
+        for list_type in ["note", "notes", "notizzettel"] {
+            let list = ShoppingList {
+                id: 1,
+                name: "Notes".to_string(),
+                icon: None,
+                color: None,
+                folder_id: None,
+                folder_name: None,
+                archived: None,
+                archive_mode: None,
+                view_mode: None,
+                role: None,
+                list_type: Some(list_type.to_string()),
+                item_count: None,
+                done_count: None,
+                state_config: None,
+                states: None,
+                created_at: None,
+            };
+            assert!(list.is_note(), "expected {list_type} to count as a note list");
+        }
     }
 }
 

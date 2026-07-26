@@ -256,6 +256,25 @@ mod tests {
     }
 
     #[test]
+    fn try_parse_supported_locale_rejects_supported_language_tags_with_unsupported_script() {
+        assert!(try_parse_supported_locale("haw-US").is_none());
+    }
+
+    #[test]
+    fn try_parse_supported_locale_accepts_primary_language_when_full_tag_is_invalid() {
+        assert_eq!(
+            try_parse_supported_locale("de-").unwrap().to_string(),
+            "de"
+        );
+    }
+
+    #[test]
+    fn extract_keys_skips_equals_only_key_lines() {
+        let keys = extract_keys("valid = Value\n= blank\n");
+        assert_eq!(keys, vec!["valid".to_string()]);
+    }
+
+    #[test]
     fn try_parse_supported_locale_uses_primary_language_fallback() {
         assert_eq!(
             try_parse_supported_locale("de-XX").unwrap().to_string(),

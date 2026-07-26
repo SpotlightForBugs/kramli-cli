@@ -282,10 +282,18 @@ impl ApiClient {
         let Ok(parsed) = Url::parse(url) else {
             return false;
         };
+        Self::public_https_resource_allowed_parsed(&parsed)
+    }
+
+    fn public_https_resource_allowed_parsed(parsed: &Url) -> bool {
         if parsed.scheme() != "https" {
             return false;
         }
-        let Some(host) = parsed.host_str() else {
+        Self::public_https_resource_host_allowed(parsed.host_str())
+    }
+
+    fn public_https_resource_host_allowed(host: Option<&str>) -> bool {
+        let Some(host) = host else {
             return false;
         };
         Self::public_resource_host_allowed(host)
@@ -418,7 +426,11 @@ impl ApiClient {
             .filter(|line| !line.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
-        if !collapsed.is_empty() {
+        if !collapsed.is_empty()
+            && collapsed
+                .chars()
+                .any(|ch| !ch.is_whitespace() && ch != '\u{200b}')
+        {
             return Self::truncate_error_message(&telemetry::scrub_message(&collapsed));
         }
 
@@ -904,6 +916,9 @@ mod tests {
     use std::time::Duration;
 
     use reqwest::Client;
+    use reqwest::Response;
+
+    use super::Url;
     use serde_json::{json, Value};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1448,6 +1463,11 @@ mod tests {
         assert!(!ApiClient::public_https_resource_allowed("https://"));
     }
 
+    #[test]
+    fn public_https_resource_rejects_https_url_missing_host() {
+        assert!(!ApiClient::public_https_resource_host_allowed(None));
+    }
+
     #[tokio::test]
     async fn api_with_empty_responses_skips_mock_registration() {
         let (api, server) = api_with_responses(Vec::new()).await;
@@ -1477,5 +1497,75 @@ mod tests {
         assert!(got["ok"].as_bool().unwrap_or(false));
         let requests = server.await.expect("server finished");
         assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn api_client_new_rejects_foreign_test_env() {
+        crate::test_env::with_env_vars_async(
+            &[
+                ("KRAMLI_URL", "https://kramli.de"),
+                ("KRAMLI_API_KEY", "kramli_cov_api_key"),
+            ],
+            || async {
+                let config = Config::load();
+                let result = tokio::spawn(async move { ApiClient::new(&config) })
+                    .await
+                    .expect("spawn should finish");
+                assert!(result.is_err());
+                let Err(message) = result else {
+                    panic!("expected ApiClient::new to fail in foreign test env");
+                };
+                assert_eq!(message, "test environment belongs to another test");
+            },
+        )
+        .await;
+    }
+
+    #[test]
+    fn api_retry_delay_ignores_invalid_retry_after() {
+        use reqwest::header::{HeaderValue, RETRY_AFTER};
+
+        let non_numeric = Response::from(
+            http::Response::builder()
+                .status(429)
+                .header(RETRY_AFTER, HeaderValue::from_static("not-a-number"))
+                .body("")
+                .unwrap(),
+        );
+        assert_eq!(
+            ApiClient::retry_delay(&non_numeric, 1),
+            Duration::from_millis(500)
+        );
+
+        let non_utf8 = Response::from(
+            http::Response::builder()
+                .status(429)
+                .header(
+                    RETRY_AFTER,
+                    HeaderValue::from_bytes(&[0xff]).expect("retry-after header bytes"),
+                )
+                .body("")
+                .unwrap(),
+        );
+        assert_eq!(
+            ApiClient::retry_delay(&non_utf8, 0),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn public_https_resource_parse_failure_is_rejected() {
+        assert!(!ApiClient::public_https_resource_allowed("https://"));
+        let parsed = Url::parse("data:text/plain,cov").expect("data url should parse");
+        assert!(!ApiClient::public_https_resource_allowed_parsed(&parsed));
+    }
+
+    #[test]
+    fn api_error_message_reports_byte_count_for_blank_utf8_body() {
+        let body = "   \n\u{200b}\n   ";
+        assert_eq!(
+            ApiClient::format_api_error_message(body.as_bytes()),
+            format!("[{} bytes]", body.len())
+        );
     }
 }

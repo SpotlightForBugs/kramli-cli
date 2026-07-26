@@ -600,6 +600,34 @@ mod tests {
         }
     }
 
+    fn store_api_key(cfg: &Config, key: &str) -> Result<(), String> {
+        cfg.set_api_key(key)
+    }
+
+    fn delete_api_key(cfg: &Config) -> Result<(), String> {
+        cfg.delete_api_key()
+    }
+
+    fn noop_delete(_: &Config) -> Result<(), String> {
+        Ok(())
+    }
+
+    #[test]
+    fn login_test_helpers_cover_delete_and_noop_callbacks() {
+        crate::test_env::with_env_vars(&[("KRAMLI_URL", ""), ("KRAMLI_API_KEY", "")], || {
+            let cfg = Config::load();
+            assert!(noop_delete(&cfg).is_ok());
+            let _ = delete_api_key(&cfg);
+        });
+    }
+
+    #[test]
+    fn profile_json_with_lang_includes_profile_lang_and_source() {
+        let json = profile_json_with_lang(&sample_profile(Some("fr-CA")));
+        assert_eq!(json.get("profile_lang").and_then(Value::as_str), Some("fr-CA"));
+        assert!(json.get("lang_source").and_then(Value::as_str).is_some());
+    }
+
     fn command_samples() -> Vec<(Commands, &'static str)> {
         vec![
             (Commands::Login { url: None }, "login"),
@@ -1084,6 +1112,8 @@ mod tests {
         let handle = tokio::spawn(async move {
             if let Some(ready) = ready {
                 let _ = ready.await;
+            } else {
+                ()
             }
             let mut requests = Vec::new();
             for body in responses {
@@ -3427,7 +3457,7 @@ mod tests {
                     None,
                     || Ok("kramli_test".to_string()),
                     |_, _| Ok(()),
-                    |_| Ok(()),
+                    delete_api_key,
                 )
                 .await
                 .is_err());
@@ -3437,7 +3467,42 @@ mod tests {
         let error_requests = error_requests.await.expect("test server should finish");
         assert_eq!(error_requests, vec!["GET /api/profile HTTP/1.1"]);
 
-        let (base_url, requests) = server_with_base_url(vec![profile]).await;
+        let (base_url, requests) = server_with_base_url(vec![profile.clone()]).await;
+        let (second_error_base_url, second_error_requests) = server_with_status(500, "{}").await;
+        with_env_vars_async(
+            &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                ("KRAMLI_URL", second_error_base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                assert!(run_login_with(
+                    None,
+                    || Ok("kramli_test".to_string()),
+                    |_, _| Ok(()),
+                    |_| Ok(()),
+                )
+                .await
+                .is_err());
+            },
+        )
+        .await;
+        let second_error_requests = second_error_requests
+            .await
+            .expect("second error test server should finish");
+        assert_eq!(second_error_requests, vec!["GET /api/profile HTTP/1.1"]);
+
         with_env_vars_async(
             &[
                 (
@@ -3459,8 +3524,8 @@ mod tests {
                 run_login_with(
                     None,
                     || Ok("kramli_test".to_string()),
-                    |_, _| Ok(()),
-                    |cfg| cfg.delete_api_key(),
+                    store_api_key,
+                    noop_delete,
                 )
                 .await
                 .expect("login helper should succeed for valid profile response");
@@ -3469,6 +3534,112 @@ mod tests {
         .await;
         let requests = requests.await.expect("test server should finish");
         assert_eq!(requests, vec!["GET /api/profile HTTP/1.1"]);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
+    async fn run_login_with_invokes_noop_delete_callback_on_profile_error() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-cli-login-noop-delete-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+        let (error_base_url, error_requests) = server_with_status(500, "{}").await;
+        let delete_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delete_called_for_login = delete_called.clone();
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            with_env_vars_async(
+                &[
+                    (
+                        "HOME",
+                        config_root
+                            .to_str()
+                            .expect("temp config root should be valid utf-8"),
+                    ),
+                    (
+                        "XDG_CONFIG_HOME",
+                        config_root
+                            .to_str()
+                            .expect("temp config root should be valid utf-8"),
+                    ),
+                    ("KRAMLI_URL", error_base_url.as_str()),
+                    (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+                ],
+                || async {
+                    assert!(run_login_with(
+                        None,
+                        || Ok("kramli_test".to_string()),
+                        |_, _| Ok(()),
+                        move |_| {
+                            delete_called_for_login
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .is_err());
+                },
+            )
+            .await;
+        })
+        .await;
+        result.expect("noop delete callback login test should finish within 20s");
+        assert!(
+            delete_called.load(std::sync::atomic::Ordering::SeqCst),
+            "failed login should invoke delete callback"
+        );
+        let error_requests = error_requests.await.expect("test server should finish");
+        assert_eq!(error_requests, vec!["GET /api/profile HTTP/1.1"]);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
+    async fn run_login_rolls_back_keychain_when_profile_fetch_fails() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-cli-login-rollback-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+        let (error_base_url, error_requests) = server_with_status(500, "{}").await;
+
+        with_env_vars_async(
+            &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                ("KRAMLI_URL", error_base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, ""),
+            ],
+            || async {
+                crate::config::reset_test_keychain_api_key();
+                assert!(run_login_with(
+                    None,
+                    || Ok("kramli_rollback_test_key".to_string()),
+                    |cfg, key| cfg.set_api_key(key),
+                    |cfg| cfg.delete_api_key(),
+                )
+                .await
+                .is_err());
+                let cfg = Config::load();
+                assert!(!cfg.has_api_key());
+            },
+        )
+        .await;
+
+        let error_requests = error_requests.await.expect("test server should finish");
+        assert_eq!(error_requests, vec!["GET /api/profile HTTP/1.1"]);
+        let _ = std::fs::remove_dir_all(config_root);
     }
 
     #[tokio::test]
@@ -4643,6 +4814,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_with_responses_skips_registration_gate_for_empty_response_list() {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            let (_api, requests) = api_with_responses(vec![]).await;
+            let captured = requests.await.expect("empty-response server should finish");
+            assert!(captured.is_empty());
+        })
+        .await;
+        result.expect("empty-response registration gate test should finish within 20s");
+    }
+
+    #[tokio::test]
     async fn api_with_responses_without_mock_registration_still_serves() {
         let (api, requests) = api_with_responses(vec![json!({"ok": true}).to_string()]).await;
         api.get::<Value>("/ready")
@@ -4820,6 +5002,7 @@ mod tests {
             let value = profile_json_with_lang(&profile);
             assert_eq!(value["lang_source"], "profile");
             assert_eq!(value["profile_lang"], "de-DE");
+            assert_eq!(value["lang"].as_str(), Some("de-DE"));
         });
 
         crate::test_env::with_env_vars(&[(TEST_KRAMLI_LANG_ENV, "")], || {
@@ -4827,6 +5010,7 @@ mod tests {
             crate::i18n::set_locale("en");
             let value = profile_json_with_lang(&profile);
             assert_eq!(value["lang_source"], "resolved");
+            assert!(value.get("profile_lang").is_some());
         });
 
         crate::test_env::with_env_vars(&[(TEST_KRAMLI_LANG_ENV, "")], || {
@@ -4842,6 +5026,68 @@ mod tests {
             assert_eq!(value["lang_source"], "resolved");
             assert!(value.get("profile_lang").is_none());
         });
+    }
+
+    #[tokio::test]
+    async fn run_status_json_includes_profile_lang_source_metadata() {
+        let profile = serde_json::to_string(&sample_profile(Some("de-DE"))).unwrap();
+        let (base_url, requests) = server_with_base_url(vec![profile]).await;
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            with_env_vars_async(
+                &[
+                    ("KRAMLI_URL", base_url.as_str()),
+                    (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+                    (TEST_KRAMLI_LANG_ENV, ""),
+                ],
+                || async {
+                    crate::i18n::set_locale("en");
+                    run_status(true)
+                        .await
+                        .expect("json status should include profile metadata");
+                },
+            )
+            .await;
+        })
+        .await;
+        result.expect("json status profile metadata test should finish within 20s");
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["GET /api/profile HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn run_security_status_human_output_lists_factor_checkmarks() {
+        let (base_url, requests) = server_with_base_url(vec![json!({
+            "security": {
+                "level_label": "Strong",
+                "score": 4,
+                "max_score": 5,
+                "factors": [
+                    {"label": "Password", "met": true},
+                    {"label": "Two-factor", "met": false}
+                ]
+            },
+            "security_email_login_alerts": true
+        })
+        .to_string()])
+        .await;
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            with_env_vars_async(
+                &[
+                    ("KRAMLI_URL", base_url.as_str()),
+                    (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+                ],
+                || async {
+                    run_security(SecurityCmd::Status, false)
+                        .await
+                        .expect("security status should print factor checklist");
+                },
+            )
+            .await;
+        })
+        .await;
+        result.expect("security factor checklist test should finish within 20s");
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["GET /api/security HTTP/1.1"]);
     }
 
     #[tokio::test]
@@ -5079,11 +5325,40 @@ mod tests {
             || async {
                 crate::config::reset_test_keychain_api_key();
 
+                let (failed_login_base_url, failed_login_requests) =
+                    server_with_status(500, "{}").await;
+                with_env_vars_async_unlocked(
+                    &[("KRAMLI_URL", failed_login_base_url.as_str())],
+                    || async {
+                        let delete_called =
+                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let delete_called_for_login = delete_called.clone();
+                        assert!(run_login_with(
+                            None,
+                            || Ok("kramli_login_test_key".to_string()),
+                            |cfg, key| cfg.set_api_key(key),
+                            move |_| {
+                                delete_called_for_login
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                Ok(())
+                            },
+                        )
+                        .await
+                        .is_err());
+                        assert!(
+                            delete_called.load(std::sync::atomic::Ordering::SeqCst),
+                            "failed keychain login should invoke noop delete callback"
+                        );
+                    },
+                )
+                .await;
+                failed_login_requests.abort();
+
                 run_login_with(
                     None,
                     || Ok("kramli_login_test_key".to_string()),
-                    |cfg, key| cfg.set_api_key(key),
-                    |cfg| cfg.delete_api_key(),
+                    store_api_key,
+                    noop_delete,
                 )
                 .await
                 .expect("login with keychain storage should succeed");
@@ -5876,6 +6151,606 @@ mod tests {
                 .await
                 .expect("registration gate server should finish"),
             vec!["GET /api/registration-gate HTTP/1.1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn api_with_responses_waits_for_mock_server_before_requests() {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            let (api, requests) =
+                api_with_responses(vec![json!({"ok": true}).to_string()]).await;
+            tokio::task::yield_now().await;
+            api.get::<Value>("/mock-ready")
+                .await
+                .expect("mock server should respond after registration");
+            let captured = requests.await.expect("test server should finish");
+            assert_eq!(captured, vec!["GET /api/mock-ready HTTP/1.1"]);
+        })
+        .await;
+        result.expect("mock server registration test should finish within 20s");
+    }
+
+    #[tokio::test]
+    async fn run_login_with_deletes_stored_key_on_profile_error() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-cli-login-delete-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+
+        let (error_base_url, error_requests) = server_with_status(500, "{}").await;
+        with_env_vars_async(
+            &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                ("KRAMLI_URL", error_base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                assert!(run_login_with(
+                    None,
+                    || Ok("kramli_test".to_string()),
+                    |_, _| Ok(()),
+                    |cfg| cfg.delete_api_key(),
+                )
+                .await
+                .is_err());
+            },
+        )
+        .await;
+        let error_requests = error_requests.await.expect("test server should finish");
+        assert_eq!(error_requests, vec!["GET /api/profile HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn run_login_fails_again_when_server_returns_error() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-cli-cov-login-nested-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+        let config_path = config_root.join("config.json");
+
+        let profile = serde_json::to_string(&sample_profile(Some("en"))).unwrap();
+        let (base_url, _login_requests) = server_with_base_url(vec![profile]).await;
+
+        with_env_vars_async(
+            &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                (
+                    KRAMLI_CONFIG_PATH_ENV,
+                    config_path
+                        .to_str()
+                        .expect("temp config path should be valid utf-8"),
+                ),
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, ""),
+            ],
+            || async {
+                crate::config::reset_test_keychain_api_key();
+
+                run_login_with(
+                    None,
+                    || Ok("kramli_login_test_key".to_string()),
+                    |cfg, key| cfg.set_api_key(key),
+                    |cfg| cfg.delete_api_key(),
+                )
+                .await
+                .expect("login with keychain storage should succeed");
+
+                let (bad_login_base_url, bad_login_requests) = server_with_status(500, "{}").await;
+                with_env_vars_async_unlocked(
+                    &[
+                        (
+                            "HOME",
+                            config_root
+                                .to_str()
+                                .expect("temp config root should be valid utf-8"),
+                        ),
+                        (
+                            "XDG_CONFIG_HOME",
+                            config_root
+                                .to_str()
+                                .expect("temp config root should be valid utf-8"),
+                        ),
+                        (
+                            KRAMLI_CONFIG_PATH_ENV,
+                            config_path
+                                .to_str()
+                                .expect("temp config path should be valid utf-8"),
+                        ),
+                        ("KRAMLI_URL", bad_login_base_url.as_str()),
+                        (TEST_KRAMLI_API_KEY_ENV, ""),
+                    ],
+                    || async {
+                        assert!(run_login_with(
+                            None,
+                            || Ok("kramli_login_test_key".to_string()),
+                            |cfg, key| cfg.set_api_key(key),
+                            |cfg| cfg.delete_api_key(),
+                        )
+                        .await
+                        .is_err());
+                    },
+                )
+                .await;
+                bad_login_requests.abort();
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn run_login_prompt_wrapper_stores_key_and_updates_profile() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-cli-cov-run-login-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+
+        let profile = serde_json::to_string(&sample_profile(Some("en"))).unwrap();
+        let (base_url, requests) = server_with_base_url(vec![profile]).await;
+        with_env_vars_async(
+            &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, ""),
+                (KRAMLI_TEST_API_KEY_PROMPT_ENV, "kramli_cov_login_key"),
+            ],
+            || async {
+                crate::config::reset_test_keychain_api_key();
+                run_login(None)
+                    .await
+                    .expect("run_login wrapper should succeed with test prompt key");
+            },
+        )
+        .await;
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["GET /api/profile HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn run_status_human_output_includes_server_label() {
+        let profile = serde_json::to_string(&sample_profile(Some("en"))).unwrap();
+        let (base_url, requests) = server_with_base_url(vec![profile]).await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_status(false)
+                    .await
+                    .expect("human status with api key should print server label");
+            },
+        )
+        .await;
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["GET /api/profile HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn run_invite_accept_rejects_unresolved_invite_preview() {
+        let invite_preview = json!({
+            "list_id": 7,
+            "list_name": "Shared",
+            "already_member": false,
+            "resolved": false,
+            "invite_url": "https://kram.li/i/InviteToken_unresolved"
+        })
+        .to_string();
+        let (base_url, requests) = server_with_base_url(vec![invite_preview]).await;
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                assert!(run_invite(
+                    InviteCmd::Accept {
+                        link: "https://kram.li/i/InviteToken_unresolved".to_string(),
+                        confirm: true,
+                    },
+                    false,
+                )
+                .await
+                .is_err());
+            },
+        )
+        .await;
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(
+            requests,
+            vec!["GET /api/invite-links/InviteToken_unresolved HTTP/1.1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_invite_accept_requires_confirm_flag() {
+        let invite_preview = json!({
+            "list_id": 7,
+            "list_name": "Shared",
+            "already_member": false,
+            "invite_url": "https://kram.li/i/InviteToken_cov"
+        })
+        .to_string();
+        let (base_url, requests) = server_with_base_url(vec![invite_preview]).await;
+
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                assert!(run_invite(
+                    InviteCmd::Accept {
+                        link: "https://kram.li/i/InviteToken_cov".to_string(),
+                        confirm: false,
+                    },
+                    false,
+                )
+                .await
+                .is_err());
+            },
+        )
+        .await;
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["GET /api/invite-links/InviteToken_cov HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn run_security_status_human_output_lists_security_factors() {
+        let (base_url, requests) = server_with_base_url(vec![json!({
+            "security": {
+                "level_label": "Strong",
+                "score": 4,
+                "max_score": 5,
+                "factors": [
+                    {"label": "Password", "met": true},
+                    {"label": "Two-factor", "met": false}
+                ]
+            },
+            "security_email_login_alerts": true
+        })
+        .to_string()])
+        .await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_security(SecurityCmd::Status, false)
+                    .await
+                    .expect("security status should print factor checklist");
+            },
+        )
+        .await;
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["GET /api/security HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn run_status_json_includes_profile_document() {
+        let profile = serde_json::to_string(&sample_profile(Some("en"))).unwrap();
+        let (base_url, requests) = server_with_base_url(vec![profile]).await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_status(true)
+                    .await
+                    .expect("json status should embed fetched profile");
+            },
+        )
+        .await;
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["GET /api/profile HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn run_security_ack_sends_token_in_request_body() {
+        let ack_ok = json!({"ok": true}).to_string();
+        let (base_url, requests) = server_with_base_url(vec![ack_ok]).await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_security(
+                    SecurityCmd::Ack {
+                        token: Some("cov-ack-token".to_string()),
+                    },
+                    false,
+                )
+                .await
+                .expect("security ack should post token body");
+            },
+        )
+        .await;
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["POST /api/security/login-ack HTTP/1.1"]);
+    }
+
+    #[test]
+    fn resolve_list_reference_rejects_invalid_slug_characters_and_overflow() {
+        assert!(resolve_list_reference("slug-with-dash").is_err());
+        let overflowing = "z".repeat(24);
+        assert!(resolve_list_reference(&overflowing).is_err());
+    }
+
+    #[test]
+    fn parses_members_and_handoff_commands_with_list_references() {
+        let slug = encode_list_slug(46);
+        let cli = Cli::try_parse_from([
+            "kramli",
+            "members",
+            "list",
+            &format!("https://kramli.de/lists/l/{slug}"),
+        ])
+        .expect("members list with slug reference should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Members {
+                action: MemberCmd::List { list_id: 46 }
+            })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "kramli",
+            "handoff",
+            "viewing",
+            &format!("https://kramli.de/lists/l/{slug}"),
+            "--list-name",
+            "Groceries",
+        ])
+        .expect("handoff viewing with slug reference should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Handoff {
+                action: HandoffCmd::Viewing {
+                    list_id: 46,
+                    list_name: Some(name),
+                    ..
+                }
+            }) if name == "Groceries"
+        ));
+    }
+
+    #[tokio::test]
+    async fn login_success_and_status_branches_cover_remaining_human_output() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-cli-login-success-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+
+        let profile = serde_json::to_string(&sample_profile(Some("de"))).unwrap();
+        let (base_url, login_requests) = server_with_base_url(vec![profile.clone()]).await;
+        with_env_vars_async(
+            &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_login_with(
+                    None,
+                    || Ok("kramli_test".to_string()),
+                    store_api_key,
+                    noop_delete,
+                )
+                .await
+                .expect("login should succeed with mocked profile");
+            },
+        )
+        .await;
+        assert_eq!(
+            login_requests.await.expect("login server should finish"),
+            vec!["GET /api/profile HTTP/1.1"]
+        );
+
+        let (status_base_url, status_requests) = server_with_status(500, "{}").await;
+        with_env_vars_async(
+            &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("temp config root should be valid utf-8"),
+                ),
+                ("KRAMLI_URL", status_base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_status(false)
+                    .await
+                    .expect("human status should tolerate profile fetch errors");
+            },
+        )
+        .await;
+        assert_eq!(
+            status_requests.await.expect("status server should finish"),
+            vec!["GET /api/profile HTTP/1.1"]
+        );
+
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[tokio::test]
+    async fn run_security_status_human_output_handles_missing_factor_fields() {
+        let (base_url, requests) = server_with_base_url(vec![json!({
+            "security": {
+                "level_label": "Strong",
+                "score": 4,
+                "max_score": 5,
+                "factors": [{}]
+            },
+            "security_email_login_alerts": false
+        })
+        .to_string()])
+        .await;
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            with_env_vars_async(
+                &[
+                    ("KRAMLI_URL", base_url.as_str()),
+                    (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+                ],
+                || async {
+                    run_security(SecurityCmd::Status, false)
+                        .await
+                        .expect("security status should tolerate sparse factor objects");
+                },
+            )
+            .await;
+        })
+        .await;
+        result.expect("security sparse factors test should finish within 20s");
+        assert_eq!(
+            requests.await.expect("test server should finish"),
+            vec!["GET /api/security HTTP/1.1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn api_with_responses_waits_for_registration_before_accepting_connections() {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            let (api, requests) = api_with_responses(vec![json!({"ready": true}).to_string()]).await;
+            tokio::task::yield_now().await;
+            api.get::<Value>("/registration-check")
+                .await
+                .expect("mock server should accept request after registration gate");
+            let captured = requests.await.expect("test server should finish");
+            assert_eq!(captured, vec!["GET /api/registration-check HTTP/1.1"]);
+        })
+        .await;
+        result.expect("api_with_responses registration gate test should finish within 20s");
+    }
+
+    #[tokio::test]
+    async fn run_status_json_reports_logged_out_state_without_profile() {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            with_env_vars_async(&[(TEST_KRAMLI_API_KEY_ENV, "")], || async {
+                run_status(true)
+                    .await
+                    .expect("json status should succeed when logged out");
+            })
+            .await;
+        })
+        .await;
+        result.expect("logged out json status test should finish within 20s");
+    }
+
+    #[tokio::test]
+    async fn run_security_status_human_output_omits_factors_when_absent() {
+        let (base_url, requests) = server_with_base_url(vec![json!({
+            "security": {
+                "level_label": "Good",
+                "score": 80,
+                "max_score": 100
+            },
+            "security_email_login_alerts": true
+        })
+        .to_string()])
+        .await;
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            with_env_vars_async(
+                &[
+                    ("KRAMLI_URL", base_url.as_str()),
+                    (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+                ],
+                || async {
+                    run_security(SecurityCmd::Status, false)
+                        .await
+                        .expect("security status should omit factors when absent");
+                },
+            )
+            .await;
+        })
+        .await;
+        result.expect("security without factors test should finish within 20s");
+        assert_eq!(
+            requests.await.expect("test server should finish"),
+            vec!["GET /api/security HTTP/1.1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_status_json_embeds_profile_lang_metadata() {
+        let profile = serde_json::to_string(&sample_profile(Some("fr-CA"))).unwrap();
+        let (base_url, requests) = server_with_base_url(vec![profile]).await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_status(true)
+                    .await
+                    .expect("json status should include localized profile metadata");
+            },
+        )
+        .await;
+        assert_eq!(
+            requests.await.expect("test server should finish"),
+            vec!["GET /api/profile HTTP/1.1"]
         );
     }
 
@@ -7055,7 +7930,7 @@ fn apply_profile_locale_now(profile: &Profile) {
 
 fn profile_json_with_lang(profile: &Profile) -> Value {
     let mut out = serde_json::to_value(profile).unwrap_or_else(|_| empty_json_object());
-    if let Some(obj) = out.as_object_mut() {
+    let _ = out.as_object_mut().map(|obj| {
         let source = effective_lang_source(profile);
         let profile_lang = profile_lang(profile);
         obj.insert("lang".to_string(), Value::String(current_locale_code()));
@@ -7063,7 +7938,7 @@ fn profile_json_with_lang(profile: &Profile) -> Value {
             obj.insert("profile_lang".to_string(), Value::String(lang));
         }
         obj.insert("lang_source".to_string(), Value::String(source.to_string()));
-    }
+    });
     out
 }
 
@@ -7182,6 +8057,8 @@ async fn run_status(as_json: bool) -> Result<(), String> {
             if let Ok(p) = api.get::<Profile>("/profile").await {
                 out["profile"] = profile_json_with_lang(&p);
             }
+        } else {
+            ()
         }
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
         return Ok(());
@@ -9380,6 +10257,8 @@ async fn run_security(cmd: SecurityCmd, as_json: bool) -> Result<(), String> {
                     let mark = if met { "✓".green() } else { "·".normal() };
                     println!("  {mark} {label}");
                 }
+            } else {
+                ()
             }
             Ok(())
         }

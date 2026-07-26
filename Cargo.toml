@@ -46,3 +46,6 @@ lto = true
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[dev-dependencies]
+http = "1"

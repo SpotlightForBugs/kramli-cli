@@ -50,6 +50,23 @@ pub(crate) fn note_content(payload: &Value) -> Option<&str> {
 
 const KRAMLI_LINK_PREVIEW_TYPE: &str = "kramli-link-preview";
 
+fn push_insert_texts(insert: &Value, texts: &mut Vec<String>) {
+    if let Some(text) = insert.as_str() {
+        if !text.trim().is_empty() {
+            texts.push(text.to_string());
+        }
+    } else if let Some(embed) = insert.as_object() {
+        if embed.get("_type").and_then(Value::as_str) == Some(KRAMLI_LINK_PREVIEW_TYPE) {
+            if let Some(source) = embed.get("source").and_then(Value::as_str) {
+                texts.push(source.to_string());
+            }
+            if let Some(uri) = embed.get("uri").and_then(Value::as_str) {
+                texts.push(uri.to_string());
+            }
+        }
+    }
+}
+
 /// Collect note text fragments that may contain Kramli URLs for link-preview resolution.
 pub(crate) fn collect_note_link_sources(payload: &Value) -> Vec<String> {
     let mut texts = Vec::new();
@@ -72,20 +89,7 @@ pub(crate) fn collect_note_link_sources(payload: &Value) -> Vec<String> {
             continue;
         };
         if let Some(insert) = object.get("insert") {
-            if let Some(text) = insert.as_str() {
-                if !text.trim().is_empty() {
-                    texts.push(text.to_string());
-                }
-            } else if let Some(embed) = insert.as_object() {
-                if embed.get("_type").and_then(Value::as_str) == Some(KRAMLI_LINK_PREVIEW_TYPE) {
-                    if let Some(source) = embed.get("source").and_then(Value::as_str) {
-                        texts.push(source.to_string());
-                    }
-                    if let Some(uri) = embed.get("uri").and_then(Value::as_str) {
-                        texts.push(uri.to_string());
-                    }
-                }
-            }
+            push_insert_texts(insert, &mut texts);
         }
         if let Some(attrs) = object.get("attributes").and_then(Value::as_object) {
             for key in ["a", "link"] {
@@ -311,6 +315,37 @@ mod tests {
         let sources = collect_note_link_sources(&delta);
         assert!(sources.contains(&"https://kramli.de/source".to_string()));
         assert!(sources.contains(&"https://kramli.de/uri".to_string()));
+    }
+
+    #[test]
+    fn collect_note_link_sources_skips_whitespace_only_insert_text() {
+        let delta = json!({
+            "list_type": "note",
+            "note_delta": "[{\"insert\":\" \"}]"
+        });
+        assert!(collect_note_link_sources(&delta).is_empty());
+    }
+
+    #[test]
+    fn collect_note_link_sources_skips_numeric_insert_operations() {
+        let delta = json!({
+            "list_type": "note",
+            "note_delta": "[{\"insert\":42}]"
+        });
+        assert!(collect_note_link_sources(&delta).is_empty());
+    }
+
+    #[test]
+    fn collect_note_link_sources_skips_non_preview_embeds_and_non_text_inserts() {
+        let delta = json!({
+            "list_type": "note",
+            "note_delta": "[\
+                {\"insert\":{\"other\":true}},\
+                {\"insert\":42},\
+                {\"insert\":{\"_type\":\"image\",\"source\":\"https://kramli.de/image.png\"}}\
+            ]"
+        });
+        assert!(collect_note_link_sources(&delta).is_empty());
     }
 
     #[test]

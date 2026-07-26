@@ -94,10 +94,28 @@ pub(crate) async fn upload_item_attachment(
 pub(crate) fn initialize_mcp_file_policy() {
     if let Ok(cwd) = std::env::current_dir() {
         if let Ok(mut guard) = MCP_STARTUP_CWD.write() {
-            if guard.is_none() {
+            if should_set_startup_cwd(guard.as_ref()) {
                 *guard = Some(cwd);
             }
         }
+    }
+}
+
+fn should_set_startup_cwd(existing: Option<&PathBuf>) -> bool {
+    existing.is_none()
+}
+
+fn push_mcp_root_from_startup_state(roots: &mut Vec<PathBuf>, startup_cwd: Option<PathBuf>) {
+    if let Some(startup_cwd) = startup_cwd {
+        roots.push(startup_cwd);
+    } else if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+}
+
+fn push_mcp_root_on_read_failure(roots: &mut Vec<PathBuf>) {
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
     }
 }
 
@@ -116,17 +134,9 @@ pub(crate) fn ensure_mcp_upload_allowed(path: &Path) -> Result<(), String> {
         .canonicalize()
         .map_err(|_| tr_args("attachment-file-not-found", &[]))?;
     let mut roots = Vec::new();
-    if let Ok(guard) = MCP_STARTUP_CWD.read() {
-        match guard.as_ref() {
-            Some(startup_cwd) => roots.push(startup_cwd.clone()),
-            None => {
-                if let Ok(cwd) = std::env::current_dir() {
-                    roots.push(cwd);
-                }
-            }
-        }
-    } else if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd);
+    match MCP_STARTUP_CWD.read() {
+        Ok(guard) => push_mcp_root_from_startup_state(&mut roots, guard.as_ref().cloned()),
+        Err(_) => push_mcp_root_on_read_failure(&mut roots),
     }
     if let Ok(configured) = std::env::var(MCP_FILE_ROOTS_ENV) {
         roots.extend(
@@ -169,8 +179,9 @@ mod tests {
 
     use super::{
         ensure_mcp_upload_allowed, initialize_mcp_file_policy, mcp_file_uploads_enabled,
-        reset_mcp_file_policy_for_tests, upload_item_attachment, validate_image_path,
-        AttachmentUpload,
+        push_mcp_root_from_startup_state, push_mcp_root_on_read_failure,
+        reset_mcp_file_policy_for_tests, should_set_startup_cwd, upload_item_attachment,
+        validate_image_path, AttachmentUpload,
     };
     use crate::api::ApiClient;
     use crate::test_env::{register_mock_server, with_env_vars};
@@ -364,5 +375,49 @@ mod tests {
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
         let _ = fs::remove_dir_all(forbidden_root);
+    }
+
+    #[test]
+    fn mcp_upload_root_helpers_cover_startup_and_read_failure_paths() {
+        let mut roots = Vec::new();
+        push_mcp_root_from_startup_state(&mut roots, None);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0], std::env::current_dir().expect("cwd"));
+
+        let startup = std::env::current_dir().expect("cwd");
+        let mut roots = Vec::new();
+        push_mcp_root_from_startup_state(&mut roots, Some(startup.clone()));
+        assert_eq!(roots, vec![startup]);
+
+        let mut roots = Vec::new();
+        push_mcp_root_on_read_failure(&mut roots);
+        assert_eq!(roots.len(), 1);
+    }
+
+    #[test]
+    fn should_set_startup_cwd_only_when_unset() {
+        assert!(should_set_startup_cwd(None));
+        let cwd = std::env::current_dir().expect("cwd");
+        assert!(!should_set_startup_cwd(Some(&cwd)));
+    }
+
+    #[test]
+    fn initialize_mcp_file_policy_records_startup_cwd_once() {
+        reset_mcp_file_policy_for_tests();
+        let cwd = std::env::current_dir().expect("cwd");
+        let allowed = cwd.join(format!("mcp-startup-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&allowed).expect("temp upload dir should exist");
+        let png = allowed.join("probe.png");
+        std::fs::write(&png, [137, 80, 78, 71]).expect("png fixture should be written");
+
+        with_env_vars(&[("KRAMLI_MCP_ALLOW_FILE_UPLOADS", "1")], || {
+            initialize_mcp_file_policy();
+            assert!(ensure_mcp_upload_allowed(&png).is_ok());
+            initialize_mcp_file_policy();
+            assert!(ensure_mcp_upload_allowed(&png).is_ok());
+        });
+
+        reset_mcp_file_policy_for_tests();
+        let _ = std::fs::remove_dir_all(allowed);
     }
 }

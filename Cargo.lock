@@ -2067,6 +2067,7 @@ dependencies = [
  "dialoguer",
  "dirs",
  "fluent-templates",
+ "http 1.4.0",
  "image",
  "keyring",
  "ratatui",

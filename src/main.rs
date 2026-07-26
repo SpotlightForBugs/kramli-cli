@@ -203,6 +203,10 @@ mod tests {
         }
     }
 
+    fn confirm_true(_: &str, _: bool) -> Result<bool, String> {
+        Ok(true)
+    }
+
     #[test]
     fn run_with_cli_hooks_handles_preference_and_runtime_failures() {
         crate::test_env::with_env_vars(&[("KRAMLI_URL", ""), ("KRAMLI_API_KEY", "")], || {
@@ -468,7 +472,7 @@ mod tests {
                 let mut prompts = Vec::new();
                 ensure_first_run_preferences_with(&cli, true, true, |prompt, default| {
                     prompts.push((prompt.to_string(), default));
-                    Ok(true)
+                    confirm_true(prompt, default)
                 })
                 .expect("bootstrap-only prompt should succeed");
 
@@ -507,13 +511,142 @@ mod tests {
             )],
             || {
                 let cli = cli_for(Some(Commands::Status));
-                let mut prompted = false;
-                ensure_first_run_preferences_with(&cli, true, true, |_, _| {
-                    prompted = true;
-                    Ok(true)
+                ensure_first_run_preferences_with(&cli, true, true, confirm_true)
+                    .expect("configured preferences should not prompt");
+            },
+        );
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[test]
+    fn first_run_preferences_returns_error_when_confirm_callback_fails() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-main-confirm-error-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0_u128, |value| value.as_nanos())
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+
+        crate::test_env::with_env_vars(
+            &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("config root should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("config root should be valid utf-8"),
+                ),
+                (
+                    crate::config::KRAMLI_CONFIG_PATH_ENV,
+                    config_root
+                        .join("config.json")
+                        .to_str()
+                        .expect("config path should be valid utf-8"),
+                ),
+                ("DO_NOT_TRACK", ""),
+                ("KRAMLI_NO_TELEMETRY", ""),
+                ("KRAMLI_TELEMETRY", ""),
+                ("KRAMLI_BOOTSTRAP_ICONS", ""),
+                ("KRAMLI_TUI_BOOTSTRAP_ICONS", ""),
+                ("KRAMLI_LOAD_BOOTSTRAP_ICONS", ""),
+            ],
+            || {
+                let cli = cli_for(Some(Commands::Status));
+                assert!(ensure_first_run_preferences_with(&cli, true, true, |_, _| {
+                    Err("configured preferences should not prompt".to_string())
                 })
-                .expect("configured preferences should not prompt");
-                assert!(!prompted, "configured preferences should not prompt");
+                .is_err());
+            },
+        );
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[test]
+    fn first_run_preferences_surfaces_config_save_errors() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-main-save-error-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0_u128, |value| value.as_nanos())
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+        let config_path = config_root.join("config.json");
+        std::fs::write(&config_path, r#"{"telemetry_enabled":true}"#).expect("seed config");
+        let mut permissions = std::fs::metadata(&config_path)
+            .expect("config metadata")
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&config_path, permissions).expect("mark config readonly");
+
+        crate::test_env::with_env_vars(
+            &[(
+                crate::config::KRAMLI_CONFIG_PATH_ENV,
+                config_path
+                    .to_str()
+                    .expect("config path should be valid utf-8"),
+            )],
+            || {
+                let cli = cli_for(Some(Commands::Status));
+                assert!(ensure_first_run_preferences_with(&cli, true, true, |_, _| Ok(true)).is_err());
+            },
+        );
+
+        let mut permissions = std::fs::metadata(&config_path)
+            .expect("config metadata")
+            .permissions();
+        permissions.set_readonly(false);
+        let _ = std::fs::set_permissions(&config_path, permissions);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[test]
+    fn run_with_cli_reports_runtime_builder_failures() {
+        crate::test_env::with_env_vars(&[("KRAMLI_URL", ""), ("KRAMLI_API_KEY", "")], || {
+            let exit = run_with_cli_hooks(
+                cli_for(Some(Commands::Status)),
+                |_| Ok(()),
+                || Err("runtime failed".to_string()),
+            );
+            assert_eq!(exit, ExitCode::FAILURE);
+        });
+    }
+
+    #[test]
+    fn first_run_preferences_ask_confirm_runs_ok_branch() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-main-cov-prompt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0_u128, |value| value.as_nanos())
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+
+        crate::test_env::with_env_vars(
+            &[(
+                crate::config::KRAMLI_CONFIG_PATH_ENV,
+                config_root
+                    .join("config.json")
+                    .to_str()
+                    .expect("config path should be valid utf-8"),
+            )],
+            || {
+                let cli = cli_for(Some(Commands::Status));
+                let mut prompted = false;
+                ensure_first_run_preferences_with(&cli, true, true, |prompt, default| {
+                    prompted = true;
+                    confirm_true(prompt, default)
+                })
+                .expect("ask confirm Ok(true) should succeed");
+                assert!(prompted, "fresh config should invoke ask confirm");
             },
         );
         let _ = std::fs::remove_dir_all(config_root);

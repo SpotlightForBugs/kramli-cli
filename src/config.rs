@@ -668,6 +668,12 @@ mod tests {
     }
 
     #[test]
+    fn save_to_path_skips_parent_creation_when_path_has_no_parent() {
+        let cfg = config_file(None, None);
+        assert!(cfg.save_to_path(std::path::Path::new("/")).is_err());
+    }
+
+    #[test]
     fn save_to_path_creates_missing_parent_directories() {
         with_clean_config_env(|| {
             let parent =

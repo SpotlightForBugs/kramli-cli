@@ -874,6 +874,61 @@ mod tests {
     }
 
     #[test]
+    fn trace_span_applies_tags_data_and_status_with_active_sentry() {
+        let _guard = sentry::init((
+            "https://9435ede2d0d8eceedf3b3e0eb5cb6aff@o4509985277018112.ingest.de.sentry.io/4510966154002512",
+            sentry::ClientOptions {
+                release: sentry::release_name!(),
+                send_default_pii: false,
+                attach_stacktrace: false,
+                max_breadcrumbs: 0,
+                default_integrations: false,
+                auto_session_tracking: false,
+                traces_sample_rate: 1.0,
+                before_send: Some(std::sync::Arc::new(scrub_event)),
+                ..sentry::ClientOptions::default()
+            },
+        ));
+
+        let transaction =
+            TraceTransaction::start_with_enabled("test.transaction", "test.transaction", true);
+        let span = TraceSpan::child_with_enabled("test.child", "child", true);
+        span.set_tag("command", "status");
+        span.set_data_i64("count", 1);
+        span.set_status(true);
+        span.finish();
+        transaction.finish(true);
+    }
+
+    #[test]
+    fn trace_span_drop_applies_cancelled_status_with_active_sentry() {
+        let _guard = sentry::init((
+            "https://9435ede2d0d8eceedf3b3e0eb5cb6aff@o4509985277018112.ingest.de.sentry.io/4510966154002512",
+            sentry::ClientOptions {
+                release: sentry::release_name!(),
+                send_default_pii: false,
+                attach_stacktrace: false,
+                max_breadcrumbs: 0,
+                default_integrations: false,
+                auto_session_tracking: false,
+                traces_sample_rate: 1.0,
+                before_send: Some(std::sync::Arc::new(scrub_event)),
+                ..sentry::ClientOptions::default()
+            },
+        ));
+
+        let transaction =
+            TraceTransaction::start_with_enabled("test.transaction", "test.transaction", true);
+        {
+            let span = TraceSpan::child_with_enabled("test.child", "child", true);
+            span.set_tag("operation", "demo");
+            span.set_data_i64("count", 1);
+            span.set_status(false);
+        }
+        transaction.finish(true);
+    }
+
+    #[test]
     fn trace_span_helpers_are_safe_without_active_client() {
         let span = TraceSpan::child("test.child", "test.child");
         span.set_tag("operation", "demo");
