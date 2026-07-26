@@ -14751,7 +14751,6 @@ mod tests {
             .expect("event loop should exit after redraw");
     }
 
-
     #[tokio::test]
     async fn init_terminal_factory_uses_real_stdout_when_available() {
         if !std::io::IsTerminal::is_terminal(&io::stdout()) {
@@ -14776,7 +14775,9 @@ mod tests {
         assert_eq!(FooterAction::Attach.chip_shortcut(), "P");
         assert_eq!(key_binding_modifier_label(KeyModifiers::SHIFT), "S+");
         assert_eq!(
-            key_binding_modifier_label(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT),
+            key_binding_modifier_label(
+                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
+            ),
             "C+A+S+"
         );
     }
@@ -15039,19 +15040,13 @@ mod tests {
         );
         app.detail_scroll = 4;
 
-        app.handle_key(KeyEvent::new(
-            KeyCode::Up,
-            KeyModifiers::ALT,
-        ))
-        .await
-        .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT))
+            .await
+            .unwrap();
         assert_eq!(app.detail_scroll, 3);
-        app.handle_key(KeyEvent::new(
-            KeyCode::Down,
-            KeyModifiers::ALT,
-        ))
-        .await
-        .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT))
+            .await
+            .unwrap();
         assert_eq!(app.detail_scroll, 4);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::empty()))
@@ -15069,7 +15064,10 @@ mod tests {
     #[tokio::test]
     async fn open_list_from_preview_selects_known_list_or_queues_reload() {
         let mut app = test_app();
-        app.lists = vec![test_list(), test_shopping_list(9, "Other", None, None, None, false)];
+        app.lists = vec![
+            test_list(),
+            test_shopping_list(9, "Other", None, None, None, false),
+        ];
         app.selected_list = 1;
 
         app.open_list_from_preview(1, Some(3));
@@ -15089,15 +15087,19 @@ mod tests {
         app.editor.as_mut().unwrap().active_field = EditorField::DueDate;
         app.push_editor_char('@');
         assert!(app.editor.as_ref().unwrap().due_date.is_empty());
-        assert!(app.status.as_deref().is_some_and(|status| status.contains("YYYY-MM-DD")));
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("YYYY-MM-DD")));
 
         app.editor.as_mut().unwrap().active_field = EditorField::Progress;
         app.editor.as_mut().unwrap().progress.clear();
         app.push_editor_char('Z');
         assert!(app.editor.as_ref().unwrap().progress.is_empty());
-        assert!(app.status.as_deref().is_some_and(|status| {
-            status.contains(tr("label-state").trim_end_matches(':'))
-        }));
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| { status.contains(tr("label-state").trim_end_matches(':')) }));
     }
 
     #[tokio::test]
@@ -15124,20 +15126,14 @@ mod tests {
         app.kanban_drag_item = Some(0);
         let area = Rect::new(0, 0, 120, 40);
 
-        app.handle_mouse(
-            mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
-            area,
-        )
-        .await
-        .unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 0), area)
+            .await
+            .unwrap();
         assert!(app.kanban_drag_item.is_none());
 
-        app.handle_mouse(
-            mouse(MouseEventKind::ScrollDown, 10, 10),
-            area,
-        )
-        .await
-        .unwrap();
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 10, 10), area)
+            .await
+            .unwrap();
 
         app.handle_mouse(
             MouseEvent {
@@ -15235,7 +15231,9 @@ mod tests {
             assert!(
                 summary.contains("probe+iterm") || picker.protocol_type() == ProtocolType::Iterm2
             );
-            assert!(debug.iter().any(|line| line.contains("imgcat") || line.contains("iterm")));
+            assert!(debug
+                .iter()
+                .any(|line| line.contains("imgcat") || line.contains("iterm")));
 
             match previous_images {
                 Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
@@ -15296,11 +15294,7 @@ mod tests {
         app.kanban_drag_source_column = Some(0);
         app.kanban_drag_started = true;
         app.kanban_drag_target_column = Some(done_column);
-        assert!(
-            app.finish_kanban_drag(Some(done_column))
-                .await
-                .unwrap()
-        );
+        assert!(app.finish_kanban_drag(Some(done_column)).await.unwrap());
 
         assert_eq!(app.items[0].is_done, Some(true));
         let requests = requests.await.expect("kanban drag should persist");
@@ -15387,10 +15381,7 @@ mod tests {
     async fn filter_editor_save_via_handle_key_applies_visible_selection() {
         let mut app = test_app();
         app.lists = vec![test_list()];
-        app.items = vec![
-            sample_item(1, "Alpha"),
-            sample_item(2, "Beta"),
-        ];
+        app.items = vec![sample_item(1, "Alpha"), sample_item(2, "Beta")];
         app.open_filter_editor().unwrap();
         app.editor.as_mut().unwrap().text = "beta".to_string();
         app.handle_editor_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))

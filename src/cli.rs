@@ -4846,19 +4846,15 @@ mod tests {
 
     #[tokio::test]
     async fn batch_stdin_json_redirect_and_keep_going_branches_are_covered() {
-        let keep_going_parse = temp_batch_file(
-            "batch-keep-going-parse",
-            "\"unterminated\nconfig\n",
-        );
+        let keep_going_parse =
+            temp_batch_file("batch-keep-going-parse", "\"unterminated\nconfig\n");
         assert!(run_batch(&keep_going_parse, true, false).await.is_err());
 
         let keep_going_nested = temp_batch_file("batch-keep-going-nested", "batch -\nconfig\n");
         assert!(run_batch(&keep_going_nested, true, false).await.is_err());
 
-        let keep_going_runtime = temp_batch_file(
-            "batch-keep-going-runtime",
-            "lists resolve '   '\nconfig\n",
-        );
+        let keep_going_runtime =
+            temp_batch_file("batch-keep-going-runtime", "lists resolve '   '\nconfig\n");
         assert!(run_batch(&keep_going_runtime, true, false).await.is_err());
 
         let batch_file = temp_batch_file("json-batch-spawn-keep-going", "status\nstatus\n");
@@ -4988,26 +4984,20 @@ mod tests {
         assert_eq!(update[0].method, "PUT");
         assert_eq!(update[0].path, "/api/lists/7");
 
-        assert!(
-            dry_run_requests_for_list_cmd(&ListCmd::List)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            dry_run_requests_for_list_cmd(&ListCmd::Show { id: 7 })
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            dry_run_requests_for_list_cmd(&ListCmd::Resolve {
-                reference: "7".to_string(),
-            })
+        assert!(dry_run_requests_for_list_cmd(&ListCmd::List)
             .await
             .unwrap()
-            .is_none()
-        );
+            .is_none());
+        assert!(dry_run_requests_for_list_cmd(&ListCmd::Show { id: 7 })
+            .await
+            .unwrap()
+            .is_none());
+        assert!(dry_run_requests_for_list_cmd(&ListCmd::Resolve {
+            reference: "7".to_string(),
+        })
+        .await
+        .unwrap()
+        .is_none());
 
         assert!(dry_run_requests_for_member_cmd(&MemberCmd::List { list_id: 7 }).is_none());
         assert!(dry_run_requests_for_key_cmd(&KeyCmd::List).is_none());
@@ -5394,11 +5384,16 @@ mod tests {
         .await;
 
         let requests = requests.await.expect("test server should finish");
-        assert!(requests.iter().any(|request| request.starts_with("GET /api/security")));
-        assert!(requests.iter().any(|request| {
-            request.starts_with("POST /api/invite-links/InviteToken_1/accept")
-        }));
-        assert_eq!(requests.last(), Some(&"PUT /api/folders/5 HTTP/1.1".to_string()));
+        assert!(requests
+            .iter()
+            .any(|request| request.starts_with("GET /api/security")));
+        assert!(requests
+            .iter()
+            .any(|request| { request.starts_with("POST /api/invite-links/InviteToken_1/accept") }));
+        assert_eq!(
+            requests.last(),
+            Some(&"PUT /api/folders/5 HTTP/1.1".to_string())
+        );
     }
 
     #[tokio::test]
@@ -5421,7 +5416,8 @@ mod tests {
         let mut scalar_done = Value::String("not-an-object".to_string());
         enrich_done_response_tags(&api, 55, &mut scalar_done).await;
 
-        let (empty_api, empty_requests) = api_with_responses(vec![json!({"ok": true}).to_string()]).await;
+        let (empty_api, empty_requests) =
+            api_with_responses(vec![json!({"ok": true}).to_string()]).await;
         empty_api
             .get::<Value>("/registered")
             .await
@@ -5481,22 +5477,31 @@ mod tests {
         )
         .await;
         let search_requests = search_requests.await.expect("test server should finish");
-        assert!(search_requests.iter().any(|request| request.starts_with("GET /api/search?")));
+        assert!(search_requests
+            .iter()
+            .any(|request| request.starts_with("GET /api/search?")));
         assert_eq!(search_requests[1], "GET /api/lists HTTP/1.1");
-        assert!(search_requests.iter().any(|request| {
-            request.starts_with("GET /api/invite-links/InviteToken_2")
-        }));
+        assert!(search_requests
+            .iter()
+            .any(|request| { request.starts_with("GET /api/invite-links/InviteToken_2") }));
 
-        with_env_vars_async(&[(NO_COLOR_ENV, "1"), ("KRAMLI_URL", ""), (TEST_KRAMLI_API_KEY_ENV, "")], || async {
-            run_inner(Cli {
-                json: false,
-                interactive: false,
-                dry_run: false,
-                command: Some(Commands::Config),
-            })
-            .await
-            .expect("NO_COLOR should disable styling without breaking config output");
-        })
+        with_env_vars_async(
+            &[
+                (NO_COLOR_ENV, "1"),
+                ("KRAMLI_URL", ""),
+                (TEST_KRAMLI_API_KEY_ENV, ""),
+            ],
+            || async {
+                run_inner(Cli {
+                    json: false,
+                    interactive: false,
+                    dry_run: false,
+                    command: Some(Commands::Config),
+                })
+                .await
+                .expect("NO_COLOR should disable styling without breaking config output");
+            },
+        )
         .await;
     }
 
@@ -5577,12 +5582,10 @@ mod tests {
             json!([]).to_string(),
         ])
         .await;
-        assert!(
-            find_item_across_lists(&missing_api, 404)
-                .await
-                .expect("lookup should succeed")
-                .is_none()
-        );
+        assert!(find_item_across_lists(&missing_api, 404)
+            .await
+            .expect("lookup should succeed")
+            .is_none());
         missing_requests.abort();
 
         let (handoff_base_url, handoff_requests) =
@@ -5616,13 +5619,9 @@ mod tests {
             std::process::id(),
             unix_timestamp_secs()
         ));
-        assert!(run_batch(
-            &missing_batch.to_string_lossy(),
-            false,
-            false
-        )
-        .await
-        .is_err());
+        assert!(run_batch(&missing_batch.to_string_lossy(), false, false)
+            .await
+            .is_err());
 
         let login_profile = json!({"display_name": null, "email": null}).to_string();
         let (login_base_url, login_requests) =
@@ -5775,7 +5774,8 @@ mod tests {
         assert_eq!(multi_captured.len(), 2);
 
         let (search_base_url, search_requests) = server_with_base_url(vec![
-            json!({"lists": [], "items": [{"id": 5, "text": "Existing", "list_id": 7}]}).to_string(),
+            json!({"lists": [], "items": [{"id": 5, "text": "Existing", "list_id": 7}]})
+                .to_string(),
         ])
         .await;
         with_env_vars_async(
@@ -5823,35 +5823,30 @@ mod tests {
             vec!["GET /api/security HTTP/1.1"]
         );
 
-        assert!(
-            dry_run_requests_for_list_cmd(&ListCmd::Create {
-                name: "Bad states".to_string(),
-                icon: None,
-                color: None,
-                folder: None,
-                list_type: None,
-                note_content: None,
-                states: Some("{}".to_string()),
-            })
-            .await
-            .is_err()
-        );
-        assert!(
-            dry_run_requests_for_list_cmd(&ListCmd::Update {
-                id: 1,
-                name: None,
-                icon: None,
-                color: None,
-                note_content: None,
-                states: None,
-            })
-            .await
-            .is_err()
-        );
+        assert!(dry_run_requests_for_list_cmd(&ListCmd::Create {
+            name: "Bad states".to_string(),
+            icon: None,
+            color: None,
+            folder: None,
+            list_type: None,
+            note_content: None,
+            states: Some("{}".to_string()),
+        })
+        .await
+        .is_err());
+        assert!(dry_run_requests_for_list_cmd(&ListCmd::Update {
+            id: 1,
+            name: None,
+            icon: None,
+            color: None,
+            note_content: None,
+            states: None,
+        })
+        .await
+        .is_err());
 
         let status_profile = serde_json::to_string(&sample_profile(Some("en-US"))).unwrap();
-        let (status_base_url, status_requests) =
-            server_with_base_url(vec![status_profile]).await;
+        let (status_base_url, status_requests) = server_with_base_url(vec![status_profile]).await;
         with_env_vars_async(
             &[
                 ("KRAMLI_URL", status_base_url.as_str()),
