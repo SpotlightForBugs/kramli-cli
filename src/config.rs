@@ -403,6 +403,32 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_config_path_falls_back_to_default() {
+        let path = std::env::temp_dir()
+            .join("kramli-clean-config-test")
+            .join(format!("{}-config.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        with_env_vars(
+            &[
+                (KRAMLI_URL_ENV, ""),
+                (KRAMLI_API_KEY_ENV, ""),
+                (DO_NOT_TRACK_ENV, ""),
+                (KRAMLI_NO_TELEMETRY_ENV, ""),
+                (KRAMLI_TELEMETRY_ENV, ""),
+                (KRAMLI_BOOTSTRAP_ICONS_ENV, ""),
+                (KRAMLI_TUI_BOOTSTRAP_ICONS_ENV, ""),
+                (KRAMLI_LOAD_BOOTSTRAP_ICONS_ENV, ""),
+                (KRAMLI_CONFIG_PATH_ENV, "   "),
+                (TEST_BOOL_ENV, ""),
+            ],
+            || {
+                let path = Config::path();
+                assert!(path.ends_with("kramli/config.json"));
+            },
+        );
+    }
+
+    #[test]
     fn explicit_config_path_is_used_without_touching_user_home() {
         let path = std::env::temp_dir()
             .join("kramli-explicit-config-test")
@@ -612,6 +638,22 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn set_and_delete_api_key_cover_keychain_paths() {
+        with_clean_config_env(|| {
+            let cfg = Config::load();
+            let _ = cfg.set_api_key("coverage-test-key");
+            let _ = cfg.delete_api_key();
+        });
+    }
+
+    #[test]
+    fn keyring_entry_can_be_constructed() {
+        with_clean_config_env(|| {
+            assert!(Config::keyring_entry(KEYRING_API_KEY).is_ok());
+        });
     }
 
     #[test]

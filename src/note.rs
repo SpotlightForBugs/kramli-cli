@@ -245,6 +245,65 @@ mod tests {
     }
 
     #[test]
+    fn normalize_list_type_handles_whitespace_and_unknown_aliases() {
+        assert_eq!(normalize_list_type(Some("  ".to_string())), None);
+        assert_eq!(
+            normalize_list_type(Some("shopping".to_string())).as_deref(),
+            Some("shopping")
+        );
+        assert_eq!(
+            normalize_list_type(Some("NOTIZZETTEL".to_string())).as_deref(),
+            Some("note")
+        );
+    }
+
+    #[test]
+    fn collect_note_link_sources_handles_delta_edge_cases() {
+        let content_only = json!({
+            "list_type": "note",
+            "note_content": "  ",
+            "note_delta": "not-json"
+        });
+        assert!(collect_note_link_sources(&content_only).is_empty());
+
+        let empty_delta = json!({
+            "list_type": "note",
+            "note_content": "Hello",
+            "note_delta": ""
+        });
+        assert_eq!(
+            collect_note_link_sources(&empty_delta),
+            vec!["Hello".to_string()]
+        );
+
+        let rich_delta = json!({
+            "list_type": "note",
+            "note_delta": "[\
+                42,\
+                {\"insert\":\" \"},\
+                {\"insert\":{\"_type\":\"kramli-link-preview\",\"uri\":\"https://kramli.de/lists/1\"}},\
+                {\"insert\":\"x\",\"attributes\":{\"link\":\"https://kramli.de/privacy\"}}\
+            ]"
+        });
+        let sources = collect_note_link_sources(&rich_delta);
+        assert!(sources.contains(&"https://kramli.de/lists/1".to_string()));
+        assert!(sources.contains(&"https://kramli.de/privacy".to_string()));
+    }
+
+    #[test]
+    fn validate_plain_note_accepts_empty_delta_operations() {
+        let payload = json!({
+            "list_type": "note",
+            "note_content": "",
+            "note_delta": "",
+            "note_version": 1
+        });
+        let parsed = validate_plain_note(&payload).expect("empty delta should be editable");
+        assert_eq!(parsed.content, "");
+        assert_eq!(parsed.delta, "");
+    }
+
+    #[test]
     fn builds_versioned_payload_and_preserves_clear() {
         let current = json!({
             "list_type": "note",

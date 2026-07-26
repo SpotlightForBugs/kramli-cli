@@ -475,6 +475,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_search_response_object_falls_back_to_flat_hit_when_grouped_fields_absent() {
+        let parsed = SearchResponse::from_value(serde_json::json!({
+            "type": "list",
+            "id": 5,
+            "name": "Weekend"
+        }))
+        .expect("flat object hit should parse");
+        match parsed {
+            SearchResponse::Flat(hits) => {
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].id, 5);
+            }
+            other => panic!("expected flat hit, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_search_response_accepts_flat_hits() {
         let value = serde_json::json!([
             {

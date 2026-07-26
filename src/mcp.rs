@@ -1173,6 +1173,7 @@ mod tests {
     use crate::attachments::initialize_mcp_file_policy;
     use crate::api::ApiClient;
     use serde_json::{json, Map, Value};
+    use std::fs;
     use std::future::Future;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2505,11 +2506,82 @@ mod tests {
                     || text.contains("auth")
                     || text.contains("expired")
             );
-            assert_eq!(
-                requests.await.unwrap(),
-                vec!["GET /api/invite-links/InviteToken_1 HTTP/1.1"]
-            );
+        assert_eq!(
+            requests.await.unwrap(),
+            vec!["GET /api/invite-links/InviteToken_1 HTTP/1.1"]
+        );
         }
+    }
+
+    #[tokio::test]
+    async fn upload_attachment_tool_requires_explicit_opt_in() {
+        let result = with_env_vars_async(
+            &[
+                ("KRAMLI_URL", "http://127.0.0.1:9"),
+                ("KRAMLI_API_KEY", "kramli_test"),
+                ("KRAMLI_MCP_ALLOW_FILE_UPLOADS", "0"),
+            ],
+            || async {
+                handle_tool_call(&json!({
+                    "name": "upload_item_attachment",
+                    "arguments": {"id": 1, "path": "/tmp/x.png"}
+                }))
+                .await
+            },
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn upload_attachment_tool_posts_multipart_when_enabled() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let root = cwd.join(format!("kramli-mcp-upload-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let png = root.join("item.png");
+        fs::write(&png, [137, 80, 78, 71]).unwrap();
+
+        let (api, requests) = api_with_responses(vec![
+            json!({
+                "attachment": {
+                    "id": 3,
+                    "filename": "item.png",
+                    "content_type": "image/png"
+                }
+            })
+            .to_string(),
+        ])
+        .await;
+        let base_url = api.base_url_for_tests().to_string();
+
+        let result = with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                ("KRAMLI_API_KEY", "kramli_test"),
+                ("KRAMLI_MCP_ALLOW_FILE_UPLOADS", "1"),
+            ],
+            || async {
+                initialize_mcp_file_policy();
+                handle_tool_call(&json!({
+                    "name": "upload_item_attachment",
+                    "arguments": {
+                        "id": 5,
+                        "path": png.to_str().expect("png path utf-8"),
+                        "sensitive": true,
+                        "context": "receipt"
+                    }
+                }))
+                .await
+                .expect("upload tool should succeed")
+            },
+        )
+        .await;
+        assert!(!result["isError"].as_bool().unwrap_or(true));
+        assert_eq!(result["structuredContent"]["data"]["id"], 3);
+
+        let requests = requests.await.expect("server should finish");
+        assert!(requests[0].contains("POST /api/items/5/attachments"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

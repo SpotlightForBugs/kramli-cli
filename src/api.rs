@@ -1319,4 +1319,63 @@ mod tests {
         assert_eq!(requests[2], "GET /too-large.png HTTP/1.1");
         assert_eq!(requests[3], "GET /missing.png HTTP/1.1");
     }
+
+    #[tokio::test]
+    async fn api_retries_on_rate_limit_then_succeeds() {
+        let (api, server) = api_with_responses(vec![
+            TestResponse {
+                status: 429,
+                headers: vec![("Retry-After", "1")],
+                body: Vec::new(),
+            },
+            TestResponse::json(json!({"ok": true})),
+        ])
+        .await;
+
+        let got: Value = api.get("/ok").await.unwrap();
+        assert!(got["ok"].as_bool().unwrap_or(false));
+
+        let requests = server.await.expect("server finished");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], "GET /api/ok HTTP/1.1");
+        assert_eq!(requests[1], "GET /api/ok HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn api_rate_limit_interval_waits_between_requests() {
+        let (api, server) = api_with_responses(vec![
+            TestResponse::json(json!({"first": true})),
+            TestResponse::json(json!({"second": true})),
+        ])
+        .await;
+        let mut api = api;
+        api.min_request_interval = Duration::from_millis(40);
+
+        let started = std::time::Instant::now();
+        let _: Value = api.get("/first").await.unwrap();
+        let _: Value = api.get("/second").await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(35));
+
+        let requests = server.await.expect("server finished");
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn api_get_rejects_non_json_success_body() {
+        let (api, server) = api_with_responses(vec![TestResponse::status(200, b"plain text")]).await;
+        assert!(api.get::<Value>("/broken").await.is_err());
+        let requests = server.await.expect("server finished");
+        assert_eq!(requests[0], "GET /api/broken HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn api_get_reports_network_errors() {
+        let api = test_client("http://127.0.0.1:1");
+        assert!(api.get::<Value>("/missing").await.is_err());
+    }
+
+    #[test]
+    fn public_https_resource_rejects_missing_host() {
+        assert!(!ApiClient::public_https_resource_allowed("https:///avatar.png"));
+    }
 }

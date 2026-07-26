@@ -1681,6 +1681,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dry_run_folder_member_key_handoff_and_undo_contracts_are_stable() {
+        let folder_create = dry_run_requests_for_command(&Commands::Folders {
+            action: FolderCmd::Create {
+                name: "Work".to_string(),
+                icon: Some("folder".to_string()),
+                color: Some("#123456".to_string()),
+                parent: Some(2),
+            },
+        })
+        .await
+        .expect("folder dry-run should build")
+        .expect("folder create should be dry-runnable");
+        assert_eq!(folder_create[0].method, "POST");
+        assert_eq!(folder_create[0].path, "/api/folders");
+
+        let folder_update = dry_run_requests_for_command(&Commands::Folders {
+            action: FolderCmd::Update {
+                id: 3,
+                name: Some("Renamed".to_string()),
+                icon: None,
+                color: None,
+                parent: None,
+            },
+        })
+        .await
+        .expect("folder update dry-run should build")
+        .expect("folder update should be dry-runnable");
+        assert_eq!(folder_update[0].method, "PUT");
+        assert_eq!(folder_update[0].path, "/api/folders/3");
+
+        assert!(dry_run_requests_for_command(&Commands::Folders {
+            action: FolderCmd::Update {
+                id: 3,
+                name: None,
+                icon: None,
+                color: None,
+                parent: None,
+            },
+        })
+        .await
+        .is_err());
+
+        let member_invite = dry_run_requests_for_command(&Commands::Members {
+            action: MemberCmd::Invite {
+                list_id: 7,
+                email: "user@example.com".to_string(),
+                role: "editor".to_string(),
+            },
+        })
+        .await
+        .expect("member dry-run should build")
+        .expect("member invite should be dry-runnable");
+        assert_eq!(member_invite[0].path, "/api/lists/7/invite");
+
+        let key_create = dry_run_requests_for_command(&Commands::Keys {
+            action: KeyCmd::Create {
+                name: "CI".to_string(),
+                scopes: "read,write".to_string(),
+            },
+        })
+        .await
+        .expect("key dry-run should build")
+        .expect("key create should be dry-runnable");
+        assert_eq!(key_create[0].path, "/api/api-keys");
+
+        let handoff = dry_run_requests_for_command(&Commands::Handoff {
+            action: HandoffCmd::Viewing {
+                list_id: 5,
+                list_name: Some("Groceries".to_string()),
+                device: None,
+            },
+        })
+        .await
+        .expect("handoff dry-run should build")
+        .expect("handoff viewing should be dry-runnable");
+        assert_eq!(handoff[0].path, "/api/activity/viewing");
+
+        let undo = dry_run_requests_for_command(&Commands::Undo { list_id: 9 })
+            .await
+            .expect("undo dry-run should build")
+            .expect("undo should be dry-runnable");
+        assert_eq!(undo[0].path, "/api/lists/9/undo");
+
+        let redo = dry_run_requests_for_command(&Commands::Redo { list_id: 9 })
+            .await
+            .expect("redo dry-run should build")
+            .expect("redo should be dry-runnable");
+        assert_eq!(redo[0].path, "/api/lists/9/redo");
+    }
+
+    #[tokio::test]
     async fn explicit_invite_inspection_propagates_server_failures() {
         let (base_url, requests) = server_with_status(410, r#"{"error":"expired"}"#).await;
         let result = with_env_vars_async(

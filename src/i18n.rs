@@ -225,6 +225,42 @@ mod tests {
     }
 
     #[test]
+    fn normalize_candidate_rejects_modifier_only_values() {
+        assert_eq!(normalize_candidate("@euro"), None);
+    }
+
+    #[test]
+    fn detect_locale_reads_lang_and_defaults_to_english() {
+        with_env_var("KRAMLI_LANG", None, || {
+            with_env_var("LC_ALL", None, || {
+                with_env_var("LC_MESSAGES", None, || {
+                    with_env_var("LANG", Some("de_DE.UTF-8"), || {
+                        assert_eq!(detect_locale().to_string(), "de-DE");
+                    });
+                    with_env_var("LANG", None, || {
+                        assert_eq!(detect_locale().to_string(), "en");
+                    });
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn try_parse_supported_locale_uses_primary_language_fallback() {
+        assert_eq!(
+            try_parse_supported_locale("de-XX").unwrap().to_string(),
+            "de-XX"
+        );
+        assert!(try_parse_supported_locale("haw-US").is_none());
+    }
+
+    #[test]
+    fn extract_keys_skips_blank_and_continuation_lines() {
+        let keys = extract_keys("valid = Value\n   continuation\n\n# comment\n = blank\n");
+        assert_eq!(keys, vec!["valid".to_string()]);
+    }
+
+    #[test]
     fn locale_candidate_parsing_handles_empty_charset_modifier_and_fallbacks() {
         assert_eq!(normalize_candidate("  "), None);
         assert_eq!(

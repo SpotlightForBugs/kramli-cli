@@ -142,8 +142,53 @@ fn env_truthy(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_image_path;
     use std::fs;
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::{
+        ensure_mcp_upload_allowed, initialize_mcp_file_policy, mcp_file_uploads_enabled,
+        upload_item_attachment, validate_image_path, AttachmentUpload,
+    };
+    use crate::api::ApiClient;
+    use crate::test_env::{register_mock_server, with_env_vars};
+
+    async fn api_with_upload_response(
+        body: serde_json::Value,
+    ) -> (ApiClient, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server address");
+        let base_url = format!("http://{addr}");
+        let ready = register_mock_server(base_url.clone());
+        let handle = tokio::spawn(async move {
+            let _ = ready.await;
+            let (mut stream, _) =
+                tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("accept timed out")
+                    .expect("connection");
+            let mut buf = vec![0_u8; 16_384];
+            let n = stream.read(&mut buf).await.expect("read request");
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let payload = body.to_string();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(payload.as_bytes()).await.unwrap();
+            request
+        });
+        (
+            ApiClient::for_tests(&base_url),
+            handle,
+        )
+    }
 
     #[test]
     fn validates_supported_non_empty_files_and_rejects_unsafe_inputs() {
@@ -162,5 +207,112 @@ mod tests {
         fs::write(&text, [1]).unwrap();
         assert!(validate_image_path(&text).is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn upload_item_attachment_posts_multipart_with_optional_fields() {
+        let root = std::env::temp_dir().join(format!("kramli-upload-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let png = root.join("photo.png");
+        fs::write(&png, [137, 80, 78, 71]).unwrap();
+
+        let (api, request) = api_with_upload_response(json!({
+            "attachment": {
+                "id": 9,
+                "filename": "photo.png",
+                "content_type": "image/png"
+            }
+        }))
+        .await;
+
+        let attachment = upload_item_attachment(
+            &api,
+            7,
+            &AttachmentUpload {
+                path: png.clone(),
+                sensitive: true,
+                context: Some("receipt".to_string()),
+                alt_text: Some("Receipt".to_string()),
+            },
+        )
+        .await
+        .expect("upload should succeed");
+        assert_eq!(attachment.id, 9);
+
+        let request = request.await.expect("server should finish");
+        assert!(request.starts_with("POST /api/items/7/attachments"));
+        assert!(request.contains("multipart/form-data"));
+        assert!(request.contains("name=\"sensitive\""));
+        assert!(request.contains("name=\"context\""));
+        assert!(request.contains("name=\"alt_text\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validate_image_path_accepts_common_extensions() {
+        let root = std::env::temp_dir().join(format!("kramli-mime-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let cases = [
+            ("photo.jpg", "image/jpeg"),
+            ("photo.jpeg", "image/jpeg"),
+            ("photo.gif", "image/gif"),
+            ("photo.webp", "image/webp"),
+            ("photo.heic", "image/heic"),
+            ("photo.heif", "image/heif"),
+        ];
+        for (name, mime) in cases {
+            let path = root.join(name);
+            fs::write(&path, [1, 2, 3]).unwrap();
+            let validated = validate_image_path(&path).unwrap();
+            assert_eq!(validated.mime_type, mime);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_file_policy_allows_startup_paths_and_rejects_outside_roots() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let root = cwd.join(format!("kramli-mcp-policy-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let png = root.join("allowed.png");
+        fs::write(&png, [1, 2, 3]).unwrap();
+        let outside = std::env::temp_dir().join(format!("kramli-outside-{}", std::process::id()));
+        fs::create_dir_all(&outside).unwrap();
+        let allowed = outside.join("scoped.png");
+        fs::write(&allowed, [1, 2, 3]).unwrap();
+        let forbidden_root =
+            std::env::temp_dir().join(format!("kramli-forbidden-{}", std::process::id()));
+        fs::create_dir_all(&forbidden_root).unwrap();
+        let forbidden = forbidden_root.join("secret.png");
+        fs::write(&forbidden, [1, 2, 3]).unwrap();
+
+        with_env_vars(&[("KRAMLI_MCP_ALLOW_FILE_UPLOADS", "1")], || {
+            initialize_mcp_file_policy();
+            assert!(mcp_file_uploads_enabled());
+            assert!(ensure_mcp_upload_allowed(&png).is_ok());
+        });
+
+        with_env_vars(
+            &[
+                ("KRAMLI_MCP_ALLOW_FILE_UPLOADS", "1"),
+                (
+                    "KRAMLI_MCP_FILE_ROOTS",
+                    outside.to_str().expect("outside path utf-8"),
+                ),
+            ],
+            || {
+                assert!(ensure_mcp_upload_allowed(&allowed).is_ok());
+                assert!(ensure_mcp_upload_allowed(&forbidden).is_err());
+            },
+        );
+
+        with_env_vars(&[("KRAMLI_MCP_ALLOW_FILE_UPLOADS", "0")], || {
+            assert!(!mcp_file_uploads_enabled());
+            assert!(ensure_mcp_upload_allowed(&png).is_err());
+        });
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+        let _ = fs::remove_dir_all(forbidden_root);
     }
 }

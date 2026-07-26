@@ -428,4 +428,60 @@ mod tests {
             },
         );
     }
+
+    #[test]
+    fn first_run_prompt_only_asks_bootstrap_when_telemetry_is_saved() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-main-bootstrap-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0_u128, |value| value.as_nanos())
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+        let config_path = config_root.join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{"telemetry_enabled":true}"#,
+        )
+        .expect("seed config");
+
+        crate::test_env::with_env_vars(
+            &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("config root should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("config root should be valid utf-8"),
+                ),
+                (
+                    crate::config::KRAMLI_CONFIG_PATH_ENV,
+                    config_path
+                        .to_str()
+                        .expect("config path should be valid utf-8"),
+                ),
+            ],
+            || {
+                let cli = cli_for(Some(Commands::Status));
+                let mut prompts = Vec::new();
+                ensure_first_run_preferences_with(&cli, true, true, |prompt, default| {
+                    prompts.push((prompt.to_string(), default));
+                    Ok(true)
+                })
+                .expect("bootstrap-only prompt should succeed");
+
+                assert_eq!(prompts.len(), 1);
+                assert!(prompts[0].0.contains("Bootstrap") || prompts[0].0.contains("bootstrap"));
+                let saved = Config::load();
+                assert!(saved.telemetry_enabled());
+                assert!(saved.bootstrap_icons_enabled());
+            },
+        );
+    }
 }
