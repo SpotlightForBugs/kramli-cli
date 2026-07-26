@@ -690,8 +690,7 @@ fn item_id(fragment: &str) -> Option<Option<u64>> {
 
 fn share_token_from_segment(segment: &str) -> Option<&str> {
     let token = segment.strip_suffix(".json").unwrap_or(segment);
-    valid_token(token, SHARE_TOKEN_LEN, SHARE_TOKEN_LEN)
-        .then_some(token)
+    valid_token(token, SHARE_TOKEN_LEN, SHARE_TOKEN_LEN).then_some(token)
 }
 
 fn invite_link(token: &str) -> InternalKramliLink {
@@ -950,7 +949,8 @@ mod tests {
             format!("https://kramli.de/lists/s/{token}#item-2")
         );
 
-        let json_feed = parse_internal_kramli_url(&format!("https://kram.li/{token}.json")).unwrap();
+        let json_feed =
+            parse_internal_kramli_url(&format!("https://kram.li/{token}.json")).unwrap();
         assert_eq!(json_feed.kind, InternalLinkKind::PublicList);
         assert_eq!(
             json_feed.canonical_url,

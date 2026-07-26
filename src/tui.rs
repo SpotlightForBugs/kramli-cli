@@ -38,7 +38,9 @@ use crate::internal_links::{LinkPreview, LinkPreviewActionKind, LinkPreviewResol
 use crate::models::{
     Attachment, ItemComment, ListItem, ListState as ApiListState, Profile, ShoppingList,
 };
-use crate::note::{collect_note_link_sources, note_content, safe_update_payload, validate_plain_note};
+use crate::note::{
+    collect_note_link_sources, note_content, safe_update_payload, validate_plain_note,
+};
 
 const ACCENT: Color = Color::Rgb(126, 200, 255);
 const STATUS_COLOR: Color = Color::Rgb(126, 231, 155);
@@ -3151,7 +3153,9 @@ impl App {
             NavigationAction::SwitchMode(mode) if shows_list_mode_tabs(self) => {
                 self.switch_mode(mode)
             }
-            NavigationAction::NextMode | NavigationAction::PreviousMode | NavigationAction::SwitchMode(_) => {}
+            NavigationAction::NextMode
+            | NavigationAction::PreviousMode
+            | NavigationAction::SwitchMode(_) => {}
             NavigationAction::MoveMonth(delta) => self.move_month_if_calendar_items(delta),
             NavigationAction::MoveHorizontal { delta, fallback } => {
                 self.move_horizontal_or_focus(delta, fallback);
@@ -3711,8 +3715,7 @@ impl App {
             vertical: 1,
             horizontal: 1,
         });
-        let logical_row =
-            self.detail_scroll as usize + mouse.row.saturating_sub(inner.y) as usize;
+        let logical_row = self.detail_scroll as usize + mouse.row.saturating_sub(inner.y) as usize;
         let lines = note_mode_lines(self);
         if logical_row >= lines.len() {
             return Ok(());
@@ -5456,9 +5459,7 @@ fn editor_field_hint(field: EditorField, mode: EditorMode) -> String {
 }
 
 fn shows_list_mode_tabs(app: &App) -> bool {
-    !app
-        .selected_list()
-        .is_some_and(ShoppingList::is_note)
+    !app.selected_list().is_some_and(ShoppingList::is_note)
 }
 
 fn ui_layout(area: Rect, show_mode_tabs: bool) -> UiLayout {

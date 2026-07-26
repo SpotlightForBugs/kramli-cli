@@ -233,13 +233,15 @@ mod tests {
             "note_version": 1
         });
         let sources = collect_note_link_sources(&payload);
-        assert!(sources.iter().any(|text| text.contains("kramli.de/privacy")));
-        assert!(sources.iter().any(|text| text.contains("kram.li/i/InviteToken_1")));
-        assert!(
-            sources
-                .iter()
-                .any(|text| text.contains("PvxNDHrxliG3YtBaq-k1fg.json"))
-        );
+        assert!(sources
+            .iter()
+            .any(|text| text.contains("kramli.de/privacy")));
+        assert!(sources
+            .iter()
+            .any(|text| text.contains("kram.li/i/InviteToken_1")));
+        assert!(sources
+            .iter()
+            .any(|text| text.contains("PvxNDHrxliG3YtBaq-k1fg.json")));
     }
 
     #[test]
