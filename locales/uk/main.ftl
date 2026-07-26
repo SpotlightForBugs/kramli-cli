@@ -357,4 +357,4 @@ tui-invite-confirm-body = Приєднатися до «{ $list }»?
 tui-invite-confirm-hint = Enter: прийняти   Esc: скасувати
 tui-invite-accepting = Запрошення приймається...
 tui-help-actions-5 =   v Відкрити/прийняти посилання   V Наступне посилання   Alt+↑/↓ Прокрутка
-tui-help-note-links =   ↑/↓ Обрати посилання Kramli   Enter Відкрити/прийняти   також v/V
+tui-help-note-links =   ↑/↓ Scroll note   v Open/accept link   V Select next link   Click link card

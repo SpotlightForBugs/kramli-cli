@@ -1997,11 +1997,16 @@ impl App {
         ));
     }
 
-    fn note_link_navigation_active(&self) -> bool {
-        !self.current_link_previews().is_empty()
-            && self
-                .selected_list()
-                .is_some_and(ShoppingList::is_note)
+    fn is_note_view(&self) -> bool {
+        self.selected_list().is_some_and(ShoppingList::is_note)
+    }
+
+    fn scroll_note_detail(&mut self, delta: isize) {
+        if delta < 0 {
+            self.detail_scroll = self.detail_scroll.saturating_sub((-delta) as u16);
+        } else if delta > 0 {
+            self.detail_scroll = self.detail_scroll.saturating_add(delta as u16);
+        }
     }
 
     async fn activate_link_preview(&mut self) -> Result<(), String> {
@@ -2137,6 +2142,10 @@ impl App {
                 self.load_items_for_selected_list(false);
             }
             FocusPane::Items => {
+                if self.is_note_view() {
+                    self.scroll_note_detail(delta);
+                    return;
+                }
                 if self.mode == ViewMode::Kanban {
                     let step = delta.signum();
                     if step != 0 {
@@ -3076,24 +3085,6 @@ impl App {
             return Ok(());
         }
 
-        if self.editor.is_none() && self.note_link_navigation_active() {
-            match key.code {
-                KeyCode::Up if !key.modifiers.contains(KeyModifiers::ALT) => {
-                    self.select_link_preview(-1);
-                    return Ok(());
-                }
-                KeyCode::Down if !key.modifiers.contains(KeyModifiers::ALT) => {
-                    self.select_link_preview(1);
-                    return Ok(());
-                }
-                KeyCode::Enter => {
-                    self.activate_link_preview().await?;
-                    return Ok(());
-                }
-                _ => {}
-            }
-        }
-
         if self.editor.is_none()
             && !self.current_link_previews().is_empty()
             && matches!(key.code, KeyCode::Char('v'))
@@ -3166,8 +3157,12 @@ impl App {
                 self.move_horizontal_or_focus(delta, fallback);
             }
             NavigationAction::MoveSelection(delta) => {
-                self.move_selection_by_key(key, delta, &mut list_changed, &mut item_changed)
-                    .await?;
+                if self.is_note_view() && self.focus == FocusPane::Items && self.editor.is_none() {
+                    self.scroll_note_detail(delta);
+                } else {
+                    self.move_selection_by_key(key, delta, &mut list_changed, &mut item_changed)
+                        .await?;
+                }
             }
             NavigationAction::Enter => list_changed = self.handle_enter_key(key)?,
             NavigationAction::Escape => self.handle_escape_key(),
@@ -3673,6 +3668,11 @@ impl App {
         content: Rect,
         buttons: MouseButtons,
     ) -> Result<(), String> {
+        if self.is_note_view() {
+            return self
+                .handle_note_mode_mouse(mouse, content, buttons.left_down)
+                .await;
+        }
         match self.mode {
             ViewMode::List => self.handle_list_mode_mouse(mouse, content, buttons.left_down),
             ViewMode::Kanban => {
@@ -3696,6 +3696,35 @@ impl App {
                 .await
             }
         }
+    }
+
+    async fn handle_note_mode_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        content: Rect,
+        left_down: bool,
+    ) -> Result<(), String> {
+        if !left_down || !rect_contains(content, mouse.column, mouse.row) {
+            return Ok(());
+        }
+        let inner = content.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let logical_row =
+            self.detail_scroll as usize + mouse.row.saturating_sub(inner.y) as usize;
+        let lines = note_mode_lines(self);
+        if logical_row >= lines.len() {
+            return Ok(());
+        }
+        let Some(index) = note_link_preview_index_at_line(&lines, logical_row) else {
+            return Ok(());
+        };
+        if index >= self.current_link_previews().len() {
+            return Ok(());
+        }
+        self.selected_link_preview = index;
+        self.activate_link_preview().await
     }
 
     fn handle_list_mode_mouse(
@@ -5753,6 +5782,50 @@ fn preview_content_fingerprint(texts: &[String]) -> u64 {
     hasher.finish()
 }
 
+fn note_mode_lines(app: &App) -> Vec<Line<'static>> {
+    let list_id = app.selected_list_id();
+    let mut lines = Vec::new();
+    if let Some(content) = list_id
+        .and_then(|id| app.note_detail_cache.get(&id))
+        .and_then(note_content)
+    {
+        lines.extend(content.lines().map(|line| Line::from(line.to_string())));
+    } else {
+        lines.push(Line::from(tr("tui-note-loading")));
+    }
+    if let Some(previews) = list_id
+        .map(note_preview_owner)
+        .as_deref()
+        .and_then(|owner| app.link_previews.get(owner))
+    {
+        if !previews.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                tr("link-preview-section"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            lines.extend(link_preview_lines(previews, app.selected_link_preview));
+        }
+    }
+    lines
+}
+
+fn note_link_preview_index_at_line(lines: &[Line<'_>], line_index: usize) -> Option<usize> {
+    let section = tr("link-preview-section");
+    let header_idx = lines.iter().position(|line| {
+        line.spans
+            .iter()
+            .any(|span| span.content.as_ref() == section)
+    })?;
+    if line_index <= header_idx {
+        return None;
+    }
+    let offset = line_index - header_idx - 1;
+    let preview_count = lines.len().saturating_sub(header_idx + 1) / 3;
+    let index = offset / 3;
+    (index < preview_count).then_some(index)
+}
+
 fn link_preview_lines(previews: &[LinkPreview], selected: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (index, preview) in previews.iter().enumerate() {
@@ -5783,30 +5856,7 @@ fn link_preview_lines(previews: &[LinkPreview], selected: usize) -> Vec<Line<'st
 }
 
 fn draw_note_mode(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let list_id = app.selected_list_id();
-    let mut lines = Vec::new();
-    if let Some(content) = list_id
-        .and_then(|id| app.note_detail_cache.get(&id))
-        .and_then(note_content)
-    {
-        lines.extend(content.lines().map(|line| Line::from(line.to_string())));
-    } else {
-        lines.push(Line::from(tr("tui-note-loading")));
-    }
-    if let Some(previews) = list_id
-        .map(note_preview_owner)
-        .as_deref()
-        .and_then(|owner| app.link_previews.get(owner))
-    {
-        if !previews.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::styled(
-                tr("link-preview-section"),
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-            lines.extend(link_preview_lines(previews, app.selected_link_preview));
-        }
-    }
+    let lines = note_mode_lines(app);
     frame.render_widget(
         Paragraph::new(lines)
             .block(
@@ -8990,14 +9040,34 @@ mod tests {
             ],
         );
 
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::empty()))
             .await
             .unwrap();
         assert_eq!(app.selected_link_preview, 1);
-        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::empty()))
             .await
             .unwrap();
         assert_eq!(app.selected_link_preview, 0);
+    }
+
+    #[test]
+    fn note_view_scrolls_with_arrow_keys() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.note_detail_cache.insert(
+            1,
+            json!({"note_content": (0..40).map(|i| format!("Line {i}")).collect::<Vec<_>>().join("\n")}),
+        );
+        app.focus = FocusPane::Items;
+        app.detail_scroll = 0;
+
+        app.scroll_note_detail(3);
+        assert_eq!(app.detail_scroll, 3);
+        app.scroll_note_detail(-1);
+        assert_eq!(app.detail_scroll, 2);
     }
 
     #[tokio::test]
