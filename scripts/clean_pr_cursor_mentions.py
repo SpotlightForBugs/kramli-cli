@@ -14,13 +14,17 @@ import sys
 import urllib.error
 import urllib.request
 
-CURSOR_AGENT_BLOCK_RE = re.compile(
-    r"<!--\s*CURSOR_AGENT_PR_BODY_BEGIN\s*-->.*?<!--\s*CURSOR_AGENT_PR_BODY_END\s*-->",
-    re.DOTALL | re.IGNORECASE,
+CURSOR_AGENT_MARKER_RE = re.compile(
+    r"<!--\s*CURSOR_AGENT_PR_BODY_(?:BEGIN|END)\s*-->\n?",
+    re.IGNORECASE,
 )
 CURSOR_AGENT_LINK_RE = re.compile(
     r"\n*---\n*\s*(?:\[.*?\]\()?https?://(?:www\.)?cursor\.com/agents/[^\s\)\]]+.*",
     re.IGNORECASE,
+)
+CURSOR_BADGE_BLOCK_RE = re.compile(
+    r"\n*<div>.*?cursor\.com.*?</div>\s*",
+    re.DOTALL | re.IGNORECASE,
 )
 CURSOR_FOOTER_RE = re.compile(
     r"\n*(?:Made with \[?Cursor\]?|Powered by \[?Cursor\]?|"
@@ -43,7 +47,8 @@ def scrub_pr_body(body: str | None) -> tuple[str, bool]:
 
     cleaned = body
     for pattern in (
-        CURSOR_AGENT_BLOCK_RE,
+        CURSOR_AGENT_MARKER_RE,
+        CURSOR_BADGE_BLOCK_RE,
         CURSOR_AGENT_LINK_RE,
         CURSOR_FOOTER_RE,
         TRAILING_CURSOR_LINK_RE,
@@ -161,8 +166,10 @@ def run_self_test() -> None:
     body = (
         "Real summary\n\n"
         "<!-- CURSOR_AGENT_PR_BODY_BEGIN -->\n"
-        "Agent junk\n"
+        "## Problem\n\n"
+        "Actual PR content stays.\n"
         "<!-- CURSOR_AGENT_PR_BODY_END -->\n\n"
+        '<div><a href="https://cursor.com/agents/abc123">Open</a></div>\n'
         "---\n"
         "[View run](https://cursor.com/agents/abc123)\n"
     )
@@ -170,6 +177,7 @@ def run_self_test() -> None:
     assert changed
     assert "CURSOR_AGENT" not in cleaned
     assert "cursor.com" not in cleaned
+    assert "Actual PR content stays" in cleaned
     assert "Real summary" in cleaned
 
     assert is_cursor_noise_comment(

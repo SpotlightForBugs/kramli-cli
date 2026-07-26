@@ -76,6 +76,10 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Fetch base branch
+        if: steps.pr.outputs.all_open != 'true'
+        run: git fetch origin "${{ github.event.pull_request.base.ref || 'main' }}"
+
       - name: Rewrite cursoragent-authored commits
         if: steps.pr.outputs.all_open != 'true'
         env:

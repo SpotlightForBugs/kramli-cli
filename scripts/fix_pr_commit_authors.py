@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -39,6 +40,10 @@ def resolve_fallback_author(token: str, repo: str, pr_number: int) -> tuple[str,
     commits = github_request(token, f"/repos/{repo}/pulls/{pr_number}/commits")
     if isinstance(commits, list):
         for commit in commits:
+            message = (commit.get("commit") or {}).get("message", "")
+            from_message = human_author_from_commit_message(message)
+            if from_message:
+                return from_message
             for author in commit.get("authors") or []:
                 email = (author.get("email") or "").strip().lower()
                 login = (author.get("login") or "").strip()
@@ -68,9 +73,27 @@ def resolve_head_ref(token: str, repo: str, pr_number: int) -> str:
     return head_ref
 
 
-def branch_has_cursor_authors() -> bool:
+COAUTHOR_RE = re.compile(
+    r"^Co-authored-by:\s*(.+?)\s*<([^>]+)>",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def human_author_from_commit_message(message: str) -> tuple[str, str] | None:
+    for match in COAUTHOR_RE.finditer(message):
+        name = match.group(1).strip()
+        email = match.group(2).strip().lower()
+        if email == CURSOR_AUTHOR_EMAIL.lower() or "cursoragent" in email:
+            continue
+        return name, email
+    return None
+
+
+def branch_has_cursor_authors(base_ref: str = "origin/main") -> bool:
     output = subprocess.check_output(
-        ["git", "log", "--format=%ae", "HEAD"], text=True, cwd=REPO_ROOT
+        ["git", "log", f"{base_ref}..HEAD", "--format=%ae"],
+        text=True,
+        cwd=REPO_ROOT,
     )
     return any(
         email.strip().lower() == CURSOR_AUTHOR_EMAIL.lower()
@@ -78,26 +101,30 @@ def branch_has_cursor_authors() -> bool:
     )
 
 
-def rewrite_branch(fallback_name: str, fallback_email: str) -> bool:
-    if not branch_has_cursor_authors():
+def rewrite_branch(fallback_name: str, fallback_email: str, base_ref: str = "origin/main") -> bool:
+    if not branch_has_cursor_authors(base_ref):
         return False
 
-    env = os.environ.copy()
-    env["FALLBACK_AUTHOR_NAME"] = fallback_name
-    env["FALLBACK_AUTHOR_EMAIL"] = fallback_email
-    env["GIT_SEQUENCE_EDITOR"] = "true"
-    subprocess.run(
-        [
-            "git",
-            "rebase",
-            "--root",
-            "--exec",
-            f"python3 {EXEC_HELPER}",
-        ],
-        cwd=REPO_ROOT,
-        env=env,
-        check=True,
-    )
+    with tempfile.TemporaryDirectory(prefix="kramli-clean-pr-") as tmpdir:
+        exec_path = Path(tmpdir) / "fix_commit_author_exec.py"
+        shutil.copy2(EXEC_HELPER, exec_path)
+
+        env = os.environ.copy()
+        env["FALLBACK_AUTHOR_NAME"] = fallback_name
+        env["FALLBACK_AUTHOR_EMAIL"] = fallback_email
+        env["GIT_SEQUENCE_EDITOR"] = "true"
+        subprocess.run(
+            [
+                "git",
+                "rebase",
+                base_ref,
+                "--exec",
+                f"python3 {exec_path}",
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            check=True,
+        )
     return True
 
 
