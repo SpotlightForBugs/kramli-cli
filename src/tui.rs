@@ -38,7 +38,9 @@ use crate::internal_links::{LinkPreview, LinkPreviewActionKind, LinkPreviewResol
 use crate::models::{
     Attachment, ItemComment, ListItem, ListState as ApiListState, Profile, ShoppingList,
 };
-use crate::note::{note_content, safe_update_payload, validate_plain_note};
+use crate::note::{
+    collect_note_link_sources, note_content, safe_update_payload, validate_plain_note,
+};
 
 const ACCENT: Color = Color::Rgb(126, 200, 255);
 const STATUS_COLOR: Color = Color::Rgb(126, 231, 155);
@@ -1688,6 +1690,7 @@ impl App {
             self.selected_item = 0;
             self.pending_open_item_id = None;
             self.detail_scroll = 0;
+            self.focus = FocusPane::Items;
             self.loading_items_for = Some(list_id);
             self.load_note_detail_background(list_id);
             return;
@@ -1927,8 +1930,8 @@ impl App {
         if let Some(list) = self.lists.iter().find(|list| list.id == list_id) {
             texts.push(list.name.clone());
         }
-        if let Some(content) = self.note_detail_cache.get(&list_id).and_then(note_content) {
-            texts.push(content.to_string());
+        if let Some(detail) = self.note_detail_cache.get(&list_id) {
+            texts.extend(collect_note_link_sources(detail));
         }
         self.load_link_previews(note_preview_owner(list_id), texts);
     }
@@ -1974,16 +1977,38 @@ impl App {
     }
 
     fn cycle_link_preview(&mut self) {
+        self.select_link_preview(1);
+    }
+
+    fn select_link_preview(&mut self, delta: isize) {
         let count = self.current_link_previews().len();
-        if count > 0 {
-            self.selected_link_preview = (self.selected_link_preview + 1) % count;
-            self.status = Some(tr_args(
-                "tui-link-preview-selected",
-                &[
-                    ("index", (self.selected_link_preview + 1).to_string()),
-                    ("count", count.to_string()),
-                ],
-            ));
+        if count == 0 {
+            return;
+        }
+        let next = if delta < 0 {
+            (self.selected_link_preview + count - 1) % count
+        } else {
+            (self.selected_link_preview + 1) % count
+        };
+        self.selected_link_preview = next;
+        self.status = Some(tr_args(
+            "tui-link-preview-selected",
+            &[
+                ("index", (self.selected_link_preview + 1).to_string()),
+                ("count", count.to_string()),
+            ],
+        ));
+    }
+
+    fn is_note_view(&self) -> bool {
+        self.selected_list().is_some_and(ShoppingList::is_note)
+    }
+
+    fn scroll_note_detail(&mut self, delta: isize) {
+        if delta < 0 {
+            self.detail_scroll = self.detail_scroll.saturating_sub((-delta) as u16);
+        } else if delta > 0 {
+            self.detail_scroll = self.detail_scroll.saturating_add(delta as u16);
         }
     }
 
@@ -2120,6 +2145,10 @@ impl App {
                 self.load_items_for_selected_list(false);
             }
             FocusPane::Items => {
+                if self.is_note_view() {
+                    self.scroll_note_detail(delta);
+                    return;
+                }
                 if self.mode == ViewMode::Kanban {
                     let step = delta.signum();
                     if step != 0 {
@@ -3116,16 +3145,29 @@ impl App {
         let mut item_changed = false;
 
         match navigation_action_for_key(key.code) {
-            NavigationAction::NextMode => self.switch_mode(self.mode.next()),
-            NavigationAction::PreviousMode => self.switch_mode(self.mode.prev()),
-            NavigationAction::SwitchMode(mode) => self.switch_mode(mode),
+            NavigationAction::NextMode if shows_list_mode_tabs(self) => {
+                self.switch_mode(self.mode.next())
+            }
+            NavigationAction::PreviousMode if shows_list_mode_tabs(self) => {
+                self.switch_mode(self.mode.prev())
+            }
+            NavigationAction::SwitchMode(mode) if shows_list_mode_tabs(self) => {
+                self.switch_mode(mode)
+            }
+            NavigationAction::NextMode
+            | NavigationAction::PreviousMode
+            | NavigationAction::SwitchMode(_) => {}
             NavigationAction::MoveMonth(delta) => self.move_month_if_calendar_items(delta),
             NavigationAction::MoveHorizontal { delta, fallback } => {
                 self.move_horizontal_or_focus(delta, fallback);
             }
             NavigationAction::MoveSelection(delta) => {
-                self.move_selection_by_key(key, delta, &mut list_changed, &mut item_changed)
-                    .await?;
+                if self.is_note_view() && self.focus == FocusPane::Items && self.editor.is_none() {
+                    self.scroll_note_detail(delta);
+                } else {
+                    self.move_selection_by_key(key, delta, &mut list_changed, &mut item_changed)
+                        .await?;
+                }
             }
             NavigationAction::Enter => list_changed = self.handle_enter_key(key)?,
             NavigationAction::Escape => self.handle_escape_key(),
@@ -3444,7 +3486,7 @@ impl App {
             return Ok(());
         };
         let previous_item = self.selected_item;
-        let layout = ui_layout(area);
+        let layout = ui_layout(area, shows_list_mode_tabs(self));
 
         if buttons.left_up && !rect_contains(layout.content, mouse.column, mouse.row) {
             self.clear_drag_state();
@@ -3526,6 +3568,9 @@ impl App {
     }
 
     fn handle_tab_mouse(&mut self, mouse: MouseEvent, layout: &UiLayout, left_down: bool) -> bool {
+        if !shows_list_mode_tabs(self) || layout.tab_chunks[0].height == 0 {
+            return false;
+        }
         if !left_down {
             return false;
         }
@@ -3612,7 +3657,7 @@ impl App {
     }
 
     fn handle_empty_items_mouse(&mut self, left_up: bool) -> bool {
-        if !self.items.is_empty() {
+        if !self.items.is_empty() || self.is_note_view() {
             return false;
         }
         if left_up {
@@ -3628,6 +3673,11 @@ impl App {
         content: Rect,
         buttons: MouseButtons,
     ) -> Result<(), String> {
+        if self.is_note_view() {
+            return self
+                .handle_note_mode_mouse(mouse, content, buttons.left_down)
+                .await;
+        }
         match self.mode {
             ViewMode::List => self.handle_list_mode_mouse(mouse, content, buttons.left_down),
             ViewMode::Kanban => {
@@ -3651,6 +3701,34 @@ impl App {
                 .await
             }
         }
+    }
+
+    async fn handle_note_mode_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        content: Rect,
+        left_down: bool,
+    ) -> Result<(), String> {
+        if !left_down || !rect_contains(content, mouse.column, mouse.row) {
+            return Ok(());
+        }
+        let inner = content.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let logical_row = self.detail_scroll as usize + mouse.row.saturating_sub(inner.y) as usize;
+        let lines = note_mode_lines(self);
+        if logical_row >= lines.len() {
+            return Ok(());
+        }
+        let Some(index) = note_link_preview_index_at_line(&lines, logical_row) else {
+            return Ok(());
+        };
+        if index >= self.current_link_previews().len() {
+            return Ok(());
+        }
+        self.selected_link_preview = index;
+        self.activate_link_preview().await
     }
 
     fn handle_list_mode_mouse(
@@ -5381,24 +5459,34 @@ fn editor_field_hint(field: EditorField, mode: EditorMode) -> String {
     }
 }
 
-fn ui_layout(area: Rect) -> UiLayout {
+fn shows_list_mode_tabs(app: &App) -> bool {
+    !app.selected_list().is_some_and(ShoppingList::is_note)
+}
+
+fn ui_layout(area: Rect, show_mode_tabs: bool) -> UiLayout {
+    let tab_height = if show_mode_tabs { 3 } else { 0 };
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(tab_height),
             Constraint::Min(6),
             Constraint::Length(5),
         ])
         .split(area);
 
-    let tab_chunks_vec = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-        ])
-        .split(vertical[0]);
+    let tab_chunks = if show_mode_tabs {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(33),
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+            ])
+            .split(vertical[0]);
+        [chunks[0], chunks[1], chunks[2]]
+    } else {
+        [Rect::default(), Rect::default(), Rect::default()]
+    };
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
@@ -5409,7 +5497,7 @@ fn ui_layout(area: Rect) -> UiLayout {
         lists: body[0],
         content: body[1],
         footer: vertical[2],
-        tab_chunks: [tab_chunks_vec[0], tab_chunks_vec[1], tab_chunks_vec[2]],
+        tab_chunks,
     }
 }
 
@@ -5618,9 +5706,12 @@ fn centered_popup(
 }
 
 fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
-    let layout = ui_layout(frame.area());
+    let show_mode_tabs = shows_list_mode_tabs(app);
+    let layout = ui_layout(frame.area(), show_mode_tabs);
 
-    draw_mode_tabs(frame, app, &layout);
+    if show_mode_tabs {
+        draw_mode_tabs(frame, app, &layout);
+    }
 
     draw_lists_panel(frame, app, layout.lists);
 
@@ -5693,6 +5784,50 @@ fn preview_content_fingerprint(texts: &[String]) -> u64 {
     hasher.finish()
 }
 
+fn note_mode_lines(app: &App) -> Vec<Line<'static>> {
+    let list_id = app.selected_list_id();
+    let mut lines = Vec::new();
+    if let Some(content) = list_id
+        .and_then(|id| app.note_detail_cache.get(&id))
+        .and_then(note_content)
+    {
+        lines.extend(content.lines().map(|line| Line::from(line.to_string())));
+    } else {
+        lines.push(Line::from(tr("tui-note-loading")));
+    }
+    if let Some(previews) = list_id
+        .map(note_preview_owner)
+        .as_deref()
+        .and_then(|owner| app.link_previews.get(owner))
+    {
+        if !previews.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                tr("link-preview-section"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            lines.extend(link_preview_lines(previews, app.selected_link_preview));
+        }
+    }
+    lines
+}
+
+fn note_link_preview_index_at_line(lines: &[Line<'_>], line_index: usize) -> Option<usize> {
+    let section = tr("link-preview-section");
+    let header_idx = lines.iter().position(|line| {
+        line.spans
+            .iter()
+            .any(|span| span.content.as_ref() == section)
+    })?;
+    if line_index <= header_idx {
+        return None;
+    }
+    let offset = line_index - header_idx - 1;
+    let preview_count = lines.len().saturating_sub(header_idx + 1) / 3;
+    let index = offset / 3;
+    (index < preview_count).then_some(index)
+}
+
 fn link_preview_lines(previews: &[LinkPreview], selected: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (index, preview) in previews.iter().enumerate() {
@@ -5723,30 +5858,7 @@ fn link_preview_lines(previews: &[LinkPreview], selected: usize) -> Vec<Line<'st
 }
 
 fn draw_note_mode(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let list_id = app.selected_list_id();
-    let mut lines = Vec::new();
-    if let Some(content) = list_id
-        .and_then(|id| app.note_detail_cache.get(&id))
-        .and_then(note_content)
-    {
-        lines.extend(content.lines().map(|line| Line::from(line.to_string())));
-    } else {
-        lines.push(Line::from(tr("tui-note-loading")));
-    }
-    if let Some(previews) = list_id
-        .map(note_preview_owner)
-        .as_deref()
-        .and_then(|owner| app.link_previews.get(owner))
-    {
-        if !previews.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::styled(
-                tr("link-preview-section"),
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-            lines.extend(link_preview_lines(previews, app.selected_link_preview));
-        }
-    }
+    let lines = note_mode_lines(app);
     frame.render_widget(
         Paragraph::new(lines)
             .block(
@@ -5849,10 +5961,15 @@ fn draw_lists_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .unwrap_or_else(|| tr("common-unknown"));
         let list_count = app.lists.len();
         let selected = app.selected_list_display_name();
+        let selected_label = if app.selected_list().is_some_and(ShoppingList::is_note) {
+            tr("view-note")
+        } else {
+            tr("view-list")
+        };
         let info = vec![
             Line::from(profile_text),
             Line::from(format!("{} {}", tr("label-lists"), list_count)),
-            Line::from(format!("{} {}", tr("view-list"), selected)),
+            Line::from(format!("{selected_label} {selected}")),
         ];
         let mut info = info;
         if cfg!(debug_assertions) {
@@ -6844,6 +6961,7 @@ fn draw_help_overlay(frame: &mut Frame<'_>) {
         Line::from(tr("tui-help-actions-3")),
         Line::from(tr("tui-help-actions-4")),
         Line::from(tr("tui-help-actions-5")),
+        Line::from(tr("tui-help-note-links")),
         Line::from(""),
         Line::from(vec![Span::styled(
             tr("tui-help-editor"),
@@ -8880,6 +8998,108 @@ mod tests {
         assert!(text.contains("Plan https://kramli.de/privacy"));
         assert!(text.contains(&tr("link-preview-open")));
         assert!(app.items.is_empty());
+    }
+
+    #[test]
+    fn note_lists_hide_view_mode_toolbar() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        assert!(!shows_list_mode_tabs(&app));
+
+        app.note_detail_cache
+            .insert(1, json!({"note_content": "Plain note"}));
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        let text = terminal_text(&terminal);
+        assert!(!text.contains(&tr("view-board")));
+        assert!(!text.contains(&tr("view-calendar")));
+        assert!(text.contains(&tr("view-note")));
+    }
+
+    #[tokio::test]
+    async fn note_link_previews_are_keyboard_selectable() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.apply_note_detail_result(
+            1,
+            Ok(json!({
+                "note_content": "One",
+                "note_delta": "[{\"insert\":\"https://kram.li/PvxNDHrxliG3YtBaq-k1fg.json\\n\"}]"
+            })),
+        );
+        app.link_previews.insert(
+            note_preview_owner(1),
+            vec![
+                test_link_preview(
+                    "https://kramli.de/lists/s/PvxNDHrxliG3YtBaq-k1fg",
+                    Some(LinkPreviewActionKind::Open),
+                    Some(46),
+                ),
+                test_link_preview(
+                    "https://kramli.de/privacy",
+                    Some(LinkPreviewActionKind::Open),
+                    None,
+                ),
+            ],
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.selected_link_preview, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.selected_link_preview, 0);
+    }
+
+    #[test]
+    fn note_view_scrolls_with_arrow_keys() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.note_detail_cache.insert(
+            1,
+            json!({"note_content": (0..40).map(|i| format!("Line {i}")).collect::<Vec<_>>().join("\n")}),
+        );
+        app.focus = FocusPane::Items;
+        app.detail_scroll = 0;
+
+        app.scroll_note_detail(3);
+        assert_eq!(app.detail_scroll, 3);
+        app.scroll_note_detail(-1);
+        assert_eq!(app.detail_scroll, 2);
+    }
+
+    #[test]
+    fn note_view_allows_content_mouse_and_auto_focuses_items() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.note_detail_cache
+            .insert(1, json!({"note_content": "Plain note"}));
+        let owner = note_preview_owner(1);
+        let mut texts = vec![app.lists[0].name.clone()];
+        texts.extend(collect_note_link_sources(
+            app.note_detail_cache.get(&1).unwrap(),
+        ));
+        app.link_preview_fingerprints
+            .insert(owner, preview_content_fingerprint(&texts));
+        app.focus = FocusPane::Lists;
+        app.load_items_for_selected_list(false);
+        assert_eq!(app.focus, FocusPane::Items);
+        assert!(!app.handle_empty_items_mouse(false));
     }
 
     #[tokio::test]
@@ -11865,7 +12085,7 @@ mod tests {
         assert!(!app.handle_mouse_scroll(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1)));
 
         let area = Rect::new(0, 0, 120, 40);
-        let layout = ui_layout(area);
+        let layout = ui_layout(area, shows_list_mode_tabs(&app));
         assert!(!app.handle_tab_mouse(
             mouse(
                 MouseEventKind::Down(MouseButton::Left),
@@ -11923,7 +12143,7 @@ mod tests {
         app.items = vec![sample_item(1, "One"), sample_item(2, "Two")];
         app.items_cache.insert(1, app.items.clone());
         let area = Rect::new(0, 0, 120, 40);
-        let layout = ui_layout(area);
+        let layout = ui_layout(area, shows_list_mode_tabs(&app));
 
         app.show_help = true;
         assert!(app.handle_help_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1)));

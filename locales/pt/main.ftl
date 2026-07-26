@@ -100,6 +100,7 @@ role-editor = Editor
 role-viewer = Visualizador
 
 view-list = Lista
+view-note = Note
 view-board = Quadro
 view-calendar = Calendário
 view-timeline = Linha do tempo
@@ -357,3 +358,4 @@ tui-invite-confirm-body = Entrar em «{ $list }»?
 tui-invite-confirm-hint = Enter: aceitar   Esc: cancelar
 tui-invite-accepting = A aceitar convite...
 tui-help-actions-5 =   v Abrir/aceitar ligação   V Ligação seguinte   Alt+↑/↓ Deslocar detalhes
+tui-help-note-links =   ↑/↓ Scroll note   v Open/accept link   V Select next link   Click link card

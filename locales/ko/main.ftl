@@ -100,6 +100,7 @@ role-editor = 편집자
 role-viewer = 뷰어
 
 view-list = 목록
+view-note = Note
 view-board = 보드
 view-calendar = 캘린더
 view-timeline = 타임라인
@@ -357,3 +358,4 @@ tui-invite-confirm-body = “{ $list }”에 참여할까요?
 tui-invite-confirm-hint = Enter: 수락   Esc: 취소
 tui-invite-accepting = 초대 수락 중...
 tui-help-actions-5 =   v 링크 열기/수락   V 다음 링크   Alt+↑/↓ 세부 정보 스크롤
+tui-help-note-links =   ↑/↓ Scroll note   v Open/accept link   V Select next link   Click link card

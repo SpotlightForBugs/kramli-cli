@@ -100,6 +100,7 @@ role-editor = 编辑者
 role-viewer = 查看者
 
 view-list = 列表
+view-note = Note
 view-board = 看板
 view-calendar = 日历
 view-timeline = 时间线
@@ -357,3 +358,4 @@ tui-invite-confirm-body = 加入“{ $list }”？
 tui-invite-confirm-hint = Enter：接受   Esc：取消
 tui-invite-accepting = 正在接受邀请...
 tui-help-actions-5 =   v 打开/接受链接   V 下一个链接   Alt+↑/↓ 滚动详情
+tui-help-note-links =   ↑/↓ Scroll note   v Open/accept link   V Select next link   Click link card
