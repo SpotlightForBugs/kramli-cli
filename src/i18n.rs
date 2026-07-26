@@ -231,18 +231,28 @@ mod tests {
 
     #[test]
     fn detect_locale_reads_lang_and_defaults_to_english() {
-        with_env_var("KRAMLI_LANG", None, || {
-            with_env_var("LC_ALL", None, || {
-                with_env_var("LC_MESSAGES", None, || {
-                    with_env_var("LANG", Some("de_DE.UTF-8"), || {
-                        assert_eq!(detect_locale().to_string(), "de-DE");
-                    });
-                    with_env_var("LANG", None, || {
-                        assert_eq!(detect_locale().to_string(), "en");
-                    });
-                });
-            });
-        });
+        crate::test_env::with_env_vars(
+            &[
+                ("KRAMLI_LANG", ""),
+                ("LC_ALL", ""),
+                ("LC_MESSAGES", ""),
+                ("LANG", "de_DE.UTF-8"),
+            ],
+            || {
+                assert_eq!(detect_locale().to_string(), "de-DE");
+            },
+        );
+        crate::test_env::with_env_vars(
+            &[
+                ("KRAMLI_LANG", ""),
+                ("LC_ALL", ""),
+                ("LC_MESSAGES", ""),
+                ("LANG", ""),
+            ],
+            || {
+                assert_eq!(detect_locale().to_string(), "en");
+            },
+        );
     }
 
     #[test]
