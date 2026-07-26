@@ -1690,6 +1690,7 @@ impl App {
             self.selected_item = 0;
             self.pending_open_item_id = None;
             self.detail_scroll = 0;
+            self.focus = FocusPane::Items;
             self.loading_items_for = Some(list_id);
             self.load_note_detail_background(list_id);
             return;
@@ -3656,7 +3657,7 @@ impl App {
     }
 
     fn handle_empty_items_mouse(&mut self, left_up: bool) -> bool {
-        if !self.items.is_empty() {
+        if !self.items.is_empty() || self.is_note_view() {
             return false;
         }
         if left_up {
@@ -9077,6 +9078,28 @@ mod tests {
         assert_eq!(app.detail_scroll, 3);
         app.scroll_note_detail(-1);
         assert_eq!(app.detail_scroll, 2);
+    }
+
+    #[test]
+    fn note_view_allows_content_mouse_and_auto_focuses_items() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.note_detail_cache
+            .insert(1, json!({"note_content": "Plain note"}));
+        let owner = note_preview_owner(1);
+        let mut texts = vec![app.lists[0].name.clone()];
+        texts.extend(collect_note_link_sources(
+            app.note_detail_cache.get(&1).unwrap(),
+        ));
+        app.link_preview_fingerprints
+            .insert(owner, preview_content_fingerprint(&texts));
+        app.focus = FocusPane::Lists;
+        app.load_items_for_selected_list(false);
+        assert_eq!(app.focus, FocusPane::Items);
+        assert!(!app.handle_empty_items_mouse(false));
     }
 
     #[tokio::test]
