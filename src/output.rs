@@ -1921,6 +1921,76 @@ mod tests {
     }
 
     #[test]
+    fn print_link_previews_cover_open_and_unresolved_actions() {
+        use crate::internal_links::{InternalLinkKind, LinkPreview, LinkPreviewAction, LinkPreviewActionKind};
+
+        print_link_previews(&[
+            LinkPreview {
+                kind: InternalLinkKind::Page,
+                canonical_url: "https://kramli.de/privacy".to_string(),
+                display_url: "https://kramli.de/privacy".to_string(),
+                resolved: true,
+                list_id: None,
+                item_id: None,
+                list_name: None,
+                list_icon: None,
+                list_color: None,
+                list_type: None,
+                item_text: None,
+                folder_name: None,
+                folder_icon: None,
+                folder_color: None,
+                role: None,
+                invited_by: None,
+                action: Some(LinkPreviewAction {
+                    kind: LinkPreviewActionKind::Open,
+                    target_url: "https://kramli.de/privacy".to_string(),
+                    requires_confirmation: false,
+                }),
+            },
+            LinkPreview {
+                kind: InternalLinkKind::Invite,
+                canonical_url: "https://kram.li/i/Unknown".to_string(),
+                display_url: "https://kram.li/i/Unknown".to_string(),
+                resolved: false,
+                list_id: None,
+                item_id: None,
+                list_name: None,
+                list_icon: None,
+                list_color: None,
+                list_type: None,
+                item_text: None,
+                folder_name: None,
+                folder_icon: None,
+                folder_color: None,
+                role: None,
+                invited_by: None,
+                action: None,
+            },
+        ]);
+    }
+
+    #[test]
+    fn print_note_helpers_cover_empty_and_nonempty_content() {
+        use super::{print_note_content, print_note_for_list};
+
+        print_note_content(None);
+        print_note_content(Some("  "));
+        print_note_content(Some("Line one\nLine two"));
+        print_note_for_list(None, None);
+        print_note_for_list(None, Some("  "));
+        print_note_for_list(Some(&sample_list(1, "Notes")), Some("Note body"));
+    }
+
+    #[test]
+    fn bootstrap_icon_asset_name_scans_multiple_inline_markers() {
+        assert_eq!(
+            bootstrap_icon_asset_name("prefix bi-cart-fill suffix bi-fire"),
+            Some("cart-fill".to_string())
+        );
+    }
+
+    #[test]
     fn bootstrap_icon_asset_name_parses_inline_class_icons() {
         assert_eq!(
             bootstrap_icon_asset_name(r#"<i class="bi bi-cart-fill"></i>"#),

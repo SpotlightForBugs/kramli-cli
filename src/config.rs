@@ -641,6 +641,23 @@ mod tests {
     }
 
     #[test]
+    fn save_to_path_creates_missing_parent_directories() {
+        with_clean_config_env(|| {
+            let parent = std::env::temp_dir().join(format!(
+                "kramli-config-nested-{}",
+                std::process::id()
+            ));
+            let path = parent.join("nested").join("config.json");
+            let mut cfg = config_file(Some(true), Some(false));
+            cfg.set_base_url(Some("https://nested.example".to_string()));
+            cfg.save_to_path(&path).expect("nested save should succeed");
+            let saved = Config::load_from_path(&path);
+            assert_eq!(saved.base_url(), "https://nested.example");
+            let _ = fs::remove_dir_all(parent);
+        });
+    }
+
+    #[test]
     fn save_to_path_reports_create_dir_errors() {
         let path = std::path::PathBuf::from("/proc/kramli-config-unwritable/config.json");
         let cfg = config_file(None, None);

@@ -291,6 +291,18 @@ mod tests {
     }
 
     #[test]
+    fn collect_note_link_sources_reads_embed_uri_without_source() {
+        let delta = json!({
+            "list_type": "note",
+            "note_delta": "[{\"insert\":{\"_type\":\"kramli-link-preview\",\"uri\":\"https://kramli.de/uri-only\"}}]"
+        });
+        assert_eq!(
+            collect_note_link_sources(&delta),
+            vec!["https://kramli.de/uri-only".to_string()]
+        );
+    }
+
+    #[test]
     fn collect_note_link_sources_reads_embed_source_and_uri() {
         let delta = json!({
             "list_type": "note",

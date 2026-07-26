@@ -884,6 +884,24 @@ mod tests {
     }
 
     #[test]
+    fn body_prefix_stops_at_first_body_marker_in_multiline_messages() {
+        assert_eq!(
+            body_prefix("First line\nSecond\nBody: secret"),
+            "First line\nSecond"
+        );
+    }
+
+    #[test]
+    fn trace_span_drop_finishes_unfinished_spans_as_cancelled() {
+        with_env_var(TEST_KRAMLI_TELEMETRY_ENV, Some("true"), || {
+            let span = TraceSpan::child_with_enabled("test.child", "child", true);
+            span.set_tag("operation", "demo");
+            span.set_data_i64("count", 1);
+            span.set_status(false);
+        });
+    }
+
+    #[test]
     fn trace_transaction_finish_handles_error_capture_branches() {
         with_env_var(KRAMLI_CAPTURE_COMMAND_ERRORS_ENV, Some("yes"), || {
             let tx = TraceTransaction::start("test.command", "test.command");

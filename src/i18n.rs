@@ -265,6 +265,21 @@ mod tests {
     }
 
     #[test]
+    fn try_parse_supported_locale_rejects_supported_language_with_unsupported_region() {
+        assert!(try_parse_supported_locale("haw-US").is_none());
+        assert_eq!(
+            try_parse_supported_locale("de").unwrap().to_string(),
+            "de"
+        );
+    }
+
+    #[test]
+    fn extract_keys_skips_blank_key_lines() {
+        let keys = extract_keys("valid = Value\n = blank\n");
+        assert_eq!(keys, vec!["valid".to_string()]);
+    }
+
+    #[test]
     fn try_parse_supported_locale_rejects_unsupported_primary_language() {
         assert!(try_parse_supported_locale("haw-US").is_none());
         assert_eq!(

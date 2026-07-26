@@ -14648,4 +14648,122 @@ mod tests {
         let b = test_shopping_list(2, "A", None, Some(4), None, false);
         assert_eq!(compare_lists_for_tui(&a, &b), Ordering::Greater);
     }
+
+    #[test]
+    fn init_terminal_function_is_reachable_on_real_stdout() {
+        if !std::io::IsTerminal::is_terminal(&io::stdout()) {
+            return;
+        }
+        let mut terminal = init_terminal().expect("stdout terminal should initialize");
+        let _ = restore_terminal(&mut terminal);
+    }
+
+    #[test]
+    fn build_image_picker_auto_probe_applies_env_override_suffix() {
+        crate::test_env::with_env_lock(|| {
+            let previous_protocol = std::env::var_os(KRAMLI_TUI_IMAGE_PROTOCOL_ENV);
+            let previous_term = std::env::var_os(TERM_ENV);
+            let previous_program = std::env::var_os(TERM_PROGRAM_ENV);
+            let previous_lc_terminal = std::env::var_os(LC_TERMINAL_ENV);
+            let previous_iterm = std::env::var_os(ITERM_SESSION_ID_ENV);
+            let previous_images = std::env::var_os(KRAMLI_TUI_IMAGES_ENV);
+
+            std::env::remove_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV);
+            std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
+            std::env::set_var(TERM_ENV, "xterm-256color");
+            std::env::set_var(TERM_PROGRAM_ENV, "WezTerm");
+            std::env::set_var(LC_TERMINAL_ENV, "iTerm2");
+            std::env::set_var(ITERM_SESSION_ID_ENV, "abc");
+
+            let (_picker, enabled, summary, _debug) =
+                build_image_picker(ImageProtocolPreference::Auto);
+            assert!(enabled);
+            assert!(summary.contains("auto="));
+
+            match previous_protocol {
+                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, value),
+                None => std::env::remove_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV),
+            }
+            match previous_term {
+                Some(value) => std::env::set_var(TERM_ENV, value),
+                None => std::env::remove_var(TERM_ENV),
+            }
+            match previous_program {
+                Some(value) => std::env::set_var(TERM_PROGRAM_ENV, value),
+                None => std::env::remove_var(TERM_PROGRAM_ENV),
+            }
+            match previous_lc_terminal {
+                Some(value) => std::env::set_var(LC_TERMINAL_ENV, value),
+                None => std::env::remove_var(LC_TERMINAL_ENV),
+            }
+            match previous_iterm {
+                Some(value) => std::env::set_var(ITERM_SESSION_ID_ENV, value),
+                None => std::env::remove_var(ITERM_SESSION_ID_ENV),
+            }
+            match previous_images {
+                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
+                None => std::env::remove_var(KRAMLI_TUI_IMAGES_ENV),
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn save_editor_attachment_upload_error_keeps_editor_open() {
+        let (api, _) = api_with_responses(Vec::new()).await;
+        let mut app = App::new(api, false);
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Item")];
+        app.editor = Some(EditorState {
+            mode: EditorMode::Attachment,
+            item_id: Some(1),
+            text: "/does/not/exist.png".to_string(),
+            quantity: String::new(),
+            due_date: String::new(),
+            due_time: String::new(),
+            planned_date: String::new(),
+            planned_time: String::new(),
+            reminder: String::new(),
+            reminder_time: String::new(),
+            reminder_offsets: String::new(),
+            travel_time_minutes: String::new(),
+            priority: String::new(),
+            tags: String::new(),
+            progress: String::new(),
+            notes: String::new(),
+            active_field: EditorField::Text,
+        });
+        app.save_editor().await.unwrap();
+        assert!(app.editor.is_some());
+        assert!(app.status.as_ref().is_some_and(|status| !status.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn handle_mouse_help_dismisses_overlay_without_changing_selection() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.show_help = true;
+        app.selected_item = 0;
+        let area = Rect::new(0, 0, 80, 24);
+        app.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 10, 10),
+            area,
+        )
+        .await
+        .unwrap();
+        assert!(!app.show_help);
+    }
+
+    #[tokio::test]
+    async fn run_event_loop_redraws_after_load_messages_without_input() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.should_quit = true;
+        app.tx
+            .send(LoadMessage::Lists(Ok(Vec::new())))
+            .expect("load message should enqueue");
+        run_event_loop(&mut terminal, &mut app)
+            .await
+            .expect("event loop should exit after redraw");
+    }
 }

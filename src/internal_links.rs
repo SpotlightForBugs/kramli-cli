@@ -1282,6 +1282,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parser_rejects_non_https_and_malformed_hosts() {
+        assert!(parse_internal_kramli_url("ftp://kramli.de/lists/42").is_none());
+        assert!(parse_internal_kramli_url("https:///lists/42").is_none());
+    }
+
+    #[test]
+    fn parser_rejects_zero_decoded_list_ids() {
+        assert!(parse_internal_kramli_url("https://kramli.de/lists/0").is_none());
+        let zero_slug = encode_list_id(0);
+        assert!(parse_internal_kramli_url(&format!("https://kramli.de/lists/l/{zero_slug}")).is_none());
+    }
+
+    #[test]
+    fn parser_accepts_dashboard_without_fragment() {
+        let parsed = parse_internal_kramli_url("https://kramli.de/lists").unwrap();
+        assert_eq!(parsed.kind, InternalLinkKind::Dashboard);
+    }
+
+    #[tokio::test]
+    async fn resolver_metadata_uses_unresolved_when_api_reports_unresolved() {
+        let (mut resolver, server) = resolver_with_responses(vec![TestResponse {
+            status: 200,
+            body: json!({"resolved": false}),
+        }])
+        .await;
+        let preview = resolver
+            .resolve_url("https://kramli.de/lists/42")
+            .await
+            .unwrap();
+        assert!(!preview.resolved);
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolver_invite_without_token_is_unresolved() {
+        let api = ApiClient::for_tests("http://127.0.0.1:9");
+        let mut resolver = LinkPreviewResolver::new(api);
+        let link = InternalKramliLink::new(
+            InternalLinkKind::Invite,
+            "https://kramli.de/lists/join/token".to_string(),
+        );
+        let preview = resolver.resolve(&link).await;
+        assert!(!preview.resolved);
+    }
+
     #[tokio::test]
     async fn resolve_texts_uses_cache_for_duplicate_links_in_one_pass() {
         let (mut resolver, server) = resolver_with_responses(vec![TestResponse {
@@ -1294,5 +1340,23 @@ mod tests {
         assert_eq!(previews.len(), 1);
         assert!(previews[0].resolved);
         assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_texts_stops_at_max_extracted_links() {
+        let (mut resolver, server) = resolver_with_responses((0..MAX_EXTRACTED_LINKS)
+            .map(|id| TestResponse {
+                status: 200,
+                body: json!({"resolved": true, "list_name": format!("List {id}")}),
+            })
+            .collect())
+        .await;
+        let text = (1..=MAX_EXTRACTED_LINKS + 3)
+            .map(|id| format!("https://kramli.de/lists/{id}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let previews = resolver.resolve_texts([text.as_str()]).await;
+        assert_eq!(previews.len(), MAX_EXTRACTED_LINKS);
+        assert_eq!(server.await.unwrap().len(), MAX_EXTRACTED_LINKS);
     }
 }

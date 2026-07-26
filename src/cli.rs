@@ -644,6 +644,14 @@ mod tests {
                 },
                 "activity",
             ),
+            (
+                Commands::Invite {
+                    action: InviteCmd::Inspect {
+                        link: "https://kram.li/i/InviteToken_1".to_string(),
+                    },
+                },
+                "invite",
+            ),
             (Commands::Undo { list_id: 1 }, "undo"),
             (Commands::Redo { list_id: 1 }, "redo"),
             (Commands::Profile, "profile"),
@@ -3041,7 +3049,6 @@ mod tests {
 
     #[tokio::test]
     async fn env_var_helper_restores_existing_values() {
-        let original = std::env::var(TEST_KRAMLI_API_KEY_ENV).ok();
         with_env_vars_async(&[(TEST_KRAMLI_API_KEY_ENV, "before")], || async {
             with_env_vars_async_unlocked(&[(TEST_KRAMLI_API_KEY_ENV, "during")], || async {
                 assert_eq!(
@@ -3058,7 +3065,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(std::env::var(TEST_KRAMLI_API_KEY_ENV).ok(), original);
+        assert!(std::env::var(TEST_KRAMLI_API_KEY_ENV).is_err());
     }
 
     #[tokio::test]
@@ -4724,6 +4731,102 @@ mod tests {
         .await;
         let requests = requests.await.expect("test server should finish");
         assert_eq!(requests, vec!["GET /api/security HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn run_config_human_output_covers_enabled_setting_branches() {
+        let temp_config_root = std::env::temp_dir().join(format!(
+            "kramli-cli-config-enabled-{}-{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&temp_config_root).expect("temp config dir should be created");
+        with_env_vars_async(
+            &[
+                (
+                    "HOME",
+                    temp_config_root
+                        .to_str()
+                        .expect("temp config dir should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    temp_config_root
+                        .to_str()
+                        .expect("temp config dir should be valid utf-8"),
+                ),
+                ("KRAMLI_URL", "http://127.0.0.1:9"),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+                ("KRAMLI_TELEMETRY", "true"),
+                ("KRAMLI_BOOTSTRAP_ICONS", "true"),
+                ("KRAMLI_AUTO_UPDATE_CHECK", "true"),
+            ],
+            || async {
+                run_config(false).expect("human config should render enabled branches");
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn dry_run_folder_list_returns_none_and_create_renders_human_output() {
+        assert!(
+            dry_run_requests_for_command(&Commands::Folders {
+                action: FolderCmd::List,
+            })
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        let (base_url, requests) = server_with_base_url(vec![json!({
+            "id": 3,
+            "name": "Home",
+            "icon": "folder2",
+            "color": "#112233"
+        })
+        .to_string()])
+        .await;
+        with_env_vars_async(
+            &[
+                ("KRAMLI_URL", base_url.as_str()),
+                (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
+            ],
+            || async {
+                run_folders(
+                    FolderCmd::Create {
+                        name: "Home".to_string(),
+                        icon: Some("folder2".to_string()),
+                        color: Some("#112233".to_string()),
+                        parent: None,
+                    },
+                    false,
+                )
+                .await
+                .expect("folder create human output should succeed");
+            },
+        )
+        .await;
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["POST /api/folders HTTP/1.1"]);
+    }
+
+    #[test]
+    fn profile_json_helpers_cover_profile_lang_source_branches() {
+        crate::test_env::with_env_vars(&[(TEST_KRAMLI_LANG_ENV, "")], || {
+            crate::i18n::set_locale("de-DE");
+            let profile = sample_profile(Some("de-DE"));
+            let value = profile_json_with_lang(&profile);
+            assert_eq!(value["lang_source"], "profile");
+            assert_eq!(value["profile_lang"], "de-DE");
+        });
+
+        crate::test_env::with_env_vars(&[(TEST_KRAMLI_LANG_ENV, "")], || {
+            let profile = sample_profile(Some("fr-FR"));
+            crate::i18n::set_locale("en");
+            let value = profile_json_with_lang(&profile);
+            assert_eq!(value["lang_source"], "resolved");
+        });
     }
 }
 

@@ -286,6 +286,24 @@ mod tests {
     }
 
     #[test]
+    fn initialize_mcp_file_policy_is_idempotent() {
+        reset_mcp_file_policy_for_tests();
+        let cwd = std::env::current_dir().expect("cwd");
+        initialize_mcp_file_policy();
+        initialize_mcp_file_policy();
+        let root = cwd.join(format!("kramli-mcp-idempotent-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let png = root.join("local.png");
+        fs::write(&png, [1, 2, 3]).unwrap();
+
+        with_env_vars(&[("KRAMLI_MCP_ALLOW_FILE_UPLOADS", "1")], || {
+            assert!(ensure_mcp_upload_allowed(&png).is_ok());
+        });
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn ensure_mcp_upload_allowed_uses_current_dir_when_startup_cwd_unset() {
         reset_mcp_file_policy_for_tests();
         let cwd = std::env::current_dir().expect("cwd");

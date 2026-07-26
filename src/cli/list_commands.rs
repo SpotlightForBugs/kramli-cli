@@ -396,6 +396,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_show_json_output_includes_full_payload() {
+        let payload = json!({
+            "id": 7,
+            "name": "Notes",
+            "list_type": "note",
+            "note_content": "Body"
+        });
+        let (api, requests) = api_with_responses(vec![payload.to_string()]).await;
+
+        run_lists_show(&api, 7, true)
+            .await
+            .expect("json show output should succeed");
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /api/lists/7 HTTP/1.1"));
+    }
+
+    #[tokio::test]
+    async fn api_with_empty_responses_skips_mock_registration() {
+        let (api, requests) = api_with_responses(Vec::new()).await;
+        drop(api);
+        let captured = requests.await.expect("empty response server should finish");
+        assert!(captured.is_empty());
+    }
+
+    #[tokio::test]
     async fn list_update_with_note_content_uses_safe_delta_contract() {
         let current = json!({
             "id": 7,

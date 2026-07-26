@@ -1440,12 +1440,31 @@ mod tests {
         assert!(api.delete::<Value>("/items/1").await.is_err());
     }
 
+    #[test]
+    fn public_https_resource_without_host_is_rejected() {
+        assert!(!ApiClient::public_https_resource_allowed("https://"));
+    }
+
     #[tokio::test]
-    async fn api_retry_delay_honors_retry_after_header() {
+    async fn api_with_empty_responses_skips_mock_registration() {
+        let (api, server) = api_with_responses(Vec::new()).await;
+        drop(api);
+        let requests = server.await.expect("server finished");
+        assert!(requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resource_fetch_reports_transport_errors_before_status() {
+        let api = test_client("http://127.0.0.1:1");
+        assert!(api.get_bytes("/offline.png").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn api_retry_delay_uses_valid_retry_after_seconds() {
         let (api, server) = api_with_responses(vec![
             TestResponse {
                 status: 429,
-                headers: vec![("Retry-After", "not-a-number")],
+                headers: vec![("Retry-After", "2")],
                 body: Vec::new(),
             },
             TestResponse::json(json!({"ok": true})),

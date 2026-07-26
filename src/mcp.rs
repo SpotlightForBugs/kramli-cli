@@ -1181,7 +1181,8 @@ mod tests {
         optional_i64, optional_i64_array, optional_preserved_string, optional_string,
         optional_string_array, read_message,
         required_i64, required_string, run_stdio, run_with_io, toggle_item_done, tool_result,
-        tool_text_result, tools, try_parse_message, update_item, write_message, MessageFraming,
+        tool_text_result, tools, try_parse_message, update_item, update_list, write_message,
+        MessageFraming,
     };
     use crate::api::ApiClient;
     use crate::attachments::initialize_mcp_file_policy;
@@ -2624,6 +2625,47 @@ mod tests {
         let requests = requests.await.expect("server should finish");
         assert!(requests[0].contains("POST /api/items/5/attachments"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn update_list_tool_accepts_integer_folder_id() {
+        let (api, requests) = api_with_responses(vec![
+            json!({"id": 7, "name": "Groceries", "folder_id": 3}).to_string(),
+        ])
+        .await;
+        let args = json!({"id": 7, "folder_id": 3})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let updated = update_list(&api, &args).await.expect("folder update should succeed");
+        assert_eq!(updated["folder_id"], 3);
+        let requests = requests.await.unwrap();
+        assert!(requests[0].starts_with("PUT /api/lists/7 HTTP/1.1"));
+        assert!(requests[0].contains("\"folder_id\":3"));
+    }
+
+    #[tokio::test]
+    async fn update_list_tool_rejects_empty_payload_without_note_content() {
+        let args = json!({"id": 7}).as_object().cloned().unwrap();
+        let api = ApiClient::for_tests("http://127.0.0.1:9");
+        let err = update_list(&api, &args)
+            .await
+            .expect_err("empty update should fail");
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn get_item_tool_user_texts_include_attachment_fields() {
+        let value = json!({
+            "text": "Item",
+            "attachments": [{
+                "context": "receipt",
+                "alt_text": "Receipt photo"
+            }]
+        });
+        let texts = super::tool_user_texts("get_item", &value);
+        assert!(texts.iter().any(|text| text.contains("receipt")));
+        assert!(texts.iter().any(|text| text.contains("Receipt photo")));
     }
 
     #[test]

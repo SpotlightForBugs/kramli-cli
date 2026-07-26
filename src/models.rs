@@ -475,6 +475,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_search_response_object_skips_empty_grouped_wrapper_before_flat_hit() {
+        let parsed = SearchResponse::from_value(serde_json::json!({
+            "unexpected_grouped_field": true,
+            "type": "item",
+            "id": 12,
+            "text": "Fallback"
+        }))
+        .expect("non-grouped object should fall back to flat hit");
+        match parsed {
+            SearchResponse::Flat(hits) => {
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].id, 12);
+            }
+            other => panic!("expected flat hit, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_search_response_object_falls_back_to_flat_hit_when_grouped_fields_absent() {
         let parsed = SearchResponse::from_value(serde_json::json!({
             "type": "list",

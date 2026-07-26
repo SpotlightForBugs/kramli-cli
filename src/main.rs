@@ -507,10 +507,13 @@ mod tests {
             )],
             || {
                 let cli = cli_for(Some(Commands::Status));
+                let mut prompted = false;
                 ensure_first_run_preferences_with(&cli, true, true, |_, _| {
-                    panic!("configured preferences should not prompt")
+                    prompted = true;
+                    Ok(true)
                 })
                 .expect("configured preferences should not prompt");
+                assert!(!prompted, "configured preferences should not prompt");
             },
         );
         let _ = std::fs::remove_dir_all(config_root);
