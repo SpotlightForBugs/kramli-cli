@@ -2,8 +2,61 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::thread::ThreadId;
+use std::time::Duration;
 
 use tokio::sync::oneshot;
+
+const DEFAULT_TEST_TIMEOUT_SECS: u64 = 20;
+
+fn test_timeout_secs() -> u64 {
+    static SECS: LazyLock<u64> = LazyLock::new(|| {
+        std::env::var("KRAMLI_TEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_TEST_TIMEOUT_SECS)
+    });
+    *SECS
+}
+
+pub(crate) fn test_timeout() -> Duration {
+    Duration::from_secs(test_timeout_secs())
+}
+
+pub(crate) fn test_timeout_arg() -> String {
+    format!("{}s", test_timeout_secs())
+}
+
+pub(crate) fn run_sync_test<T, F>(name: &str, f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(test_timeout()) {
+        Ok(Ok(value)) => value,
+        Ok(Err(payload)) => std::panic::resume_unwind(payload),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("test {name} timed out after {:?}", test_timeout());
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("test {name} exited without reporting a result");
+        }
+    }
+}
+
+pub(crate) async fn run_async_test<T, F>(name: &str, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    match tokio::time::timeout(test_timeout(), future).await {
+        Ok(value) => value,
+        Err(_) => panic!("test {name} timed out after {:?}", test_timeout()),
+    }
+}
 
 pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static ENV_SCOPE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -151,7 +204,7 @@ where
         .await
 }
 
-#[tokio::test]
+#[kramli_test_macros::tokio_test]
 async fn env_owner_rejects_foreign_tasks() {
     with_env_lock_async(|| async {
         assert!(env_access_allowed());

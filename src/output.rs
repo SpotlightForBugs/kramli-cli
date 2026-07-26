@@ -192,9 +192,7 @@ fn visible_width_ansi(input: &str) -> usize {
             continue;
         }
 
-        let Some(ch) = input[i..].chars().next() else {
-            break;
-        };
+        let ch = input[i..].chars().next().expect("utf-8 character boundary");
         i += ch.len_utf8();
         width += char_display_width(ch);
     }
@@ -237,9 +235,10 @@ fn wrap_ansi_with_prefix(
             continue;
         }
 
-        let Some(ch) = content[i..].chars().next() else {
-            break;
-        };
+        let ch = content[i..]
+            .chars()
+            .next()
+            .expect("utf-8 character boundary");
         i += ch.len_utf8();
 
         if ch == '\n' {
@@ -276,10 +275,8 @@ fn print_wrapped_item_line(first_prefix: &str, next_prefix: &str, content: &str)
     let width = crossterm::terminal::size()
         .map(|(w, _)| w as usize)
         .unwrap_or(120);
-    println!(
-        "{}",
-        wrap_ansi_with_prefix(content, first_prefix, next_prefix, width)
-    );
+    let rendered = wrap_ansi_with_prefix(content, first_prefix, next_prefix, width);
+    println!("{rendered}");
 }
 
 fn list_display_name_with_folder(list: &ShoppingList) -> String {
@@ -1009,19 +1006,19 @@ mod wrap_and_icon_tests {
     use super::{list_display_name_with_folder, map_bootstrap_icon_label, wrap_ansi_with_prefix};
     use crate::models::ShoppingList;
 
-    #[test]
+    #[kramli_test_macros::test]
     fn keeps_hanging_indent_after_wrap() {
         let out = wrap_ansi_with_prefix("o abcdefghijklmnop", "  ", "    ", 10);
         assert_eq!(out, "  o abcdef\n    ghijkl\n    mnop");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn keeps_hanging_indent_after_embedded_newline() {
         let out = wrap_ansi_with_prefix("o first\nsecond", "  ", "    ", 80);
         assert_eq!(out, "  o first\n    second");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn does_not_count_ansi_escape_sequences() {
         let red = "\u{1b}[31mRED\u{1b}[0m";
         let out = wrap_ansi_with_prefix(&format!("o {red} tail"), "  ", "    ", 9);
@@ -1029,12 +1026,12 @@ mod wrap_and_icon_tests {
         assert_eq!(out, format!("  o {red} t\n    ail"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn unknown_bootstrap_icons_use_fallback_label() {
         assert_eq!(map_bootstrap_icon_label("badge-3d", "list"), "[badge-3d]");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn list_display_name_joins_folder_and_name() {
         let list = ShoppingList {
             id: 42,
@@ -1236,15 +1233,18 @@ pub(crate) fn print_activity(entries: &[ActivityEntry]) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::IsTerminal;
+
     use super::{
         activity_action_label, activity_detail_text, bootstrap_icon_asset_name, char_display_width,
         color_dot, colorize_bold_text, colorize_text, date_with_time, display_icon, fallback_icon,
         folder_path_parts, human_size, item_status_parts, list_display_name_with_folder,
         list_folder_parts, map_bootstrap_icon_emoji, map_bootstrap_icon_label, member_type_label,
         parse_hex_color, print_activity, print_folders, print_item_detail, print_items,
-        print_items_for_list, print_list_detail, print_lists, print_members, print_search,
-        print_wrapped_item_line, reminder_offsets_label, role_label, schedule_lines, strip_html,
-        view_mode_label, visible_width_ansi, wrap_ansi_with_prefix, IconStyle, ItemComments,
+        print_items_for_list, print_link_previews, print_list_detail, print_lists, print_members,
+        print_search, print_wrapped_item_line, reminder_offsets_label, role_label, schedule_lines,
+        strip_html, view_mode_label, visible_width_ansi, wrap_ansi_with_prefix, IconStyle,
+        ItemComments,
     };
     use crate::models::{
         ActivityEntry, Attachment, Folder, ItemComment, ListItem, ListState, Member, SearchItemHit,
@@ -1341,7 +1341,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn schedule_lines_keep_due_planned_repeat_reminder_travel_order() {
         let mut item = minimal_item();
         item.due_date = Some("2026-07-20".to_string());
@@ -1373,7 +1373,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn schedule_lines_show_travel_without_reminder() {
         let mut item = minimal_item();
         item.reminder = Some(false);
@@ -1386,7 +1386,7 @@ mod tests {
         assert_eq!(lines[1].value, "15 min");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn reminder_offsets_label_formats_units() {
         assert_eq!(
             reminder_offsets_label(&[5, 60, 180, 1440]),
@@ -1394,13 +1394,13 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn strip_html_keeps_line_breaks_and_unescapes() {
         let raw = "Hi<br><b>there</b> &amp; &lt;ok&gt;";
         assert_eq!(strip_html(raw), "Hi\nthere & <ok>");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_hex_color_accepts_valid_rgb_and_rejects_invalid() {
         assert_eq!(parse_hex_color("#12AbEf"), Some((0x12, 0xAB, 0xEF)));
         assert_eq!(parse_hex_color("12abef"), Some((0x12, 0xAB, 0xEF)));
@@ -1408,7 +1408,7 @@ mod tests {
         assert_eq!(parse_hex_color("#12345"), None);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn date_with_time_appends_non_empty_time() {
         assert_eq!(
             date_with_time("2026-08-01", Some(&"09:30".to_string())),
@@ -1421,14 +1421,14 @@ mod tests {
         assert_eq!(date_with_time("2026-08-01", None), "2026-08-01");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn human_size_formats_units_progressively() {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(2048), "2.0 KB");
         assert_eq!(human_size(1024 * 1024), "1.0 MB");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn activity_detail_text_prefers_text_then_changes_then_pairs() {
         let with_text = json!({"text": "Milch"});
         let with_changes = json!({"changes": ["prio", "datum"]});
@@ -1445,7 +1445,7 @@ mod tests {
         assert!(pairs_rendered.contains("beta=x"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn icon_wrapping_and_label_helpers_cover_branch_variants() {
         assert_eq!(
             bootstrap_icon_asset_name("bi-cart-fill"),
@@ -1491,7 +1491,7 @@ mod tests {
         assert_eq!(activity_action_label("custom"), "custom");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn icon_style_helpers_cover_raw_emoji_and_fallback_branches() {
         assert_eq!(fallback_icon(IconStyle::Emoji, "folder"), "📁");
         assert_eq!(fallback_icon(IconStyle::Emoji, "list"), "📋");
@@ -1530,7 +1530,7 @@ mod tests {
         assert_eq!(display_icon(Some("Raw icon!"), "list"), "Raw icon!");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn wrapping_helpers_cover_narrow_escape_and_newline_branches() {
         assert_eq!(visible_width_ansi("abc\u{1b}"), 3);
         assert_eq!(visible_width_ansi("abc\u{1b}["), 3);
@@ -1545,7 +1545,7 @@ mod tests {
         print_wrapped_item_line("  ", "    ", "wrapped");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn remaining_output_helpers_cover_sort_and_fallback_branches() {
         let icon_from_markup = "<svg><use href=\"#bi-cart-fill\"/></svg>";
         assert_eq!(
@@ -1688,7 +1688,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn list_folder_and_print_helpers_cover_human_output_paths() {
         let list = sample_list(1, "Groceries");
         assert_eq!(
@@ -1735,7 +1735,7 @@ mod tests {
         print_folders(&[folder]);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn item_member_search_and_activity_printers_cover_output_paths() {
         let mut parent = minimal_item();
         parent.id = 10;
@@ -1815,7 +1815,7 @@ mod tests {
         }]);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn item_detail_helpers_render_all_optional_sections() {
         let mut item = minimal_item();
         item.text = "Buy milk".to_string();
@@ -1870,7 +1870,7 @@ mod tests {
         empty.print();
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn item_detail_helpers_cover_empty_and_priority_branches() {
         assert_eq!(color_dot(None), "");
         assert_eq!(color_dot(Some("not-a-color")), "");
@@ -1889,5 +1889,166 @@ mod tests {
 
         item.notes = Some("<p>  </p>".to_string());
         print_item_detail(&item, &[]);
+    }
+
+    #[kramli_test_macros::test]
+    fn print_link_previews_cover_invite_and_accept_actions() {
+        use crate::internal_links::{LinkPreview, LinkPreviewAction, LinkPreviewActionKind};
+
+        print_link_previews(&[LinkPreview {
+            kind: crate::internal_links::InternalLinkKind::Invite,
+            canonical_url: "https://kram.li/i/InviteToken_1".to_string(),
+            display_url: "https://kram.li/i/InviteToken_1".to_string(),
+            resolved: true,
+            list_id: Some(7),
+            item_id: None,
+            list_name: Some("Shared".to_string()),
+            list_icon: None,
+            list_color: None,
+            list_type: None,
+            item_text: None,
+            folder_name: None,
+            folder_icon: None,
+            folder_color: None,
+            role: None,
+            invited_by: Some("Ada".to_string()),
+            action: Some(LinkPreviewAction {
+                kind: LinkPreviewActionKind::Accept,
+                target_url: "https://kram.li/i/InviteToken_1".to_string(),
+                requires_confirmation: true,
+            }),
+        }]);
+    }
+
+    #[kramli_test_macros::test]
+    fn print_link_previews_cover_open_and_unresolved_actions() {
+        use crate::internal_links::{
+            InternalLinkKind, LinkPreview, LinkPreviewAction, LinkPreviewActionKind,
+        };
+
+        print_link_previews(&[
+            LinkPreview {
+                kind: InternalLinkKind::Page,
+                canonical_url: "https://kramli.de/privacy".to_string(),
+                display_url: "https://kramli.de/privacy".to_string(),
+                resolved: true,
+                list_id: None,
+                item_id: None,
+                list_name: None,
+                list_icon: None,
+                list_color: None,
+                list_type: None,
+                item_text: None,
+                folder_name: None,
+                folder_icon: None,
+                folder_color: None,
+                role: None,
+                invited_by: None,
+                action: Some(LinkPreviewAction {
+                    kind: LinkPreviewActionKind::Open,
+                    target_url: "https://kramli.de/privacy".to_string(),
+                    requires_confirmation: false,
+                }),
+            },
+            LinkPreview {
+                kind: InternalLinkKind::Invite,
+                canonical_url: "https://kram.li/i/Unknown".to_string(),
+                display_url: "https://kram.li/i/Unknown".to_string(),
+                resolved: false,
+                list_id: None,
+                item_id: None,
+                list_name: None,
+                list_icon: None,
+                list_color: None,
+                list_type: None,
+                item_text: None,
+                folder_name: None,
+                folder_icon: None,
+                folder_color: None,
+                role: None,
+                invited_by: None,
+                action: None,
+            },
+        ]);
+    }
+
+    #[kramli_test_macros::test]
+    fn print_note_helpers_cover_empty_and_nonempty_content() {
+        use super::{print_note_content, print_note_for_list};
+
+        print_note_content(None);
+        print_note_content(Some("  "));
+        print_note_content(Some("Line one\nLine two"));
+        print_note_for_list(None, None);
+        print_note_for_list(None, Some("  "));
+        print_note_for_list(Some(&sample_list(1, "Notes")), Some("Note body"));
+    }
+
+    #[kramli_test_macros::test]
+    fn bootstrap_icon_asset_name_skips_invalid_inline_markers_before_valid_icon() {
+        assert_eq!(
+            bootstrap_icon_asset_name("prefix bi-!!! suffix bi-fire"),
+            Some("fire".to_string())
+        );
+    }
+
+    fn run_output_test_in_pseudo_terminal(test_name: &str) {
+        let exe = std::env::current_exe().expect("current test executable should be available");
+        let script = ["/usr/bin/script", "/bin/script"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).exists())
+            .expect("script binary should exist for pseudo-terminal coverage");
+        let command = format!(
+            "{} output::tests::{test_name} --exact --nocapture --test-threads=1 --ignored",
+            exe.display()
+        );
+        let status = std::process::Command::new(script)
+            .args(["-q", "-c", &command])
+            .arg("/dev/null")
+            .status()
+            .expect("pseudo-terminal subprocess should spawn");
+        assert!(
+            status.success(),
+            "pseudo-terminal test {test_name} failed with {status:?}"
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn print_wrapped_item_line_uses_terminal_width_when_stdout_is_tty() {
+        run_output_test_in_pseudo_terminal("print_wrapped_item_line_tty_case");
+    }
+
+    #[kramli_test_macros::test]
+    fn print_wrapped_item_line_skips_when_stdout_is_not_tty() {
+        assert!(
+            !std::io::stdout().is_terminal(),
+            "cargo test stdout should not be a terminal"
+        );
+        print_wrapped_item_line_tty_case();
+    }
+
+    #[kramli_test_macros::test]
+    #[ignore = "runs in a pseudo-terminal subprocess"]
+    fn print_wrapped_item_line_tty_case() {
+        if !std::io::stdout().is_terminal() {
+            return;
+        }
+        print_wrapped_item_line("> ", "  ", "hello world with enough text to wrap");
+    }
+
+    #[kramli_test_macros::test]
+    fn bootstrap_icon_asset_name_scans_multiple_inline_markers() {
+        assert_eq!(
+            bootstrap_icon_asset_name("prefix bi-cart-fill suffix bi-fire"),
+            Some("cart-fill".to_string())
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn bootstrap_icon_asset_name_parses_inline_class_icons() {
+        assert_eq!(
+            bootstrap_icon_asset_name(r#"<i class="bi bi-cart-fill"></i>"#),
+            Some("cart-fill".to_string())
+        );
     }
 }

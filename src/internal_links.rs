@@ -230,6 +230,8 @@ pub(crate) struct InvitePreviewResponse {
     pub(crate) already_member: bool,
     #[serde(default)]
     pub(crate) invite_url: Option<String>,
+    #[serde(default)]
+    resolved: Option<bool>,
 }
 
 pub(crate) struct LinkPreviewResolver {
@@ -417,6 +419,9 @@ impl LinkPreviewResolver {
             .api
             .get_invite_link::<InvitePreviewResponse>(token)
             .await?;
+        if response.resolved == Some(false) {
+            return Ok(LinkPreview::unresolved(link));
+        }
         let display_url = response
             .invite_url
             .as_deref()
@@ -466,6 +471,17 @@ struct PreparedKramliUrl<'a> {
     parsed: Url,
 }
 
+fn parsed_kramli_origin_allowed(parsed: &Url) -> bool {
+    parsed.host_str().is_some_and(|host| {
+        let host = host.to_ascii_lowercase();
+        parsed.scheme() == "https"
+            && matches!(host.as_str(), "kram.li" | "kramli.de")
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.port().is_none()
+    })
+}
+
 fn prepare_kramli_url(value: &str) -> Option<PreparedKramliUrl<'_>> {
     let raw = value.trim();
     if raw.contains('\\') || raw.len() < "https://x".len() {
@@ -487,15 +503,18 @@ fn prepare_kramli_url(value: &str) -> Option<PreparedKramliUrl<'_>> {
     }
 
     let parsed = Url::parse(raw).ok()?;
-    let host = parsed.host_str()?.to_ascii_lowercase();
-    if parsed.scheme() != "https"
-        || !matches!(host.as_str(), "kram.li" | "kramli.de")
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.port().is_some()
-    {
+    finish_prepare_kramli_url(raw, authority_end, parsed)
+}
+
+fn finish_prepare_kramli_url(
+    raw: &str,
+    authority_end: usize,
+    parsed: Url,
+) -> Option<PreparedKramliUrl<'_>> {
+    if !parsed_kramli_origin_allowed(&parsed) {
         return None;
     }
+    let host = parsed.host_str()?.to_ascii_lowercase();
 
     let suffix = raw.get(authority_end..).unwrap_or_default();
     let raw_path_end = suffix.find(['?', '#']).unwrap_or(suffix.len());
@@ -821,6 +840,8 @@ mod tests {
         let server = tokio::spawn(async move {
             if let Some(ready) = ready {
                 let _ = ready.await;
+            } else {
+                ()
             }
             let mut requests = Vec::new();
             for response in responses {
@@ -866,6 +887,8 @@ mod tests {
         let server = tokio::spawn(async move {
             if let Some(ready) = ready {
                 let _ = ready.await;
+            } else {
+                ()
             }
             let mut requests = Vec::new();
             let mut responses = JoinSet::new();
@@ -899,7 +922,7 @@ mod tests {
         )
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parser_accepts_and_canonicalizes_supported_routes() {
         let slug = encode_list_id(42);
         let public_token = "A".repeat(SHARE_TOKEN_LEN);
@@ -958,7 +981,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parser_supports_invites_embeds_settings_pages_and_search() {
         let invite = parse_internal_kramli_url("https://kram.li/i/Abcdef_123-xy").unwrap();
         assert_eq!(invite.kind, InternalLinkKind::Invite);
@@ -1020,7 +1043,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parser_rejects_unverified_ambiguous_and_malformed_urls() {
         let rejected = [
             "kramli://lists/42",
@@ -1055,7 +1078,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn extraction_preserves_order_trims_punctuation_and_deduplicates_aliases() {
         let slug = encode_list_id(42);
         let text = format!(
@@ -1072,7 +1095,7 @@ mod tests {
         assert_eq!(links[2].kind, InternalLinkKind::Page);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn extraction_caps_results_and_ignores_malformed_kramli_candidates() {
         let mut text = String::from("https://kramli.de:443/lists/1 https://kramli.de/lists%2F2 ");
         for id in 1..=(MAX_EXTRACTED_LINKS + 5) {
@@ -1087,7 +1110,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn preview_models_serialize_action_contract() {
         let link = parse_internal_kramli_url("https://kramli.de/privacy").unwrap();
         let value = serde_json::to_value(LinkPreview::open(&link)).unwrap();
@@ -1096,7 +1119,7 @@ mod tests {
         assert!(value.get("list_name").is_none());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn resolver_uses_get_endpoints_actions_and_cache_without_posting() {
         let (mut resolver, server) = resolver_with_responses(vec![
             TestResponse {
@@ -1171,7 +1194,7 @@ mod tests {
         assert!(requests.iter().all(|request| request.starts_with("GET ")));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn best_effort_errors_are_not_cached_and_strict_errors_propagate() {
         let (mut resolver, server) = resolver_with_responses(vec![
             TestResponse {
@@ -1198,7 +1221,7 @@ mod tests {
         assert_eq!(server.await.unwrap().len(), 2);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn resolver_deduplicates_aliases_across_displayed_fields_in_source_order() {
         let (mut resolver, server) = resolver_with_responses(vec![TestResponse {
             status: 200,
@@ -1219,7 +1242,7 @@ mod tests {
         assert_eq!(server.await.unwrap().len(), 1);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn resolver_enriches_concurrently_within_budget_and_preserves_source_order() {
         let (mut resolver, server) =
             resolver_with_delayed_metadata(4, Duration::from_millis(200)).await;
@@ -1241,7 +1264,7 @@ mod tests {
         assert_eq!(server.await.unwrap().len(), 4);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn resolver_returns_unresolved_placeholders_when_total_budget_expires() {
         let (mut resolver, server) =
             resolver_with_delayed_metadata(1, Duration::from_secs(2)).await;
@@ -1253,7 +1276,7 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn resolver_never_fetches_external_urls_and_static_routes_need_no_api() {
         let api = ApiClient::for_tests("http://127.0.0.1:9");
         let mut resolver = LinkPreviewResolver::new(api);
@@ -1267,5 +1290,346 @@ mod tests {
             .unwrap();
         assert!(page.resolved);
         assert_eq!(page.action.unwrap().kind, LinkPreviewActionKind::Open);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn resolve_url_strict_returns_none_for_external_urls() {
+        let api = ApiClient::for_tests("http://127.0.0.1:9");
+        let mut resolver = LinkPreviewResolver::new(api);
+        assert!(resolver
+            .resolve_url_strict("https://example.test/lists/42")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[kramli_test_macros::test]
+    fn parser_rejects_non_https_and_malformed_hosts() {
+        assert!(parse_internal_kramli_url("ftp://kramli.de/lists/42").is_none());
+        assert!(parse_internal_kramli_url("https:///lists/42").is_none());
+    }
+
+    #[kramli_test_macros::test]
+    fn prepare_kramli_url_rejects_non_default_port_after_authority_match() {
+        assert!(super::prepare_kramli_url("https://kramli.de:8443/lists/42").is_none());
+    }
+
+    #[kramli_test_macros::test]
+    fn parsed_kramli_origin_allowed_rejects_urls_without_host() {
+        let parsed = Url::parse("https:///lists/42").expect("url should parse");
+        assert!(!super::parsed_kramli_origin_allowed(&parsed));
+    }
+
+    #[kramli_test_macros::test]
+    fn parsed_kramli_origin_rejects_disallowed_hosts_and_userinfo() {
+        assert!(!super::parsed_kramli_origin_allowed(
+            &Url::parse("https://example.com/lists/42").expect("url should parse")
+        ));
+        let mut parsed = Url::parse("https://kramli.de/lists/42").expect("url should parse");
+        parsed
+            .set_username("user")
+            .expect("username should be set for origin mismatch");
+        assert!(!super::parsed_kramli_origin_allowed(&parsed));
+    }
+
+    #[kramli_test_macros::test]
+    fn prepare_kramli_url_rejects_disallowed_parsed_origin() {
+        let raw = "https://kramli.de/lists/42";
+        let mut parsed = Url::parse(raw).expect("url should parse");
+        parsed
+            .set_username("user")
+            .expect("username should be set for origin mismatch");
+        assert!(super::finish_prepare_kramli_url(raw, raw.len(), parsed).is_none());
+    }
+
+    #[kramli_test_macros::test]
+    fn prepare_kramli_url_rejects_userinfo_in_parsed_origin() {
+        assert!(super::prepare_kramli_url("https://user@kramli.de/lists/42").is_none());
+        let parsed = Url::parse("https://user@kramli.de/lists/42").expect("url should parse");
+        assert!(!super::parsed_kramli_origin_allowed(&parsed));
+    }
+
+    #[kramli_test_macros::test]
+    fn parsed_kramli_origin_rejects_explicit_non_default_port() {
+        let parsed = Url::parse("https://kramli.de:8443/lists/42").expect("url should parse");
+        assert!(!super::parsed_kramli_origin_allowed(&parsed));
+        assert!(parse_internal_kramli_url("https://kramli.de:8443/lists/42").is_none());
+    }
+
+    #[kramli_test_macros::test]
+    fn parser_rejects_zero_decoded_list_ids() {
+        assert!(parse_internal_kramli_url("https://kramli.de/lists/0").is_none());
+        let zero_slug = encode_list_id(0);
+        assert!(
+            parse_internal_kramli_url(&format!("https://kramli.de/lists/l/{zero_slug}")).is_none()
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn parser_accepts_dashboard_without_fragment() {
+        let parsed = parse_internal_kramli_url("https://kramli.de/lists").unwrap();
+        assert_eq!(parsed.kind, InternalLinkKind::Dashboard);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn resolver_with_responses_waits_for_mock_registration() {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            let (mut resolver, server) = resolver_with_responses(vec![TestResponse {
+                status: 200,
+                body: json!({"resolved": true, "list_name": "Registered"}),
+            }])
+            .await;
+            tokio::task::yield_now().await;
+            let preview = resolver
+                .resolve_url("https://kramli.de/lists/42")
+                .await
+                .expect("preview should resolve after registration gate");
+            assert!(preview.resolved);
+            let requests = server.await.expect("resolver mock server should finish");
+            assert!(requests[0].starts_with("GET /api/internal-links/preview?"));
+        })
+        .await;
+        result.expect("resolver mock registration test should finish within 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn resolver_metadata_uses_unresolved_when_api_reports_unresolved() {
+        let (mut resolver, server) = resolver_with_responses(vec![TestResponse {
+            status: 200,
+            body: json!({"resolved": false}),
+        }])
+        .await;
+        let preview = resolver
+            .resolve_url("https://kramli.de/lists/42")
+            .await
+            .unwrap();
+        assert!(!preview.resolved);
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn resolver_invite_without_token_is_unresolved() {
+        let api = ApiClient::for_tests("http://127.0.0.1:9");
+        let mut resolver = LinkPreviewResolver::new(api);
+        let link = InternalKramliLink::new(
+            InternalLinkKind::Invite,
+            "https://kramli.de/lists/join/token".to_string(),
+        );
+        let preview = resolver.resolve(&link).await;
+        assert!(!preview.resolved);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn resolve_texts_uses_cache_for_duplicate_links_in_one_pass() {
+        let (mut resolver, server) = resolver_with_responses(vec![TestResponse {
+            status: 200,
+            body: json!({"resolved": true, "list_name": "Cached"}),
+        }])
+        .await;
+        let text = "https://kramli.de/lists/42 and https://kramli.de/lists/42";
+        let previews = resolver.resolve_texts([text]).await;
+        assert_eq!(previews.len(), 1);
+        assert!(previews[0].resolved);
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn resolve_texts_stops_at_max_extracted_links() {
+        let (mut resolver, server) = resolver_with_responses(
+            (0..MAX_EXTRACTED_LINKS)
+                .map(|id| TestResponse {
+                    status: 200,
+                    body: json!({"resolved": true, "list_name": format!("List {id}")}),
+                })
+                .collect(),
+        )
+        .await;
+        let text = (1..=MAX_EXTRACTED_LINKS + 3)
+            .map(|id| format!("https://kramli.de/lists/{id}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let previews = resolver.resolve_texts([text.as_str()]).await;
+        assert_eq!(previews.len(), MAX_EXTRACTED_LINKS);
+        assert_eq!(server.await.unwrap().len(), MAX_EXTRACTED_LINKS);
+    }
+
+    #[kramli_test_macros::test]
+    fn encode_list_id_xor_key_maps_to_zero_string() {
+        assert_eq!(encode_list_id(LIST_ID_XOR_KEY), "0");
+    }
+
+    #[kramli_test_macros::test]
+    fn parser_rejects_strict_authority_mismatch_after_parse() {
+        assert!(parse_internal_kramli_url("https://kramli.de@127.0.0.1/lists/42").is_none());
+        assert!(parse_internal_kramli_url("https://kramli.de:443/lists/42").is_none());
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn resolve_texts_stops_when_link_cap_reached() {
+        let (mut resolver, server) = resolver_with_responses(
+            (0..MAX_EXTRACTED_LINKS)
+                .map(|id| TestResponse {
+                    status: 200,
+                    body: json!({"resolved": true, "list_name": format!("List {id}")}),
+                })
+                .collect(),
+        )
+        .await;
+        let first_text = (1..=8)
+            .map(|id| format!("https://kramli.de/lists/{id}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let second_text = (9..=MAX_EXTRACTED_LINKS + 5)
+            .map(|id| format!("https://kramli.de/lists/{id}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let previews = resolver
+            .resolve_texts([first_text.as_str(), second_text.as_str()])
+            .await;
+        assert_eq!(previews.len(), MAX_EXTRACTED_LINKS);
+        assert_eq!(server.await.unwrap().len(), MAX_EXTRACTED_LINKS);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn resolve_texts_reuses_url_cache_without_refetch() {
+        let (mut resolver, server) = resolver_with_responses(vec![TestResponse {
+            status: 200,
+            body: json!({"resolved": true, "list_name": "Cached"}),
+        }])
+        .await;
+        let url = "https://kramli.de/lists/42";
+        let cached = resolver.resolve_url(url).await.unwrap();
+        assert!(cached.resolved);
+        let previews = resolver.resolve_texts([url]).await;
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].list_name.as_deref(), Some("Cached"));
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn link_resolver_waits_for_mock_server_ready() {
+        let (mut resolver, server) = resolver_with_responses(vec![TestResponse {
+            status: 200,
+            body: json!({"resolved": true, "list_name": "Ready"}),
+        }])
+        .await;
+        tokio::task::yield_now().await;
+        let preview = resolver
+            .resolve_url("https://kramli.de/lists/42")
+            .await
+            .unwrap();
+        assert!(preview.resolved);
+        assert_eq!(preview.list_name.as_deref(), Some("Ready"));
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn link_resolver_handles_delayed_mock_registration() {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            let (mut resolver, server) =
+                resolver_with_delayed_metadata(1, Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+            let previews = resolver.resolve_texts(["https://kramli.de/lists/42"]).await;
+            assert_eq!(previews.len(), 1);
+            assert!(previews[0].resolved);
+            assert_eq!(server.await.unwrap().len(), 1);
+        })
+        .await;
+        result.expect("delayed mock registration test should finish within 20s");
+    }
+
+    #[kramli_test_macros::test]
+    fn prepare_kramli_url_rejects_short_and_malformed_inputs() {
+        assert!(super::prepare_kramli_url("https://").is_none());
+        assert!(super::prepare_kramli_url("https://k").is_none());
+        assert!(super::prepare_kramli_url("https://evil.test/lists/42").is_none());
+    }
+
+    #[kramli_test_macros::test]
+    fn decode_list_id_rejects_invalid_and_overflowing_slugs() {
+        assert!(super::decode_list_id("!!!").is_none());
+        let overflowing = "z".repeat(24);
+        assert!(super::decode_list_id(&overflowing).is_none());
+    }
+
+    #[kramli_test_macros::test]
+    fn parser_supports_kram_li_embed_and_search_without_query() {
+        let public_token = "A".repeat(SHARE_TOKEN_LEN);
+        let embed = parse_internal_kramli_url(&format!("https://kram.li/{public_token}/embed"))
+            .expect("embed route should parse");
+        assert_eq!(embed.kind, InternalLinkKind::PublicList);
+
+        let search = parse_internal_kramli_url("https://kramli.de/lists/search")
+            .expect("search without query should parse");
+        assert_eq!(search.kind, InternalLinkKind::Search);
+        assert_eq!(search.canonical_url, "https://kramli.de/lists/search");
+    }
+
+    #[kramli_test_macros::test]
+    fn positive_fragment_id_rejects_invalid_item_fragments() {
+        assert!(super::positive_fragment_id("item-", "item-").is_none());
+        assert!(super::positive_fragment_id("item-007", "item-").is_none());
+        assert!(super::positive_fragment_id("item-abc", "item-").is_none());
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn resolve_texts_aborts_slow_tasks_when_budget_expires() {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("preview server should bind");
+            let addr = listener.local_addr().expect("preview server address");
+            let base_url = format!("http://{addr}");
+            let ready = crate::test_env::register_mock_server(base_url.clone());
+            let server = tokio::spawn(async move {
+                let _ = ready.await;
+                let (mut stream, _) = listener.accept().await.expect("preview connection");
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            });
+
+            let api = ApiClient::for_tests(&base_url);
+            let mut resolver = LinkPreviewResolver::new(api);
+            let previews = resolver.resolve_texts(["https://kramli.de/lists/42"]).await;
+            assert_eq!(previews.len(), 1);
+            assert!(!previews[0].resolved);
+            let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+        })
+        .await;
+        result.expect("preview budget timeout test should finish within 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn resolver_with_empty_responses_skips_registration_gate() {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            let (mut resolver, server) = resolver_with_responses(vec![]).await;
+            let previews = resolver.resolve_texts(["https://kramli.de/lists/42"]).await;
+            assert_eq!(previews.len(), 1);
+            assert!(!previews[0].resolved);
+            assert_eq!(
+                server.await.expect("empty mock server should finish").len(),
+                0
+            );
+        })
+        .await;
+        result.expect("empty resolver responses test should finish within 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn delayed_metadata_helper_skips_registration_when_count_is_zero() {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            let (mut resolver, server) =
+                resolver_with_delayed_metadata(0, Duration::from_millis(10)).await;
+            let previews = resolver.resolve_texts(["https://kramli.de/lists/42"]).await;
+            assert_eq!(previews.len(), 1);
+            assert!(!previews[0].resolved);
+            assert_eq!(
+                server.await.expect("zero-count server should finish").len(),
+                0
+            );
+        })
+        .await;
+        result.expect("zero-count delayed metadata test should finish within 20s");
     }
 }

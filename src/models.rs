@@ -412,9 +412,16 @@ impl SearchResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiKey, ApiKeyScopes, Profile, SearchResponse};
+    use super::{ApiKey, ApiKeyScopes, Profile, SearchResponse, SearchResults};
 
-    #[test]
+    fn expect_flat_hits(parsed: SearchResponse) -> Vec<super::SearchHit> {
+        match parsed {
+            SearchResponse::Flat(hits) => hits,
+            SearchResponse::Grouped(_) => panic!("expected flat search response"),
+        }
+    }
+
+    #[kramli_test_macros::test]
     fn parse_search_response_accepts_empty_array() {
         let value = serde_json::json!([]);
         let parsed = SearchResponse::from_value(value).expect("should parse empty array");
@@ -423,7 +430,7 @@ mod tests {
         assert!(grouped.items.is_none());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_search_response_covers_object_null_and_error_shapes() {
         let null = SearchResponse::from_value(serde_json::Value::Null)
             .expect("null should parse as empty flat response")
@@ -469,12 +476,80 @@ mod tests {
         assert!(SearchResponse::from_value(serde_json::json!([null])).is_err());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_search_response_object_with_null_lists_is_rejected() {
         assert!(SearchResponse::from_value(serde_json::json!({"lists": null})).is_err());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
+    fn parse_search_response_prefers_flat_after_empty_grouped() {
+        let parsed = SearchResponse::from_value(serde_json::json!({
+            "unexpected_grouped_field": true,
+            "type": "item",
+            "id": 12,
+            "text": "Fallback"
+        }))
+        .expect("non-grouped object should fall back to flat hit");
+        let hits = expect_flat_hits(parsed);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 12);
+    }
+
+    #[kramli_test_macros::test]
+    fn parse_search_response_uses_flat_when_grouped_missing() {
+        let parsed = SearchResponse::from_value(serde_json::json!({
+            "type": "list",
+            "id": 5,
+            "name": "Weekend"
+        }))
+        .expect("flat object hit should parse");
+        let hits = expect_flat_hits(parsed);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 5);
+    }
+
+    #[kramli_test_macros::test]
+    fn parse_search_response_flat_fallback_for_empty_grouped() {
+        let parsed = SearchResponse::from_value(serde_json::json!({
+            "lists": null,
+            "items": null,
+            "type": "list",
+            "id": 5,
+            "name": "Weekend"
+        }))
+        .expect("empty grouped wrapper should fall back to flat hit");
+        let hits = expect_flat_hits(parsed);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 5);
+    }
+
+    #[kramli_test_macros::test]
+    fn parse_search_response_rejects_invalid_grouped_lists_field() {
+        assert!(SearchResponse::from_value(serde_json::json!({"lists": "bad"})).is_err());
+    }
+
+    #[kramli_test_macros::test]
+    fn parse_search_response_falls_back_to_flat_after_empty_grouped_fields() {
+        let parsed = SearchResponse::from_value(serde_json::json!({
+            "lists": null,
+            "items": null,
+            "type": "item",
+            "id": 99,
+            "text": "Grouped wrapper"
+        }))
+        .expect("empty grouped wrapper should fall back to flat hit");
+        let hits = expect_flat_hits(parsed);
+        assert_eq!(hits[0].id, 99);
+        assert_eq!(hits[0].text.as_deref(), Some("Grouped wrapper"));
+    }
+
+    #[kramli_test_macros::test]
+    #[should_panic(expected = "expected flat search response")]
+    fn flat_search_response_guard_rejects_grouped_variant() {
+        expect_flat_hits(SearchResponse::Grouped(SearchResults::default()));
+    }
+
+    #[kramli_test_macros::test]
     fn parse_search_response_accepts_flat_hits() {
         let value = serde_json::json!([
             {
@@ -494,7 +569,7 @@ mod tests {
         assert_eq!(items[0].text, "Sample");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_search_response_infers_list_arrays_without_type() {
         let value = serde_json::json!([
             {
@@ -512,7 +587,7 @@ mod tests {
         assert_eq!(lists[0].name, "Groceries");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_search_response_infers_item_arrays_without_type() {
         let value = serde_json::json!([
             {
@@ -532,7 +607,7 @@ mod tests {
         assert_eq!(items[0].text, "Milk");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_search_response_covers_fallback_names_and_unknown_hits() {
         let value = serde_json::json!([
             {"type": "list", "id": 10},
@@ -553,7 +628,7 @@ mod tests {
         assert!(SearchResponse::from_value(serde_json::json!([{"id": true}])).is_err());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_profile_lang_aliases() {
         let from_lang: Profile = serde_json::from_value(serde_json::json!({"lang": "fr"}))
             .expect("profile with lang should parse");
@@ -569,7 +644,7 @@ mod tests {
         assert_eq!(from_locale.lang.as_deref(), Some("de_DE"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_api_key_scopes_array() {
         let key: ApiKey = serde_json::from_value(serde_json::json!({
             "id": 1,
@@ -585,7 +660,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_api_key_scopes_string() {
         let key: ApiKey = serde_json::from_value(serde_json::json!({
             "id": 2,
@@ -596,6 +671,36 @@ mod tests {
         .expect("api key with string scopes should parse");
 
         assert!(matches!(key.scopes, Some(ApiKeyScopes::Single(value)) if value == "all"));
+    }
+
+    #[kramli_test_macros::test]
+    fn shopping_list_is_note_recognizes_note_type_aliases() {
+        use super::ShoppingList;
+
+        for list_type in ["note", "notes", "notizzettel"] {
+            let list = ShoppingList {
+                id: 1,
+                name: "Notes".to_string(),
+                icon: None,
+                color: None,
+                folder_id: None,
+                folder_name: None,
+                archived: None,
+                archive_mode: None,
+                view_mode: None,
+                role: None,
+                list_type: Some(list_type.to_string()),
+                item_count: None,
+                done_count: None,
+                state_config: None,
+                states: None,
+                created_at: None,
+            };
+            assert!(
+                list.is_note(),
+                "expected {list_type} to count as a note list"
+            );
+        }
     }
 }
 

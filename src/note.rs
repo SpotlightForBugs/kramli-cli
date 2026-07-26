@@ -50,6 +50,23 @@ pub(crate) fn note_content(payload: &Value) -> Option<&str> {
 
 const KRAMLI_LINK_PREVIEW_TYPE: &str = "kramli-link-preview";
 
+fn push_insert_texts(insert: &Value, texts: &mut Vec<String>) {
+    if let Some(text) = insert.as_str() {
+        if !text.trim().is_empty() {
+            texts.push(text.to_string());
+        }
+    } else if let Some(embed) = insert.as_object() {
+        if embed.get("_type").and_then(Value::as_str) == Some(KRAMLI_LINK_PREVIEW_TYPE) {
+            if let Some(source) = embed.get("source").and_then(Value::as_str) {
+                texts.push(source.to_string());
+            }
+            if let Some(uri) = embed.get("uri").and_then(Value::as_str) {
+                texts.push(uri.to_string());
+            }
+        }
+    }
+}
+
 /// Collect note text fragments that may contain Kramli URLs for link-preview resolution.
 pub(crate) fn collect_note_link_sources(payload: &Value) -> Vec<String> {
     let mut texts = Vec::new();
@@ -72,20 +89,7 @@ pub(crate) fn collect_note_link_sources(payload: &Value) -> Vec<String> {
             continue;
         };
         if let Some(insert) = object.get("insert") {
-            if let Some(text) = insert.as_str() {
-                if !text.trim().is_empty() {
-                    texts.push(text.to_string());
-                }
-            } else if let Some(embed) = insert.as_object() {
-                if embed.get("_type").and_then(Value::as_str) == Some(KRAMLI_LINK_PREVIEW_TYPE) {
-                    if let Some(source) = embed.get("source").and_then(Value::as_str) {
-                        texts.push(source.to_string());
-                    }
-                    if let Some(uri) = embed.get("uri").and_then(Value::as_str) {
-                        texts.push(uri.to_string());
-                    }
-                }
-            }
+            push_insert_texts(insert, &mut texts);
         }
         if let Some(attrs) = object.get("attributes").and_then(Value::as_object) {
             for key in ["a", "link"] {
@@ -184,7 +188,7 @@ pub(crate) fn mutation_id() -> String {
 mod tests {
     use super::*;
 
-    #[test]
+    #[kramli_test_macros::test]
     fn validates_only_lossless_plain_deltas() {
         let plain = json!({
             "list_type": "note",
@@ -220,7 +224,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn collects_link_sources_from_note_delta() {
         let payload = json!({
             "list_type": "note",
@@ -244,7 +248,132 @@ mod tests {
             .any(|text| text.contains("PvxNDHrxliG3YtBaq-k1fg.json")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
+    fn normalize_list_type_handles_whitespace_and_unknown_aliases() {
+        assert_eq!(normalize_list_type(Some("  ".to_string())), None);
+        assert_eq!(
+            normalize_list_type(Some("shopping".to_string())).as_deref(),
+            Some("shopping")
+        );
+        assert_eq!(
+            normalize_list_type(Some("NOTIZZETTEL".to_string())).as_deref(),
+            Some("note")
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn collect_note_link_sources_handles_delta_edge_cases() {
+        let content_only = json!({
+            "list_type": "note",
+            "note_content": "  ",
+            "note_delta": "not-json"
+        });
+        assert!(collect_note_link_sources(&content_only).is_empty());
+
+        let empty_delta = json!({
+            "list_type": "note",
+            "note_content": "Hello",
+            "note_delta": ""
+        });
+        assert_eq!(
+            collect_note_link_sources(&empty_delta),
+            vec!["Hello".to_string()]
+        );
+
+        let rich_delta = json!({
+            "list_type": "note",
+            "note_delta": "[\
+                42,\
+                {\"insert\":\" \"},\
+                {\"insert\":{\"_type\":\"kramli-link-preview\",\"uri\":\"https://kramli.de/lists/1\"}},\
+                {\"insert\":\"x\",\"attributes\":{\"link\":\"https://kramli.de/privacy\"}}\
+            ]"
+        });
+        let sources = collect_note_link_sources(&rich_delta);
+        assert!(sources.contains(&"https://kramli.de/lists/1".to_string()));
+        assert!(sources.contains(&"https://kramli.de/privacy".to_string()));
+    }
+
+    #[kramli_test_macros::test]
+    fn collect_note_link_sources_reads_embed_uri_without_source() {
+        let delta = json!({
+            "list_type": "note",
+            "note_delta": "[{\"insert\":{\"_type\":\"kramli-link-preview\",\"uri\":\"https://kramli.de/uri-only\"}}]"
+        });
+        assert_eq!(
+            collect_note_link_sources(&delta),
+            vec!["https://kramli.de/uri-only".to_string()]
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn collect_note_link_sources_reads_embed_source_and_uri() {
+        let delta = json!({
+            "list_type": "note",
+            "note_delta": "[{\"insert\":{\"_type\":\"kramli-link-preview\",\"source\":\"https://kramli.de/source\",\"uri\":\"https://kramli.de/uri\"}}]"
+        });
+        let sources = collect_note_link_sources(&delta);
+        assert!(sources.contains(&"https://kramli.de/source".to_string()));
+        assert!(sources.contains(&"https://kramli.de/uri".to_string()));
+    }
+
+    #[kramli_test_macros::test]
+    fn collect_note_link_sources_skips_whitespace_only_insert_text() {
+        let delta = json!({
+            "list_type": "note",
+            "note_delta": "[{\"insert\":\" \"}]"
+        });
+        assert!(collect_note_link_sources(&delta).is_empty());
+    }
+
+    #[kramli_test_macros::test]
+    fn collect_note_link_sources_skips_numeric_insert_operations() {
+        let delta = json!({
+            "list_type": "note",
+            "note_delta": "[{\"insert\":42}]"
+        });
+        assert!(collect_note_link_sources(&delta).is_empty());
+    }
+
+    #[kramli_test_macros::test]
+    fn collect_note_link_sources_skips_non_preview_embeds_and_non_text_inserts() {
+        let delta = json!({
+            "list_type": "note",
+            "note_delta": "[\
+                {\"insert\":{\"other\":true}},\
+                {\"insert\":42},\
+                {\"insert\":{\"_type\":\"image\",\"source\":\"https://kramli.de/image.png\"}}\
+            ]"
+        });
+        assert!(collect_note_link_sources(&delta).is_empty());
+    }
+
+    #[kramli_test_macros::test]
+    fn collect_note_link_sources_reads_anchor_attributes() {
+        let delta = json!({
+            "list_type": "note",
+            "note_delta": "[{\"insert\":\"docs\",\"attributes\":{\"a\":\"https://kramli.de/docs\"}}]"
+        });
+        assert_eq!(
+            collect_note_link_sources(&delta),
+            vec!["docs".to_string(), "https://kramli.de/docs".to_string()]
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn validate_plain_note_accepts_empty_delta_operations() {
+        let payload = json!({
+            "list_type": "note",
+            "note_content": "",
+            "note_delta": "",
+            "note_version": 1
+        });
+        let parsed = validate_plain_note(&payload).expect("empty delta should be editable");
+        assert_eq!(parsed.content, "");
+        assert_eq!(parsed.delta, "");
+    }
+
+    #[kramli_test_macros::test]
     fn builds_versioned_payload_and_preserves_clear() {
         let current = json!({
             "list_type": "note",
