@@ -321,10 +321,7 @@ mod tests {
         });
         assert_eq!(
             collect_note_link_sources(&delta),
-            vec![
-                "docs".to_string(),
-                "https://kramli.de/docs".to_string()
-            ]
+            vec!["docs".to_string(), "https://kramli.de/docs".to_string()]
         );
     }
 

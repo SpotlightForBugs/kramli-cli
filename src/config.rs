@@ -643,10 +643,8 @@ mod tests {
     #[test]
     fn save_to_path_creates_missing_parent_directories() {
         with_clean_config_env(|| {
-            let parent = std::env::temp_dir().join(format!(
-                "kramli-config-nested-{}",
-                std::process::id()
-            ));
+            let parent =
+                std::env::temp_dir().join(format!("kramli-config-nested-{}", std::process::id()));
             let path = parent.join("nested").join("config.json");
             let mut cfg = config_file(Some(true), Some(false));
             cfg.set_base_url(Some("https://nested.example".to_string()));

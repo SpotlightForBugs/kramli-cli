@@ -9550,8 +9550,7 @@ mod tests {
         app.save_editor().await.unwrap();
         assert!(app.editor.is_some());
         assert!(app.status.as_deref().is_some_and(|status| {
-            status.contains(tr("label-state").trim_end_matches(':'))
-                && status.contains(" | ")
+            status.contains(tr("label-state").trim_end_matches(':')) && status.contains(" | ")
         }));
 
         assert!(requests.await.unwrap().is_empty());
@@ -9723,17 +9722,11 @@ mod tests {
         });
 
         let changed = app
-            .move_calendar_selection_by_key(
-                KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL),
-                -1,
-            )
+            .move_calendar_selection_by_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), -1)
             .await
             .unwrap();
         assert!(changed);
-        assert_eq!(
-            app.items[0].due_date.as_deref(),
-            Some("2026-07-15T08:00")
-        );
+        assert_eq!(app.items[0].due_date.as_deref(), Some("2026-07-15T08:00"));
         assert_eq!(app.status, Some(tr("cli-item-updated")));
 
         let requests = requests.await.expect("test server should finish");
@@ -14129,7 +14122,10 @@ mod tests {
             list_name: Some("Shared".to_string()),
         });
 
-        app.handle_invite_confirmation_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()));
+        app.handle_invite_confirmation_key(KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::empty(),
+        ));
         assert!(app.invite_confirmation.is_none());
 
         app.invite_confirmation = Some(PendingInviteAcceptance {
@@ -14176,10 +14172,7 @@ mod tests {
         app.handle_editor_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
             .await
             .unwrap();
-        assert_ne!(
-            app.editor.as_ref().unwrap().progress,
-            tr("tui-kanban-open")
-        );
+        assert_ne!(app.editor.as_ref().unwrap().progress, tr("tui-kanban-open"));
 
         app.handle_editor_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
             .await
@@ -14248,8 +14241,7 @@ mod tests {
             let previous_auto_handoff = std::env::var_os(KRAMLI_AUTO_HANDOFF_ENV);
             std::env::set_var(KRAMLI_AUTO_HANDOFF_ENV, "1");
 
-            let (api, requests) =
-                api_with_responses(vec![json!({"ok": true}).to_string()]).await;
+            let (api, requests) = api_with_responses(vec![json!({"ok": true}).to_string()]).await;
             let mut app = App::new(api, false);
             app.lists = vec![test_list()];
             app.selected_list = 0;
@@ -14366,10 +14358,8 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_event_routes_legal_consent_keys() {
-        let (api, requests) = api_with_responses(vec![
-            json!({"legal": {"pending": []}}).to_string(),
-        ])
-        .await;
+        let (api, requests) =
+            api_with_responses(vec![json!({"legal": {"pending": []}}).to_string()]).await;
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         let mut app = App::new(api, false);
         app.beta_consent_pending = false;
@@ -14431,7 +14421,10 @@ mod tests {
     #[test]
     fn list_display_and_sort_helpers_cover_empty_and_id_only_branches() {
         let folder_only = test_shopping_list(1, "   ", None, Some(83), None, false);
-        assert_eq!(list_display_name_for_tui(&folder_only), tr("common-unknown"));
+        assert_eq!(
+            list_display_name_for_tui(&folder_only),
+            tr("common-unknown")
+        );
         assert_eq!(
             list_folder_sort_key(&folder_only),
             (0, format!("#{id:020}", id = 83))
@@ -14465,10 +14458,8 @@ mod tests {
 
     #[tokio::test]
     async fn footer_refresh_filter_image_attach_and_comment_actions_are_covered() {
-        let (api, requests) = api_with_responses(vec![
-            json!([{"id": 1, "name": "Groceries"}]).to_string(),
-        ])
-        .await;
+        let (api, requests) =
+            api_with_responses(vec![json!([{"id": 1, "name": "Groceries"}]).to_string()]).await;
         let mut app = App::new(api, true);
         app.beta_consent_pending = false;
         app.lists = vec![test_list()];
@@ -14479,14 +14470,18 @@ mod tests {
         app.trigger_footer_action(FooterAction::Refresh)
             .await
             .unwrap();
-        app.trigger_footer_action(FooterAction::Filter).await.unwrap();
+        app.trigger_footer_action(FooterAction::Filter)
+            .await
+            .unwrap();
         assert!(app.editor.is_some());
         app.editor = None;
 
         app.trigger_footer_action(FooterAction::OpenImage)
             .await
             .unwrap();
-        app.trigger_footer_action(FooterAction::Attach).await.unwrap();
+        app.trigger_footer_action(FooterAction::Attach)
+            .await
+            .unwrap();
         assert!(app.editor.is_some());
         app.editor = None;
 
@@ -14608,22 +14603,14 @@ mod tests {
         handle_runtime_event(
             &mut terminal,
             &mut app,
-            Event::Mouse(mouse(
-                MouseEventKind::Down(MouseButton::Left),
-                0,
-                0,
-            )),
+            Event::Mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0)),
         )
         .await
         .unwrap();
 
-        handle_runtime_event(
-            &mut terminal,
-            &mut app,
-            Event::Resize(100, 40),
-        )
-        .await
-        .unwrap();
+        handle_runtime_event(&mut terminal, &mut app, Event::Resize(100, 40))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -14744,12 +14731,9 @@ mod tests {
         app.show_help = true;
         app.selected_item = 0;
         let area = Rect::new(0, 0, 80, 24);
-        app.handle_mouse(
-            mouse(MouseEventKind::Down(MouseButton::Left), 10, 10),
-            area,
-        )
-        .await
-        .unwrap();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10, 10), area)
+            .await
+            .unwrap();
         assert!(!app.show_help);
     }
 

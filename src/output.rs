@@ -1241,10 +1241,11 @@ mod tests {
         color_dot, colorize_bold_text, colorize_text, date_with_time, display_icon, fallback_icon,
         folder_path_parts, human_size, item_status_parts, list_display_name_with_folder,
         list_folder_parts, map_bootstrap_icon_emoji, map_bootstrap_icon_label, member_type_label,
-        parse_hex_color, print_activity,         print_folders, print_item_detail, print_items,
-        print_items_for_list, print_link_previews, print_list_detail, print_lists, print_members, print_search,
-        print_wrapped_item_line, reminder_offsets_label, role_label, schedule_lines, strip_html,
-        view_mode_label, visible_width_ansi, wrap_ansi_with_prefix, IconStyle, ItemComments,
+        parse_hex_color, print_activity, print_folders, print_item_detail, print_items,
+        print_items_for_list, print_link_previews, print_list_detail, print_lists, print_members,
+        print_search, print_wrapped_item_line, reminder_offsets_label, role_label, schedule_lines,
+        strip_html, view_mode_label, visible_width_ansi, wrap_ansi_with_prefix, IconStyle,
+        ItemComments,
     };
     use crate::models::{
         ActivityEntry, Attachment, Folder, ItemComment, ListItem, ListState, Member, SearchItemHit,
@@ -1922,7 +1923,9 @@ mod tests {
 
     #[test]
     fn print_link_previews_cover_open_and_unresolved_actions() {
-        use crate::internal_links::{InternalLinkKind, LinkPreview, LinkPreviewAction, LinkPreviewActionKind};
+        use crate::internal_links::{
+            InternalLinkKind, LinkPreview, LinkPreviewAction, LinkPreviewActionKind,
+        };
 
         print_link_previews(&[
             LinkPreview {

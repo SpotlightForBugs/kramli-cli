@@ -1273,13 +1273,11 @@ mod tests {
     async fn resolve_url_strict_returns_none_for_external_urls() {
         let api = ApiClient::for_tests("http://127.0.0.1:9");
         let mut resolver = LinkPreviewResolver::new(api);
-        assert!(
-            resolver
-                .resolve_url_strict("https://example.test/lists/42")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(resolver
+            .resolve_url_strict("https://example.test/lists/42")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1292,7 +1290,9 @@ mod tests {
     fn parser_rejects_zero_decoded_list_ids() {
         assert!(parse_internal_kramli_url("https://kramli.de/lists/0").is_none());
         let zero_slug = encode_list_id(0);
-        assert!(parse_internal_kramli_url(&format!("https://kramli.de/lists/l/{zero_slug}")).is_none());
+        assert!(
+            parse_internal_kramli_url(&format!("https://kramli.de/lists/l/{zero_slug}")).is_none()
+        );
     }
 
     #[test]
@@ -1344,12 +1344,14 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_texts_stops_at_max_extracted_links() {
-        let (mut resolver, server) = resolver_with_responses((0..MAX_EXTRACTED_LINKS)
-            .map(|id| TestResponse {
-                status: 200,
-                body: json!({"resolved": true, "list_name": format!("List {id}")}),
-            })
-            .collect())
+        let (mut resolver, server) = resolver_with_responses(
+            (0..MAX_EXTRACTED_LINKS)
+                .map(|id| TestResponse {
+                    status: 200,
+                    body: json!({"resolved": true, "list_name": format!("List {id}")}),
+                })
+                .collect(),
+        )
         .await;
         let text = (1..=MAX_EXTRACTED_LINKS + 3)
             .map(|id| format!("https://kramli.de/lists/{id}"))

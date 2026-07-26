@@ -1175,14 +1175,13 @@ fn tools() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        content_length, create_item, create_list, delete_item, error_response, handle_message, handle_tool_call,
-        insert_clearable_string, insert_optional_string, insert_reminder_fields, list_items,
-        mcp_method_trace_name, mcp_tool_trace_name, optional_bool, optional_clearable_string,
-        optional_i64, optional_i64_array, optional_preserved_string, optional_string,
-        optional_string_array, read_message,
-        required_i64, required_string, run_stdio, run_with_io, toggle_item_done, tool_result,
-        tool_text_result, tools, try_parse_message, update_item, update_list, write_message,
-        MessageFraming,
+        content_length, create_item, create_list, delete_item, error_response, handle_message,
+        handle_tool_call, insert_clearable_string, insert_optional_string, insert_reminder_fields,
+        list_items, mcp_method_trace_name, mcp_tool_trace_name, optional_bool,
+        optional_clearable_string, optional_i64, optional_i64_array, optional_preserved_string,
+        optional_string, optional_string_array, read_message, required_i64, required_string,
+        run_stdio, run_with_io, toggle_item_done, tool_result, tool_text_result, tools,
+        try_parse_message, update_item, update_list, write_message, MessageFraming,
     };
     use crate::api::ApiClient;
     use crate::attachments::initialize_mcp_file_policy;
@@ -2637,7 +2636,9 @@ mod tests {
             .as_object()
             .cloned()
             .unwrap();
-        let updated = update_list(&api, &args).await.expect("folder update should succeed");
+        let updated = update_list(&api, &args)
+            .await
+            .expect("folder update should succeed");
         assert_eq!(updated["folder_id"], 3);
         let requests = requests.await.unwrap();
         assert!(requests[0].starts_with("PUT /api/lists/7 HTTP/1.1"));
@@ -2794,8 +2795,8 @@ mod tests {
 
     #[tokio::test]
     async fn create_list_tool_posts_optional_folder_type_and_note_content() {
-        let (api, requests) = api_with_responses(vec![json!({"id": 9, "name": "Notes"}).to_string()])
-            .await;
+        let (api, requests) =
+            api_with_responses(vec![json!({"id": 9, "name": "Notes"}).to_string()]).await;
         let args = json!({
             "name": "Notes",
             "folder_id": 3,
@@ -2805,7 +2806,9 @@ mod tests {
         .as_object()
         .cloned()
         .unwrap();
-        let created = create_list(&api, &args).await.expect("create_list should post");
+        let created = create_list(&api, &args)
+            .await
+            .expect("create_list should post");
         assert_eq!(created["id"], 9);
         let requests = requests.await.unwrap();
         assert!(requests[0].starts_with("POST /api/lists HTTP/1.1"));

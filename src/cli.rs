@@ -3986,7 +3986,10 @@ mod tests {
         .expect("item add should be dry-runnable");
         assert_eq!(add[0].method, "POST");
         assert_eq!(add[0].path, "/api/lists/7/items");
-        assert!(add[0].body.as_ref().is_some_and(|body| body.get("text").is_some()));
+        assert!(add[0]
+            .body
+            .as_ref()
+            .is_some_and(|body| body.get("text").is_some()));
 
         let done = dry_run_requests_for_command(&Commands::Items {
             action: Box::new(ItemCmd::Done { id: 11 }),
@@ -4044,39 +4047,33 @@ mod tests {
         .unwrap();
         assert_eq!(clear_done[0].path, "/api/lists/7/clear-done");
 
-        assert!(
-            dry_run_requests_for_command(&Commands::Items {
-                action: Box::new(ItemCmd::List {
-                    list_id: 7,
-                    open: false,
-                    completed: false,
-                    state: None,
-                    contains: None,
-                    newest: false,
-                    oldest: false,
-                    limit: None,
-                }),
-            })
-            .await
-            .unwrap()
-            .is_none()
-        );
-        assert!(
-            dry_run_requests_for_command(&Commands::Items {
-                action: Box::new(ItemCmd::Show { id: 5 }),
-            })
-            .await
-            .unwrap()
-            .is_none()
-        );
-        assert!(
-            dry_run_requests_for_command(&Commands::Items {
-                action: Box::new(ItemCmd::DoneList { list_id: 7 }),
-            })
-            .await
-            .unwrap()
-            .is_none()
-        );
+        assert!(dry_run_requests_for_command(&Commands::Items {
+            action: Box::new(ItemCmd::List {
+                list_id: 7,
+                open: false,
+                completed: false,
+                state: None,
+                contains: None,
+                newest: false,
+                oldest: false,
+                limit: None,
+            }),
+        })
+        .await
+        .unwrap()
+        .is_none());
+        assert!(dry_run_requests_for_command(&Commands::Items {
+            action: Box::new(ItemCmd::Show { id: 5 }),
+        })
+        .await
+        .unwrap()
+        .is_none());
+        assert!(dry_run_requests_for_command(&Commands::Items {
+            action: Box::new(ItemCmd::DoneList { list_id: 7 }),
+        })
+        .await
+        .unwrap()
+        .is_none());
     }
 
     #[tokio::test]
@@ -4248,18 +4245,16 @@ mod tests {
                 (TEST_KRAMLI_API_KEY_ENV, "kramli_test"),
             ],
             || async {
-                assert!(
-                    dry_run_requests_for_command(&Commands::Items {
-                        action: Box::new(ItemCmd::Attach {
-                            id: 9,
-                            files: vec![png.clone()],
-                            sensitive: true,
-                        }),
-                    })
-                    .await
-                    .unwrap()
-                    .is_none()
-                );
+                assert!(dry_run_requests_for_command(&Commands::Items {
+                    action: Box::new(ItemCmd::Attach {
+                        id: 9,
+                        files: vec![png.clone()],
+                        sensitive: true,
+                    }),
+                })
+                .await
+                .unwrap()
+                .is_none());
 
                 run_command_with_context(
                     Commands::Items {
@@ -4333,8 +4328,14 @@ mod tests {
         .unwrap();
         assert_eq!(folder_update[0].path, "/api/folders/5");
         let body = folder_update[0].body.as_ref().expect("body should exist");
-        assert_eq!(body.get("icon"), Some(&Value::String("archive".to_string())));
-        assert_eq!(body.get("color"), Some(&Value::String("#112233".to_string())));
+        assert_eq!(
+            body.get("icon"),
+            Some(&Value::String("archive".to_string()))
+        );
+        assert_eq!(
+            body.get("color"),
+            Some(&Value::String("#112233".to_string()))
+        );
         assert_eq!(body.get("parent_folder_id"), Some(&Value::from(2)));
 
         let accept_docs = dry_run_requests_for_command(&Commands::AcceptTerms {
@@ -4400,9 +4401,7 @@ mod tests {
             || async {
                 assert!(run_batch_json(&batch_file, false).await.is_err());
                 assert!(
-                    run_batch_json(&batch_file, true)
-                        .await
-                        .is_err(),
+                    run_batch_json(&batch_file, true).await.is_err(),
                     "keep-going should still report failure after continuing"
                 );
             },
@@ -4427,8 +4426,7 @@ mod tests {
     #[tokio::test]
     async fn run_items_attach_dispatches_multipart_upload() {
         let png = temp_attachment_png("attach-dispatch");
-        let upload_response =
-            json!({"attachment": {"id": 3, "filename": "photo.png"}}).to_string();
+        let upload_response = json!({"attachment": {"id": 3, "filename": "photo.png"}}).to_string();
         let (base_url, requests) = server_with_base_url(vec![upload_response]).await;
 
         with_env_vars_async(
@@ -4536,9 +4534,9 @@ mod tests {
 
         let requests = requests.await.expect("test server should finish");
         assert_eq!(requests.len(), 7);
-        assert!(requests.iter().any(|request| {
-            request == "POST /api/invite-links/InviteToken_1/accept HTTP/1.1"
-        }));
+        assert!(requests
+            .iter()
+            .any(|request| { request == "POST /api/invite-links/InviteToken_1/accept HTTP/1.1" }));
         assert_eq!(requests[5], "POST /api/lists/9/undo HTTP/1.1");
         assert_eq!(requests[6], "POST /api/lists/9/redo HTTP/1.1");
     }
@@ -4576,7 +4574,10 @@ mod tests {
         .unwrap();
         assert_eq!(list_move[0].path, "/api/lists/9");
         assert_eq!(
-            list_move[0].body.as_ref().and_then(|body| body.get("folder_id")),
+            list_move[0]
+                .body
+                .as_ref()
+                .and_then(|body| body.get("folder_id")),
             Some(&Value::from(3))
         );
     }
@@ -4662,34 +4663,40 @@ mod tests {
 
     #[tokio::test]
     async fn run_traced_entrypoint_covers_missing_command_branch() {
-        with_env_vars_async(&[("KRAMLI_URL", ""), (TEST_KRAMLI_API_KEY_ENV, "")], || async {
-            run(Cli {
-                json: false,
-                interactive: false,
-                dry_run: false,
-                command: None,
-            })
-            .await
-            .expect("missing command should print help through traced entrypoint");
-        })
+        with_env_vars_async(
+            &[("KRAMLI_URL", ""), (TEST_KRAMLI_API_KEY_ENV, "")],
+            || async {
+                run(Cli {
+                    json: false,
+                    interactive: false,
+                    dry_run: false,
+                    command: None,
+                })
+                .await
+                .expect("missing command should print help through traced entrypoint");
+            },
+        )
         .await;
     }
 
     #[tokio::test]
     async fn run_update_check_and_privacy_command_stubs_are_reachable() {
-        with_env_vars_async(&[("KRAMLI_URL", ""), (TEST_KRAMLI_API_KEY_ENV, "")], || async {
-            run_update_check_command(true)
-                .await
-                .expect("test update-check stub should succeed");
-            run_privacy_command(PrivacyCmd::Reset, false)
-                .expect("test privacy stub should succeed");
-            run_mcp_command()
-                .await
-                .expect("test mcp stub should succeed");
-            run_tui_command()
-                .await
-                .expect("test tui stub should succeed");
-        })
+        with_env_vars_async(
+            &[("KRAMLI_URL", ""), (TEST_KRAMLI_API_KEY_ENV, "")],
+            || async {
+                run_update_check_command(true)
+                    .await
+                    .expect("test update-check stub should succeed");
+                run_privacy_command(PrivacyCmd::Reset, false)
+                    .expect("test privacy stub should succeed");
+                run_mcp_command()
+                    .await
+                    .expect("test mcp stub should succeed");
+                run_tui_command()
+                    .await
+                    .expect("test tui stub should succeed");
+            },
+        )
         .await;
     }
 
@@ -4770,14 +4777,12 @@ mod tests {
 
     #[tokio::test]
     async fn dry_run_folder_list_returns_none_and_create_renders_human_output() {
-        assert!(
-            dry_run_requests_for_command(&Commands::Folders {
-                action: FolderCmd::List,
-            })
-            .await
-            .unwrap()
-            .is_none()
-        );
+        assert!(dry_run_requests_for_command(&Commands::Folders {
+            action: FolderCmd::List,
+        })
+        .await
+        .unwrap()
+        .is_none());
 
         let (base_url, requests) = server_with_base_url(vec![json!({
             "id": 3,

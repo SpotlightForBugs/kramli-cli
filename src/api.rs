@@ -1424,7 +1424,10 @@ mod tests {
     async fn api_request_helpers_report_network_errors_for_all_verbs() {
         let api = test_client("http://127.0.0.1:1");
         assert!(api.get::<Value>("/missing").await.is_err());
-        assert!(api.get_query::<Value>("/search", &[("q", "milk")]).await.is_err());
+        assert!(api
+            .get_query::<Value>("/search", &[("q", "milk")])
+            .await
+            .is_err());
         assert!(api
             .post::<Value, Value>("/items", &json!({"text": "Milk"}))
             .await

@@ -362,20 +362,20 @@ mod tests {
                 )
                 .await
                 .expect("json create should succeed");
-        run_lists_update(
-            &api,
-            false,
-            UpdateListArgs {
-                id: 7,
-                name: Some("Renamed".to_string()),
-                icon: None,
-                color: None,
-                note_content: None,
-                states: None,
-            },
-        )
-        .await
-        .expect("human update without note content should succeed");
+                run_lists_update(
+                    &api,
+                    false,
+                    UpdateListArgs {
+                        id: 7,
+                        name: Some("Renamed".to_string()),
+                        icon: None,
+                        color: None,
+                        note_content: None,
+                        states: None,
+                    },
+                )
+                .await
+                .expect("human update without note content should succeed");
                 run_lists_delete(&api, false, 7)
                     .await
                     .expect("human delete should succeed");
@@ -440,7 +440,8 @@ mod tests {
             "note_delta": "[{\"insert\":\"New\\n\"}]",
             "note_version": 5
         });
-        let (api, requests) = api_with_responses(vec![current.to_string(), updated.to_string()]).await;
+        let (api, requests) =
+            api_with_responses(vec![current.to_string(), updated.to_string()]).await;
 
         run_lists_update(
             &api,

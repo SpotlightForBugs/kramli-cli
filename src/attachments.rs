@@ -10,8 +10,7 @@ use crate::models::Attachment;
 
 const MCP_UPLOADS_ENV: &str = "KRAMLI_MCP_ALLOW_FILE_UPLOADS";
 const MCP_FILE_ROOTS_ENV: &str = "KRAMLI_MCP_FILE_ROOTS";
-static MCP_STARTUP_CWD: LazyLock<RwLock<Option<PathBuf>>> =
-    LazyLock::new(|| RwLock::new(None));
+static MCP_STARTUP_CWD: LazyLock<RwLock<Option<PathBuf>>> = LazyLock::new(|| RwLock::new(None));
 
 #[derive(Clone, Debug)]
 pub(crate) struct AttachmentUpload {
