@@ -2912,7 +2912,11 @@ mod tests {
                     ("KRAMLI_URL", base_url.as_str()),
                     ("KRAMLI_API_KEY", "kramli_test"),
                 ],
-                || async { super::list_lists(&api).await.expect("list_lists should succeed") },
+                || async {
+                    super::list_lists(&api)
+                        .await
+                        .expect("list_lists should succeed")
+                },
             )
             .await;
             assert_eq!(listed[0]["name"], "Groceries");
@@ -3180,7 +3184,8 @@ mod tests {
     #[tokio::test]
     async fn api_with_responses_waits_for_mock_server_registration() {
         let result = tokio::time::timeout(Duration::from_secs(20), async {
-            let (api, requests) = api_with_responses(vec![json!({"ready": true}).to_string()]).await;
+            let (api, requests) =
+                api_with_responses(vec![json!({"ready": true}).to_string()]).await;
             tokio::task::yield_now().await;
             api.get::<Value>("/registration-check")
                 .await

@@ -2254,8 +2254,7 @@ impl App {
             Size::new(2, 1),
             Resize::Fit(Some(FilterType::Lanczos3)),
         ) {
-            Ok(protocol) if !self.should_reject_list_icon_protocol() =>
-            {
+            Ok(protocol) if !self.should_reject_list_icon_protocol() => {
                 self.failed_list_icons.remove(&icon);
                 self.list_icon_images.insert(icon, protocol);
             }
@@ -15999,7 +15998,9 @@ mod tests {
             .await
             .expect("zero delta should return false"));
         let unchanged_due_date = app.items[0].due_date.clone().unwrap();
-        app.update_item_due_date(0, unchanged_due_date).await.unwrap();
+        app.update_item_due_date(0, unchanged_due_date)
+            .await
+            .unwrap();
 
         app.lists = vec![note];
         app.update_item_due_date(0, "2026-07-02".to_string())
@@ -16147,10 +16148,7 @@ mod tests {
         let mut app = test_app();
         app.picker.set_protocol_type(ProtocolType::Sixel);
         app.pending_list_icons.insert("sixel-fail".to_string());
-        app.apply_list_icon_result(
-            "sixel-fail".to_string(),
-            Ok(DynamicImage::new_rgba8(2, 2)),
-        );
+        app.apply_list_icon_result("sixel-fail".to_string(), Ok(DynamicImage::new_rgba8(2, 2)));
         assert!(!app.pending_list_icons.contains("sixel-fail"));
 
         app.picker.set_protocol_type(ProtocolType::Halfblocks);
@@ -16180,9 +16178,7 @@ mod tests {
         );
 
         let mut note_item = sample_item(2, "Note image");
-        note_item.notes = Some(
-            "See ![photo](https://example.test/note.png)".to_string(),
-        );
+        note_item.notes = Some("See ![photo](https://example.test/note.png)".to_string());
         assert_eq!(
             App::selected_image_source(&note_item).as_deref(),
             Some("https://example.test/note.png")
@@ -16518,9 +16514,12 @@ mod tests {
 
     #[tokio::test]
     async fn run_event_loop_poll_paths_tty_case_noops_when_stdout_is_not_tty() {
-        tokio::time::timeout(Duration::from_secs(20), run_event_loop_poll_paths_noop_guard())
-            .await
-            .expect("test timed out after 20s");
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            run_event_loop_poll_paths_noop_guard(),
+        )
+        .await
+        .expect("test timed out after 20s");
     }
 
     #[test]
@@ -16531,9 +16530,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "runs in a pseudo-terminal subprocess"]
     async fn run_event_loop_poll_paths_tty_case_noops_on_tty() {
-        tokio::time::timeout(Duration::from_secs(20), run_event_loop_poll_paths_noop_guard())
-            .await
-            .expect("test timed out after 20s");
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            run_event_loop_poll_paths_noop_guard(),
+        )
+        .await
+        .expect("test timed out after 20s");
     }
 
     #[tokio::test]
@@ -16547,15 +16549,13 @@ mod tests {
         app.items = vec![sample_item(1, "Milk")];
         app.selected_item = 0;
 
-        assert!(
-            handle_runtime_event(
-                &mut terminal,
-                &mut app,
-                Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty())),
-            )
-            .await
-            .expect("navigation key should route through handle_key")
-        );
+        assert!(handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty())),
+        )
+        .await
+        .expect("navigation key should route through handle_key"));
 
         let (api, _requests) = api_with_responses(Vec::new()).await;
         let mut app = App::new(api, false);
@@ -16565,15 +16565,13 @@ mod tests {
         app.items = vec![sample_item(2, "Bread")];
         app.selected_item = 0;
 
-        assert!(
-            handle_runtime_event(
-                &mut terminal,
-                &mut app,
-                Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty())),
-            )
-            .await
-            .expect("delete key should route through handle_key")
-        );
+        assert!(handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty())),
+        )
+        .await
+        .expect("delete key should route through handle_key"));
         assert!(app.status.as_ref().is_some_and(|status| !status.is_empty()));
 
         let mut app = test_app();
@@ -16582,19 +16580,17 @@ mod tests {
         app.legal_pending_docs = vec!["agb".to_string()];
         let area = Rect::new(0, 0, 80, 24);
         let layout = beta_consent_layout(area);
-        assert!(
-            handle_runtime_event(
-                &mut terminal,
-                &mut app,
-                Event::Mouse(mouse(
-                    MouseEventKind::Down(MouseButton::Left),
-                    layout.accept.x + 1,
-                    layout.accept.y,
-                )),
-            )
-            .await
-            .expect("legal consent mouse should be handled")
-        );
+        assert!(handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.accept.x + 1,
+                layout.accept.y,
+            )),
+        )
+        .await
+        .expect("legal consent mouse should be handled"));
         assert!(app.legal_accepting);
 
         let (api, _requests) = api_with_responses(Vec::new()).await;
@@ -16612,19 +16608,17 @@ mod tests {
             .map(|(_, rect)| rect)
             .expect("delete footer chip should exist");
 
-        assert!(
-            handle_runtime_event(
-                &mut terminal,
-                &mut app,
-                Event::Mouse(mouse(
-                    MouseEventKind::Down(MouseButton::Left),
-                    delete_rect.x + 1,
-                    delete_rect.y,
-                )),
-            )
-            .await
-            .expect("footer delete mouse should route through handle_mouse")
-        );
+        assert!(handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                delete_rect.x + 1,
+                delete_rect.y,
+            )),
+        )
+        .await
+        .expect("footer delete mouse should route through handle_mouse"));
         assert!(app.status.as_ref().is_some_and(|status| !status.is_empty()));
     }
 
@@ -17140,7 +17134,11 @@ mod tests {
 
         app.beta_consent_pending = true;
         app.handle_beta_consent_mouse(
-            mouse(MouseEventKind::Up(MouseButton::Left), layout.accept.x + 1, layout.accept.y),
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                layout.accept.x + 1,
+                layout.accept.y,
+            ),
             area,
         );
         assert!(app.beta_consent_pending);
@@ -17170,7 +17168,11 @@ mod tests {
         legal_app.legal_consent_pending = true;
         legal_app.legal_accepting = false;
         legal_app.handle_legal_consent_mouse(
-            mouse(MouseEventKind::Moved, layout.decline.x + 1, layout.decline.y),
+            mouse(
+                MouseEventKind::Moved,
+                layout.decline.x + 1,
+                layout.decline.y,
+            ),
             area,
         );
         assert!(!legal_app.should_quit);
@@ -17239,7 +17241,10 @@ mod tests {
         }
 
         assert!(!app.loading_lists);
-        assert_eq!(requests.await.expect("test server should finish"), vec!["GET /api/lists HTTP/1.1"]);
+        assert_eq!(
+            requests.await.expect("test server should finish"),
+            vec!["GET /api/lists HTTP/1.1"]
+        );
     }
 
     #[test]
@@ -17538,7 +17543,10 @@ mod tests {
         assert_eq!(next_kanban_column_selection(&buckets, 10, 0), Some(10));
         assert_eq!(stepped_kanban_selection(&buckets, 10, 0), Some(10));
         assert_eq!(stepped_kanban_selection(&[], 0, 1), None);
-        assert_eq!(autocomplete_last_tag("weekend", &["Weekend".to_string()], 0), None);
+        assert_eq!(
+            autocomplete_last_tag("weekend", &["Weekend".to_string()], 0),
+            None
+        );
         assert_eq!(
             autocomplete_last_tag("Brot,mil", &["Milch".to_string()], 1),
             Some("Brot, Milch".to_string())
@@ -17618,7 +17626,12 @@ mod tests {
             2, "Plain", None, None, None, false
         )));
         assert!(!list_has_folder(&test_shopping_list(
-            3, "Blank folder", None, None, Some("   "), false
+            3,
+            "Blank folder",
+            None,
+            None,
+            Some("   "),
+            false
         )));
     }
 
@@ -17637,7 +17650,10 @@ mod tests {
         let mut app = test_app();
         let mut note = test_list();
         note.list_type = Some("note".to_string());
-        app.lists = vec![note.clone(), test_shopping_list(2, "Other", None, None, None, false)];
+        app.lists = vec![
+            note.clone(),
+            test_shopping_list(2, "Other", None, None, None, false),
+        ];
         app.selected_list = 1;
         app.status = None;
 
@@ -17985,8 +18001,7 @@ mod tests {
                     continue;
                 }
                 let existing = app.items[0].due_date.as_deref().unwrap();
-                let computed =
-                    due_date_with_hour_delta(Some(existing), fallback, delta);
+                let computed = due_date_with_hour_delta(Some(existing), fallback, delta);
                 if computed == existing {
                     assert!(!app
                         .move_selected_item_calendar_hours(delta)
@@ -18074,19 +18089,29 @@ mod tests {
     #[test]
     fn calendar_pointer_and_agenda_helpers_handle_edge_sizes() {
         assert_eq!(
-            calendar_pointer_date(Rect::new(0, 0, 0, 0), 0, 0, SimpleDate {
-                year: 2026,
-                month: 7,
-                day: 1,
-            }),
+            calendar_pointer_date(
+                Rect::new(0, 0, 0, 0),
+                0,
+                0,
+                SimpleDate {
+                    year: 2026,
+                    month: 7,
+                    day: 1,
+                }
+            ),
             None
         );
         assert_eq!(
-            calendar_pointer_date(Rect::new(0, 0, 2, 2), 0, 0, SimpleDate {
-                year: 2026,
-                month: 7,
-                day: 1,
-            }),
+            calendar_pointer_date(
+                Rect::new(0, 0, 2, 2),
+                0,
+                0,
+                SimpleDate {
+                    year: 2026,
+                    month: 7,
+                    day: 1,
+                }
+            ),
             None
         );
 
@@ -18148,10 +18173,8 @@ mod tests {
         let mut note = test_list();
         note.list_type = Some("note".to_string());
         app.lists = vec![note];
-        app.note_detail_cache.insert(
-            1,
-            json!({"note_content": "See link below"}),
-        );
+        app.note_detail_cache
+            .insert(1, json!({"note_content": "See link below"}));
         app.link_previews.insert(
             note_preview_owner(1),
             vec![test_link_preview(
@@ -18165,14 +18188,17 @@ mod tests {
         let header_idx = lines
             .iter()
             .position(|line| {
-                line.spans.iter().any(|span| {
-                    span.content.as_ref() == tr("link-preview-section")
-                })
+                line.spans
+                    .iter()
+                    .any(|span| span.content.as_ref() == tr("link-preview-section"))
             })
             .expect("link preview section should render");
         assert!(note_link_preview_index_at_line(&lines, header_idx).is_none());
         assert!(note_link_preview_index_at_line(&lines, header_idx.saturating_sub(1)).is_none());
-        assert_eq!(note_link_preview_index_at_line(&lines, header_idx + 1), Some(0));
+        assert_eq!(
+            note_link_preview_index_at_line(&lines, header_idx + 1),
+            Some(0)
+        );
     }
 
     #[test]
@@ -18219,10 +18245,7 @@ mod tests {
             app.set_inline_images_enabled(true);
             app.picker.set_protocol_type(ProtocolType::Kitty);
             for icon in ["folder2", "tag"] {
-                app.apply_list_icon_result(
-                    icon.to_string(),
-                    Ok(DynamicImage::new_rgba8(2, 2)),
-                );
+                app.apply_list_icon_result(icon.to_string(), Ok(DynamicImage::new_rgba8(2, 2)));
             }
             app.lists = vec![test_shopping_list(
                 1,
@@ -18271,10 +18294,7 @@ mod tests {
         let mut app = test_app();
         app.beta_consent_pending = false;
         app.lists = vec![test_list()];
-        app.items = vec![
-            sample_item(1, "First task"),
-            sample_item(2, "Second task"),
-        ];
+        app.items = vec![sample_item(1, "First task"), sample_item(2, "Second task")];
         app.selected_item = 1;
         app.mode = ViewMode::List;
 
@@ -18503,12 +18523,7 @@ mod tests {
             calendar_pointer_date(content, separator_x, monday_row, month),
             None
         );
-        let _ = calendar_pointer_date(
-            content,
-            separator_x.saturating_add(1),
-            monday_row,
-            month,
-        );
+        let _ = calendar_pointer_date(content, separator_x.saturating_add(1), monday_row, month);
     }
 
     #[test]
@@ -18518,8 +18533,7 @@ mod tests {
 
             std::env::set_var(TERM_ENV, "xterm-kitty");
             std::env::set_var(KITTY_WINDOW_ID_ENV, "42");
-            let (_picker, enabled, summary, _) =
-                build_image_picker(ImageProtocolPreference::Auto);
+            let (_picker, enabled, summary, _) = build_image_picker(ImageProtocolPreference::Auto);
             assert!(enabled);
             assert!(summary.contains("kitty") || summary.contains("probe"));
 
@@ -18650,10 +18664,7 @@ mod tests {
         assert!(app.failed_list_icons.contains("protocol-fail"));
 
         app.pending_list_icons.insert("zero-size".to_string());
-        app.apply_list_icon_result(
-            "zero-size".to_string(),
-            Ok(DynamicImage::new_rgba8(0, 0)),
-        );
+        app.apply_list_icon_result("zero-size".to_string(), Ok(DynamicImage::new_rgba8(0, 0)));
         assert!(app.failed_list_icons.contains("zero-size"));
     }
 
@@ -18791,7 +18802,9 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             let requests = requests.await.expect("delete should hit api");
-            assert!(requests.first().is_some_and(|req| req.starts_with("DELETE /api/items/99")));
+            assert!(requests
+                .first()
+                .is_some_and(|req| req.starts_with("DELETE /api/items/99")));
             assert!(app.loading_items_for.is_some());
         })
         .await
@@ -18816,7 +18829,11 @@ mod tests {
                 horizontal: 1,
             });
             app.handle_note_mode_mouse(
-                mouse(MouseEventKind::Down(MouseButton::Left), inner.x + 1, inner.y),
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    inner.x + 1,
+                    inner.y,
+                ),
                 content,
                 true,
             )
@@ -18950,7 +18967,8 @@ mod tests {
     async fn select_list_panel_row_updates_selection_and_reloads_items() {
         tokio::time::timeout(Duration::from_secs(20), async {
             let (api, requests) = api_with_responses(vec![
-                serde_json::json!({"id": 2, "list_type": "note", "note_content": "Other"}).to_string(),
+                serde_json::json!({"id": 2, "list_type": "note", "note_content": "Other"})
+                    .to_string(),
             ])
             .await;
             let mut app = App::new(api, true);
@@ -19040,7 +19058,11 @@ mod tests {
                 .next()
                 .expect("calendar should expose a clickable day");
             app.handle_calendar_mode_mouse(
-                mouse(MouseEventKind::Down(MouseButton::Left), cell.x + 1, cell.y + 1),
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    cell.x + 1,
+                    cell.y + 1,
+                ),
                 layout.content,
                 true,
                 false,
@@ -19190,10 +19212,7 @@ mod tests {
             if *width > 0 {
                 x = x.saturating_add(*width);
                 if idx + 1 < widths.len() && x < month_inner.x + month_inner.width {
-                    assert_eq!(
-                        calendar_pointer_date(content, x, monday_row, month),
-                        None
-                    );
+                    assert_eq!(calendar_pointer_date(content, x, monday_row, month), None);
                     x = x.saturating_add(1);
                 }
             }
@@ -19207,7 +19226,10 @@ mod tests {
         app.profile_name = Some("Ada".to_string());
         app.image_runtime_info = Some("images: kitty".to_string());
         app.image_runtime_debug = vec!["probe: on".to_string(), "caps: 4".to_string()];
-        app.lists = vec![test_list(), test_shopping_list(2, "Other", None, None, None, false)];
+        app.lists = vec![
+            test_list(),
+            test_shopping_list(2, "Other", None, None, None, false),
+        ];
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
         let text = terminal_text(&terminal);
@@ -19268,12 +19290,7 @@ mod tests {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
         terminal
             .draw(|frame| {
-                render_editor_field(
-                    frame,
-                    Rect::new(0, 0, 20, 5),
-                    EditorField::Notes,
-                    &editor,
-                )
+                render_editor_field(frame, Rect::new(0, 0, 20, 5), EditorField::Notes, &editor)
             })
             .unwrap();
     }
@@ -19603,7 +19620,10 @@ mod tests {
                 let mut app = App::new(ApiClient::for_tests("https://kramli.test"), true);
                 app.set_inline_images_enabled(true);
                 app.picker.set_protocol_type(ProtocolType::Kitty);
-                app.apply_list_icon_result("folder2".to_string(), Ok(DynamicImage::new_rgba8(2, 2)));
+                app.apply_list_icon_result(
+                    "folder2".to_string(),
+                    Ok(DynamicImage::new_rgba8(2, 2)),
+                );
                 app.lists = vec![test_shopping_list(
                     1,
                     "Groceries",

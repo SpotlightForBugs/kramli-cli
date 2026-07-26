@@ -595,7 +595,9 @@ mod tests {
             )],
             || {
                 let cli = cli_for(Some(Commands::Status));
-                assert!(ensure_first_run_preferences_with(&cli, true, true, |_, _| Ok(true)).is_err());
+                assert!(
+                    ensure_first_run_preferences_with(&cli, true, true, |_, _| Ok(true)).is_err()
+                );
             },
         );
 

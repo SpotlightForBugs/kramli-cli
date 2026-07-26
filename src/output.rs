@@ -235,7 +235,10 @@ fn wrap_ansi_with_prefix(
             continue;
         }
 
-        let ch = content[i..].chars().next().expect("utf-8 character boundary");
+        let ch = content[i..]
+            .chars()
+            .next()
+            .expect("utf-8 character boundary");
         i += ch.len_utf8();
 
         if ch == '\n' {

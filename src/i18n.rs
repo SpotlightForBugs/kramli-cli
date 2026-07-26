@@ -262,10 +262,7 @@ mod tests {
 
     #[test]
     fn try_parse_supported_locale_accepts_primary_language_when_full_tag_is_invalid() {
-        assert_eq!(
-            try_parse_supported_locale("de-").unwrap().to_string(),
-            "de"
-        );
+        assert_eq!(try_parse_supported_locale("de-").unwrap().to_string(), "de");
     }
 
     #[test]

@@ -1591,9 +1591,7 @@ mod tests {
 
             let api = ApiClient::for_tests(&base_url);
             let mut resolver = LinkPreviewResolver::new(api);
-            let previews = resolver
-                .resolve_texts(["https://kramli.de/lists/42"])
-                .await;
+            let previews = resolver.resolve_texts(["https://kramli.de/lists/42"]).await;
             assert_eq!(previews.len(), 1);
             assert!(!previews[0].resolved);
             let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
@@ -1609,7 +1607,10 @@ mod tests {
             let previews = resolver.resolve_texts(["https://kramli.de/lists/42"]).await;
             assert_eq!(previews.len(), 1);
             assert!(!previews[0].resolved);
-            assert_eq!(server.await.expect("empty mock server should finish").len(), 0);
+            assert_eq!(
+                server.await.expect("empty mock server should finish").len(),
+                0
+            );
         })
         .await;
         result.expect("empty resolver responses test should finish within 20s");
@@ -1623,7 +1624,10 @@ mod tests {
             let previews = resolver.resolve_texts(["https://kramli.de/lists/42"]).await;
             assert_eq!(previews.len(), 1);
             assert!(!previews[0].resolved);
-            assert_eq!(server.await.expect("zero-count server should finish").len(), 0);
+            assert_eq!(
+                server.await.expect("zero-count server should finish").len(),
+                0
+            );
         })
         .await;
         result.expect("zero-count delayed metadata test should finish within 20s");

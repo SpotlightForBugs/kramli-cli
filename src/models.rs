@@ -696,7 +696,10 @@ mod tests {
                 states: None,
                 created_at: None,
             };
-            assert!(list.is_note(), "expected {list_type} to count as a note list");
+            assert!(
+                list.is_note(),
+                "expected {list_type} to count as a note list"
+            );
         }
     }
 }

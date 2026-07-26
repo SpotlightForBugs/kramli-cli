@@ -624,7 +624,10 @@ mod tests {
     #[test]
     fn profile_json_with_lang_includes_profile_lang_and_source() {
         let json = profile_json_with_lang(&sample_profile(Some("fr-CA")));
-        assert_eq!(json.get("profile_lang").and_then(Value::as_str), Some("fr-CA"));
+        assert_eq!(
+            json.get("profile_lang").and_then(Value::as_str),
+            Some("fr-CA")
+        );
         assert!(json.get("lang_source").and_then(Value::as_str).is_some());
     }
 
@@ -6157,8 +6160,7 @@ mod tests {
     #[tokio::test]
     async fn api_with_responses_waits_for_mock_server_before_requests() {
         let result = tokio::time::timeout(Duration::from_secs(20), async {
-            let (api, requests) =
-                api_with_responses(vec![json!({"ok": true}).to_string()]).await;
+            let (api, requests) = api_with_responses(vec![json!({"ok": true}).to_string()]).await;
             tokio::task::yield_now().await;
             api.get::<Value>("/mock-ready")
                 .await
@@ -6431,7 +6433,10 @@ mod tests {
         )
         .await;
         let requests = requests.await.expect("test server should finish");
-        assert_eq!(requests, vec!["GET /api/invite-links/InviteToken_cov HTTP/1.1"]);
+        assert_eq!(
+            requests,
+            vec!["GET /api/invite-links/InviteToken_cov HTTP/1.1"]
+        );
     }
 
     #[tokio::test]
@@ -6672,7 +6677,8 @@ mod tests {
     #[tokio::test]
     async fn api_with_responses_waits_for_registration_before_accepting_connections() {
         let result = tokio::time::timeout(Duration::from_secs(20), async {
-            let (api, requests) = api_with_responses(vec![json!({"ready": true}).to_string()]).await;
+            let (api, requests) =
+                api_with_responses(vec![json!({"ready": true}).to_string()]).await;
             tokio::task::yield_now().await;
             api.get::<Value>("/registration-check")
                 .await
