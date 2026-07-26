@@ -969,11 +969,9 @@ where
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), String> {
-    restore_terminal_with_hooks(
-        terminal,
-        disable_raw_mode,
-        |backend| execute!(backend, LeaveAlternateScreen, DisableMouseCapture),
-    )
+    restore_terminal_with_hooks(terminal, disable_raw_mode, |backend| {
+        execute!(backend, LeaveAlternateScreen, DisableMouseCapture)
+    })
 }
 
 fn restore_terminal_with_hooks<B, D, Leave>(
@@ -19748,7 +19746,11 @@ mod tests {
             horizontal: 1,
         });
         app.handle_note_mode_mouse(
-            mouse(MouseEventKind::Down(MouseButton::Left), inner.x + 1, inner.y),
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                inner.x + 1,
+                inner.y,
+            ),
             content,
             true,
         )
@@ -19845,7 +19847,10 @@ mod tests {
         )
         .await
         .expect("same-date drag should clear without update");
-        assert!(requests.await.expect("test server should finish").is_empty());
+        assert!(requests
+            .await
+            .expect("test server should finish")
+            .is_empty());
     }
 
     #[kramli_test_macros::test]
@@ -19917,11 +19922,10 @@ mod tests {
             month: 7,
             day: 10,
         });
-        assert!(
-            !app.move_selected_item_calendar_hours(0)
-                .await
-                .expect("unchanged hour delta should succeed")
-        );
+        assert!(!app
+            .move_selected_item_calendar_hours(0)
+            .await
+            .expect("unchanged hour delta should succeed"));
     }
 
     #[kramli_test_macros::test]
@@ -19942,12 +19946,7 @@ mod tests {
         });
         let widths = calendar_cell_widths(inner.width.saturating_sub(6));
         let monday_row = inner.y.saturating_add(1);
-        let gutter_x = inner.x
-            + widths
-                .iter()
-                .take(1)
-                .sum::<u16>()
-            + 1;
+        let gutter_x = inner.x + widths.iter().take(1).sum::<u16>() + 1;
         assert_eq!(
             calendar_pointer_date(content, gutter_x, monday_row, month),
             None
@@ -20030,7 +20029,9 @@ mod tests {
         }
         let svg = r#"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='#fff'/></svg>"#;
         fs::write(&cache_path, svg.as_bytes()).unwrap();
-        let image = fetch_bootstrap_icon_image(&icon).await.expect("cached icon");
+        let image = fetch_bootstrap_icon_image(&icon)
+            .await
+            .expect("cached icon");
         assert!(image.width() > 0);
         assert!(image.height() > 0);
         let _ = fs::remove_file(cache_path);

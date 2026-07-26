@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, RwLock};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, RwLock};
 
 use serde::Deserialize;
 
