@@ -458,7 +458,15 @@ impl LinkPreviewResolver {
     }
 }
 
-pub(crate) fn parse_internal_kramli_url(value: &str) -> Option<InternalKramliLink> {
+struct PreparedKramliUrl<'a> {
+    host: String,
+    path: &'a str,
+    segments: Vec<&'a str>,
+    fragment: String,
+    parsed: Url,
+}
+
+fn prepare_kramli_url(value: &str) -> Option<PreparedKramliUrl<'_>> {
     let raw = value.trim();
     if raw.contains('\\') || raw.len() < "https://x".len() {
         return None;
@@ -496,29 +504,40 @@ pub(crate) fn parse_internal_kramli_url(value: &str) -> Option<InternalKramliLin
     if contains_encoded_separator(path) {
         return None;
     }
-    let segments: Vec<&str> = if path == "/" {
+    let segments = if path == "/" {
         Vec::new()
     } else {
         path.trim_matches('/').split('/').collect()
     };
-    let fragment = parsed.fragment().unwrap_or_default();
+    let fragment = parsed.fragment().unwrap_or_default().to_string();
 
-    if host == "kram.li" {
-        if segments.len() == 2
-            && segments[0] == "i"
-            && valid_token(segments[1], INVITE_TOKEN_MIN_LEN, INVITE_TOKEN_MAX_LEN)
-        {
-            return Some(invite_link(segments[1]));
-        }
-        if matches!(segments.len(), 1 | 2)
-            && (segments.len() == 1 || segments[1] == "embed")
-            && share_token_from_segment(segments[0]).is_some()
-        {
-            return public_list_link(share_token_from_segment(segments[0])?, fragment);
-        }
-        return None;
+    Some(PreparedKramliUrl {
+        host,
+        path,
+        segments,
+        fragment,
+        parsed,
+    })
+}
+
+fn parse_kram_li_host(segments: &[&str], fragment: &str) -> Option<InternalKramliLink> {
+    if segments.len() == 2
+        && segments[0] == "i"
+        && valid_token(segments[1], INVITE_TOKEN_MIN_LEN, INVITE_TOKEN_MAX_LEN)
+    {
+        return Some(invite_link(segments[1]));
     }
+    if matches!(segments.len(), 1 | 2) && (segments.len() == 1 || segments[1] == "embed") {
+        let token = share_token_from_segment(segments[0])?;
+        return public_list_link(token, fragment);
+    }
+    None
+}
 
+fn parse_kramli_de_list_segments(
+    segments: &[&str],
+    fragment: &str,
+) -> Option<InternalKramliLink> {
     if segments.len() == 3
         && segments[..2] == ["lists", "join"]
         && valid_token(segments[2], INVITE_TOKEN_MIN_LEN, INVITE_TOKEN_MAX_LEN)
@@ -528,9 +547,9 @@ pub(crate) fn parse_internal_kramli_url(value: &str) -> Option<InternalKramliLin
     if matches!(segments.len(), 3 | 4)
         && segments[..2] == ["lists", "s"]
         && (segments.len() == 3 || segments[3] == "embed")
-        && share_token_from_segment(segments[2]).is_some()
     {
-        return public_list_link(share_token_from_segment(segments[2])?, fragment);
+        let token = share_token_from_segment(segments[2])?;
+        return public_list_link(token, fragment);
     }
     if segments.len() == 2
         && segments[0] == "lists"
@@ -554,6 +573,10 @@ pub(crate) fn parse_internal_kramli_url(value: &str) -> Option<InternalKramliLin
         }
         return private_list_link(list_id, fragment);
     }
+    None
+}
+
+fn parse_kramli_de_path(path: &str, fragment: &str, parsed: &Url) -> Option<InternalKramliLink> {
     if path == "/lists" {
         if fragment.is_empty() {
             return Some(InternalKramliLink::new(
@@ -613,6 +636,15 @@ pub(crate) fn parse_internal_kramli_url(value: &str) -> Option<InternalKramliLin
         ));
     }
     None
+}
+
+pub(crate) fn parse_internal_kramli_url(value: &str) -> Option<InternalKramliLink> {
+    let prepared = prepare_kramli_url(value)?;
+    if prepared.host == "kram.li" {
+        return parse_kram_li_host(&prepared.segments, &prepared.fragment);
+    }
+    parse_kramli_de_list_segments(&prepared.segments, &prepared.fragment)
+        .or_else(|| parse_kramli_de_path(prepared.path, &prepared.fragment, &prepared.parsed))
 }
 
 pub(crate) fn extract_internal_kramli_links(text: &str) -> Vec<InternalKramliLink> {
