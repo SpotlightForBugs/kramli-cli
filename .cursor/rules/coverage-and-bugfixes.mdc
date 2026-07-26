@@ -1,0 +1,26 @@
+---
+description: Coverage work may fix in-scope bugs; never touch out-of-scope code
+alwaysApply: true
+---
+
+When adding tests or driving toward coverage in `kramli-cli`:
+
+**Allowed and encouraged**
+
+- Patch production code in your assigned module when tests expose bugs, panics, deadlocks, or hangs.
+- Add a failing test that documents correct behavior, then fix the implementation so it passes.
+- Add minimal test hooks in the module under test when needed to hit error paths.
+
+**Not allowed**
+
+- Work around production bugs in tests only (weaker asserts, skips, ignored tests) to hit a coverage number.
+- Refactor, reformat, or edit modules outside your task scope.
+- Drive-by changes to unrelated files, dependencies, or CI.
+
+**Tests**
+
+- Use `#[kramli_test_macros::test]` / `#[kramli_test_macros::tokio_test]` (never bare `#[test]`).
+- Descriptive test names; no `cov_*` prefix.
+- Never nest `with_env_vars_async`.
+
+See `AGENTS.md` → “Test coverage and bug discovery” for full conventions.
