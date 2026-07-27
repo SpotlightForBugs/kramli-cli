@@ -1429,10 +1429,17 @@ mod tests {
 
     #[kramli_test_macros::tokio_test]
     async fn api_client_new_rejects_foreign_test_tasks() {
-        let result = tokio::spawn(async { ApiClient::new(&Config::load()) })
-            .await
-            .expect("spawn should finish");
-        assert!(result.is_err());
+        crate::test_env::with_env_lock_async(|| async {
+            let result = tokio::spawn(async { ApiClient::new(&Config::load()) })
+                .await
+                .expect("spawn should finish");
+            assert!(result.is_err());
+            let Err(message) = result else {
+                panic!("expected ApiClient::new to fail on a foreign test task");
+            };
+            assert_eq!(message, "test environment belongs to another test");
+        })
+        .await;
     }
 
     #[kramli_test_macros::tokio_test]

@@ -3086,6 +3086,7 @@ mod tests {
 
     #[kramli_test_macros::tokio_test]
     async fn env_var_helper_restores_existing_values() {
+        let prior = std::env::var(TEST_KRAMLI_API_KEY_ENV).ok();
         with_env_vars_async(&[(TEST_KRAMLI_API_KEY_ENV, "before")], || async {
             with_env_vars_async_unlocked(&[(TEST_KRAMLI_API_KEY_ENV, "during")], || async {
                 assert_eq!(
@@ -3102,7 +3103,7 @@ mod tests {
         })
         .await;
 
-        assert!(std::env::var(TEST_KRAMLI_API_KEY_ENV).is_err());
+        assert_eq!(std::env::var(TEST_KRAMLI_API_KEY_ENV).ok(), prior);
     }
 
     #[kramli_test_macros::tokio_test]

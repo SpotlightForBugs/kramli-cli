@@ -1993,24 +1993,7 @@ mod tests {
     }
 
     fn run_output_test_in_pseudo_terminal(test_name: &str) {
-        let exe = std::env::current_exe().expect("current test executable should be available");
-        let script = ["/usr/bin/script", "/bin/script"]
-            .into_iter()
-            .find(|path| std::path::Path::new(path).exists())
-            .expect("script binary should exist for pseudo-terminal coverage");
-        let command = format!(
-            "{} output::tests::{test_name} --exact --nocapture --test-threads=1 --ignored",
-            exe.display()
-        );
-        let status = std::process::Command::new(script)
-            .args(["-q", "-c", &command])
-            .arg("/dev/null")
-            .status()
-            .expect("pseudo-terminal subprocess should spawn");
-        assert!(
-            status.success(),
-            "pseudo-terminal test {test_name} failed with {status:?}"
-        );
+        crate::test_env::run_test_in_pseudo_terminal(&format!("output::tests::{test_name}"));
     }
 
     #[kramli_test_macros::test]

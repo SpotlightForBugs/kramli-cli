@@ -204,6 +204,64 @@ where
         .await
 }
 
+/// Run an ignored unit test under a pseudo-TTY via `script`.
+///
+/// Uses GNU `script -c` (+ optional `timeout`) on Linux, and BSD
+/// `script file command args...` on macOS/BSD.
+pub(crate) fn run_test_in_pseudo_terminal(test_filter: &str) {
+    let exe = std::env::current_exe().expect("current test executable should be available");
+    let script = ["/usr/bin/script", "/bin/script"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists())
+        .expect("script binary should exist for pseudo-terminal coverage");
+
+    let status = if cfg!(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )) {
+        std::process::Command::new(script)
+            .arg("-q")
+            .arg("/dev/null")
+            .arg(&exe)
+            .args([
+                test_filter,
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "--ignored",
+            ])
+            .status()
+            .expect("pseudo-terminal subprocess should spawn")
+    } else {
+        let command = format!(
+            "{} {test_filter} --exact --nocapture --test-threads=1 --ignored",
+            exe.display()
+        );
+        let timeout = ["timeout", "gtimeout"]
+            .into_iter()
+            .find(|name| std::process::Command::new(name).arg("--version").output().is_ok());
+        let mut child = if let Some(timeout) = timeout {
+            let mut cmd = std::process::Command::new(timeout);
+            cmd.args([&test_timeout_arg(), script, "-q", "-c", &command, "/dev/null"]);
+            cmd
+        } else {
+            let mut cmd = std::process::Command::new(script);
+            cmd.args(["-q", "-c", &command, "/dev/null"]);
+            cmd
+        };
+        child
+            .status()
+            .expect("pseudo-terminal subprocess should spawn")
+    };
+
+    assert!(
+        status.success(),
+        "pseudo-terminal test {test_filter} failed with {status:?}"
+    );
+}
+
 #[kramli_test_macros::tokio_test]
 async fn env_owner_rejects_foreign_tasks() {
     with_env_lock_async(|| async {

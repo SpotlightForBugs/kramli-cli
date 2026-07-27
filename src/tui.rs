@@ -16331,30 +16331,7 @@ mod tests {
     }
 
     fn run_tui_test_in_pseudo_terminal(test_name: &str) {
-        let exe = std::env::current_exe().expect("current test executable should be available");
-        let script = ["/usr/bin/script", "/bin/script"]
-            .into_iter()
-            .find(|path| std::path::Path::new(path).exists())
-            .expect("script binary should exist for pseudo-terminal coverage");
-        let command = format!(
-            "{} tui::tests::{test_name} --exact --nocapture --test-threads=1 --ignored",
-            exe.display()
-        );
-        let status = std::process::Command::new("timeout")
-            .args([
-                &crate::test_env::test_timeout_arg(),
-                script,
-                "-q",
-                "-c",
-                &command,
-                "/dev/null",
-            ])
-            .status()
-            .expect("pseudo-terminal subprocess should spawn");
-        assert!(
-            status.success(),
-            "pseudo-terminal test {test_name} failed with {status:?}"
-        );
+        crate::test_env::run_test_in_pseudo_terminal(&format!("tui::tests::{test_name}"));
     }
 
     #[kramli_test_macros::tokio_test]
@@ -18303,7 +18280,10 @@ mod tests {
         app.mode = ViewMode::List;
         app.loading_items_for = Some(1);
         terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
-        assert!(terminal_text(&terminal).contains("Loading items"));
+        assert!(terminal_text(&terminal).contains(&tr_args(
+            "tui-items-loading",
+            &[("list", app.selected_list_display_name())],
+        )));
     }
 
     #[kramli_test_macros::test]
