@@ -55,7 +55,7 @@ Keep pull requests free of Cursor/Bugbot branding:
 
 The `clean-pr` GitHub Actions workflow enforces this server-side:
 
-- **`fix-commits` job** — rewrites any `cursoragent@cursor.com` commits on the PR branch (author taken from a human `Co-authored-by` trailer or the PR opener), strips Cursor co-author lines, and force-pushes the branch.
+- **`fix-commits` job** — reassigns `cursoragent@cursor.com` authorship only when the commit message already includes a human `Co-authored-by` trailer. Sole Cursor-authored commits are left unchanged. Cursor co-author trailers are stripped when reassignment happens.
 - **`clean` job** — scrubs PR descriptions and deletes Bugbot comments from the `cursor` bot.
 
 Fork PRs may not be rewriteable by `GITHUB_TOKEN` (same-repo branches only).
