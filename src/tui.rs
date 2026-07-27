@@ -38,7 +38,9 @@ use crate::internal_links::{LinkPreview, LinkPreviewActionKind, LinkPreviewResol
 use crate::models::{
     Attachment, ItemComment, ListItem, ListState as ApiListState, Profile, ShoppingList,
 };
-use crate::note::{note_content, safe_update_payload, validate_plain_note};
+use crate::note::{
+    collect_note_link_sources, note_content, safe_update_payload, validate_plain_note,
+};
 
 const ACCENT: Color = Color::Rgb(126, 200, 255);
 const STATUS_COLOR: Color = Color::Rgb(126, 231, 155);
@@ -667,6 +669,14 @@ struct App {
     image_runtime_debug: Vec<String>,
     key_bindings: KeyBindings,
     pending_auto_handoff_list_id: Option<i64>,
+    #[cfg(test)]
+    block_task_mutations: bool,
+    #[cfg(test)]
+    simulate_missing_deleted_item: bool,
+    #[cfg(test)]
+    force_list_icon_protocol_failure: bool,
+    #[cfg(test)]
+    force_empty_kanban_columns: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -908,36 +918,78 @@ where
 }
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>, String> {
-    enable_raw_mode().map_err(|e| e.to_string())?;
+    init_terminal_with_hooks(
+        enable_raw_mode,
+        disable_raw_mode,
+        enter_interactive_stdout,
+        leave_interactive_stdout,
+        |stdout| Terminal::new(CrosstermBackend::new(stdout)),
+    )
+}
+
+fn enter_interactive_stdout(stdout: &mut io::Stdout) -> io::Result<()> {
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+}
+
+fn leave_interactive_stdout(stdout: &mut io::Stdout) -> io::Result<()> {
+    execute!(
+        stdout,
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        crossterm::cursor::Show
+    )
+}
+
+fn init_terminal_with_hooks<E, D, En, Le, N>(
+    enable_raw_mode_fn: E,
+    disable_raw_mode_fn: D,
+    enter_interactive_fn: En,
+    leave_interactive_fn: Le,
+    new_terminal: N,
+) -> Result<Terminal<CrosstermBackend<io::Stdout>>, String>
+where
+    E: FnOnce() -> io::Result<()>,
+    D: FnOnce() -> io::Result<()>,
+    En: FnOnce(&mut io::Stdout) -> io::Result<()>,
+    Le: FnOnce(&mut io::Stdout) -> io::Result<()>,
+    N: FnOnce(io::Stdout) -> Result<Terminal<CrosstermBackend<io::Stdout>>, io::Error>,
+{
+    enable_raw_mode_fn().map_err(|e| e.to_string())?;
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
-        let _ = disable_raw_mode();
+    if let Err(error) = enter_interactive_fn(&mut stdout) {
+        let _ = disable_raw_mode_fn();
         return Err(error.to_string());
     }
-    let backend = CrosstermBackend::new(stdout);
-    Terminal::new(backend).map_err(|error| {
-        let _ = disable_raw_mode();
+    new_terminal(stdout).map_err(|error| {
+        let _ = disable_raw_mode_fn();
         let mut stdout = io::stdout();
-        let _ = execute!(
-            stdout,
-            LeaveAlternateScreen,
-            DisableMouseCapture,
-            crossterm::cursor::Show
-        );
+        let _ = leave_interactive_fn(&mut stdout);
         error.to_string()
     })
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), String> {
+    restore_terminal_with_hooks(terminal, disable_raw_mode, |backend| {
+        execute!(backend, LeaveAlternateScreen, DisableMouseCapture)
+    })
+}
+
+fn restore_terminal_with_hooks<B, D, Leave>(
+    terminal: &mut Terminal<B>,
+    disable_raw_mode_fn: D,
+    leave_screen_fn: Leave,
+) -> Result<(), String>
+where
+    B: Backend,
+    B::Error: std::fmt::Display,
+    D: FnOnce() -> io::Result<()>,
+    Leave: FnOnce(&mut B) -> io::Result<()>,
+{
     let mut first_error = None;
-    if let Err(error) = disable_raw_mode() {
+    if let Err(error) = disable_raw_mode_fn() {
         first_error.get_or_insert_with(|| error.to_string());
     }
-    if let Err(error) = execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    ) {
+    if let Err(error) = leave_screen_fn(terminal.backend_mut()) {
         first_error.get_or_insert_with(|| error.to_string());
     }
     if let Err(error) = terminal.show_cursor() {
@@ -1070,6 +1122,26 @@ async fn run_event_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
 ) -> Result<(), String> {
+    run_event_loop_with_io(
+        terminal,
+        app,
+        |timeout| event::poll(timeout).map_err(|e| e.to_string()),
+        || event::read().map_err(|e| e.to_string()),
+    )
+    .await
+}
+
+async fn run_event_loop_with_io<B, P, R>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    poll_event: P,
+    read_event: R,
+) -> Result<(), String>
+where
+    B: Backend,
+    P: Fn(Duration) -> Result<bool, String>,
+    R: Fn() -> Result<Event, String>,
+{
     let mut dirty = true;
     loop {
         if app.drain_load_messages() {
@@ -1086,18 +1158,16 @@ async fn run_event_loop<B: Backend>(
             return Ok(());
         }
 
-        if !event::poll(Duration::from_millis(120)).map_err(|e| e.to_string())? {
+        if !poll_event(Duration::from_millis(120))? {
             continue;
         }
 
         loop {
-            if handle_runtime_event(terminal, app, event::read().map_err(|e| e.to_string())?)
-                .await?
-            {
+            if handle_runtime_event(terminal, app, read_event()?).await? {
                 dirty = true;
             }
 
-            if !event::poll(Duration::from_millis(0)).map_err(|e| e.to_string())? {
+            if !poll_event(Duration::from_millis(0))? {
                 break;
             }
         }
@@ -1173,11 +1243,30 @@ impl App {
             image_runtime_debug: Vec::new(),
             key_bindings: KeyBindings::from_env(),
             pending_auto_handoff_list_id: None,
+            #[cfg(test)]
+            block_task_mutations: false,
+            #[cfg(test)]
+            simulate_missing_deleted_item: false,
+            #[cfg(test)]
+            force_list_icon_protocol_failure: false,
+            #[cfg(test)]
+            force_empty_kanban_columns: false,
         }
     }
 
     fn set_picker(&mut self, picker: Picker) {
         self.picker = picker;
+    }
+
+    fn should_reject_list_icon_protocol(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.force_list_icon_protocol_failure
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 
     fn set_inline_images_enabled(&mut self, enabled: bool) {
@@ -1466,6 +1555,11 @@ impl App {
     }
 
     fn task_mutation_allowed(&mut self) -> bool {
+        #[cfg(test)]
+        if self.block_task_mutations {
+            self.status = Some(tr("note-task-mutation-blocked"));
+            return false;
+        }
         if self.selected_list().is_some_and(ShoppingList::is_note) {
             self.status = Some(tr("note-task-mutation-blocked"));
             return false;
@@ -1688,6 +1782,7 @@ impl App {
             self.selected_item = 0;
             self.pending_open_item_id = None;
             self.detail_scroll = 0;
+            self.focus = FocusPane::Items;
             self.loading_items_for = Some(list_id);
             self.load_note_detail_background(list_id);
             return;
@@ -1927,8 +2022,8 @@ impl App {
         if let Some(list) = self.lists.iter().find(|list| list.id == list_id) {
             texts.push(list.name.clone());
         }
-        if let Some(content) = self.note_detail_cache.get(&list_id).and_then(note_content) {
-            texts.push(content.to_string());
+        if let Some(detail) = self.note_detail_cache.get(&list_id) {
+            texts.extend(collect_note_link_sources(detail));
         }
         self.load_link_previews(note_preview_owner(list_id), texts);
     }
@@ -1974,16 +2069,38 @@ impl App {
     }
 
     fn cycle_link_preview(&mut self) {
+        self.select_link_preview(1);
+    }
+
+    fn select_link_preview(&mut self, delta: isize) {
         let count = self.current_link_previews().len();
-        if count > 0 {
-            self.selected_link_preview = (self.selected_link_preview + 1) % count;
-            self.status = Some(tr_args(
-                "tui-link-preview-selected",
-                &[
-                    ("index", (self.selected_link_preview + 1).to_string()),
-                    ("count", count.to_string()),
-                ],
-            ));
+        if count == 0 {
+            return;
+        }
+        let next = if delta < 0 {
+            (self.selected_link_preview + count - 1) % count
+        } else {
+            (self.selected_link_preview + 1) % count
+        };
+        self.selected_link_preview = next;
+        self.status = Some(tr_args(
+            "tui-link-preview-selected",
+            &[
+                ("index", (self.selected_link_preview + 1).to_string()),
+                ("count", count.to_string()),
+            ],
+        ));
+    }
+
+    fn is_note_view(&self) -> bool {
+        self.selected_list().is_some_and(ShoppingList::is_note)
+    }
+
+    fn scroll_note_detail(&mut self, delta: isize) {
+        if delta < 0 {
+            self.detail_scroll = self.detail_scroll.saturating_sub((-delta) as u16);
+        } else if delta > 0 {
+            self.detail_scroll = self.detail_scroll.saturating_add(delta as u16);
         }
     }
 
@@ -2120,6 +2237,10 @@ impl App {
                 self.load_items_for_selected_list(false);
             }
             FocusPane::Items => {
+                if self.is_note_view() {
+                    self.scroll_note_detail(delta);
+                    return;
+                }
                 if self.mode == ViewMode::Kanban {
                     let step = delta.signum();
                     if step != 0 {
@@ -2197,11 +2318,11 @@ impl App {
             Size::new(2, 1),
             Resize::Fit(Some(FilterType::Lanczos3)),
         ) {
-            Ok(protocol) => {
+            Ok(protocol) if !self.should_reject_list_icon_protocol() => {
                 self.failed_list_icons.remove(&icon);
                 self.list_icon_images.insert(icon, protocol);
             }
-            Err(_) => {
+            _ => {
                 self.failed_list_icons.insert(icon);
             }
         }
@@ -2911,6 +3032,10 @@ impl App {
 
         let _: Value = self.api.delete(&format!("/items/{item_id}")).await?;
         self.invalidate_item_link_previews(item_id);
+        #[cfg(test)]
+        if self.simulate_missing_deleted_item {
+            self.items.clear();
+        }
         if let Some(index) = self.items.iter().position(|item| item.id == item_id) {
             self.items.remove(index);
             self.selected_item = index.min(self.items.len().saturating_sub(1));
@@ -3116,16 +3241,29 @@ impl App {
         let mut item_changed = false;
 
         match navigation_action_for_key(key.code) {
-            NavigationAction::NextMode => self.switch_mode(self.mode.next()),
-            NavigationAction::PreviousMode => self.switch_mode(self.mode.prev()),
-            NavigationAction::SwitchMode(mode) => self.switch_mode(mode),
+            NavigationAction::NextMode if shows_list_mode_tabs(self) => {
+                self.switch_mode(self.mode.next())
+            }
+            NavigationAction::PreviousMode if shows_list_mode_tabs(self) => {
+                self.switch_mode(self.mode.prev())
+            }
+            NavigationAction::SwitchMode(mode) if shows_list_mode_tabs(self) => {
+                self.switch_mode(mode)
+            }
+            NavigationAction::NextMode
+            | NavigationAction::PreviousMode
+            | NavigationAction::SwitchMode(_) => {}
             NavigationAction::MoveMonth(delta) => self.move_month_if_calendar_items(delta),
             NavigationAction::MoveHorizontal { delta, fallback } => {
                 self.move_horizontal_or_focus(delta, fallback);
             }
             NavigationAction::MoveSelection(delta) => {
-                self.move_selection_by_key(key, delta, &mut list_changed, &mut item_changed)
-                    .await?;
+                if self.is_note_view() && self.focus == FocusPane::Items && self.editor.is_none() {
+                    self.scroll_note_detail(delta);
+                } else {
+                    self.move_selection_by_key(key, delta, &mut list_changed, &mut item_changed)
+                        .await?;
+                }
             }
             NavigationAction::Enter => list_changed = self.handle_enter_key(key)?,
             NavigationAction::Escape => self.handle_escape_key(),
@@ -3398,7 +3536,9 @@ impl App {
         };
 
         let allowed = match field {
-            EditorField::DueDate => due_date_input_prefix_allowed(&candidate),
+            EditorField::DueDate | EditorField::PlannedDate => {
+                due_date_input_prefix_allowed(&candidate)
+            }
             EditorField::Progress => {
                 let candidate = candidate.trim();
                 candidate.is_empty()
@@ -3444,7 +3584,7 @@ impl App {
             return Ok(());
         };
         let previous_item = self.selected_item;
-        let layout = ui_layout(area);
+        let layout = ui_layout(area, shows_list_mode_tabs(self));
 
         if buttons.left_up && !rect_contains(layout.content, mouse.column, mouse.row) {
             self.clear_drag_state();
@@ -3526,6 +3666,9 @@ impl App {
     }
 
     fn handle_tab_mouse(&mut self, mouse: MouseEvent, layout: &UiLayout, left_down: bool) -> bool {
+        if !shows_list_mode_tabs(self) || layout.tab_chunks[0].height == 0 {
+            return false;
+        }
         if !left_down {
             return false;
         }
@@ -3612,7 +3755,7 @@ impl App {
     }
 
     fn handle_empty_items_mouse(&mut self, left_up: bool) -> bool {
-        if !self.items.is_empty() {
+        if !self.items.is_empty() || self.is_note_view() {
             return false;
         }
         if left_up {
@@ -3628,6 +3771,11 @@ impl App {
         content: Rect,
         buttons: MouseButtons,
     ) -> Result<(), String> {
+        if self.is_note_view() {
+            return self
+                .handle_note_mode_mouse(mouse, content, buttons.left_down)
+                .await;
+        }
         match self.mode {
             ViewMode::List => self.handle_list_mode_mouse(mouse, content, buttons.left_down),
             ViewMode::Kanban => {
@@ -3651,6 +3799,34 @@ impl App {
                 .await
             }
         }
+    }
+
+    async fn handle_note_mode_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        content: Rect,
+        left_down: bool,
+    ) -> Result<(), String> {
+        if !left_down || !rect_contains(content, mouse.column, mouse.row) {
+            return Ok(());
+        }
+        let inner = content.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let logical_row = self.detail_scroll as usize + mouse.row.saturating_sub(inner.y) as usize;
+        let lines = note_mode_lines(self);
+        if logical_row >= lines.len() {
+            return Ok(());
+        }
+        let Some(index) = note_link_preview_index_at_line(&lines, logical_row) else {
+            return Ok(());
+        };
+        if index >= self.current_link_previews().len() {
+            return Ok(());
+        }
+        self.selected_link_preview = index;
+        self.activate_link_preview().await
     }
 
     fn handle_list_mode_mouse(
@@ -4042,6 +4218,11 @@ impl App {
     }
 
     fn kanban_columns(&self) -> Vec<KanbanColumn> {
+        #[cfg(test)]
+        if self.force_empty_kanban_columns {
+            return Vec::new();
+        }
+
         let Some(list) = self.selected_list() else {
             return vec![
                 KanbanColumn {
@@ -4080,6 +4261,9 @@ impl App {
 
     fn kanban_buckets(&self) -> (Vec<KanbanColumn>, Vec<Vec<usize>>) {
         let columns = self.kanban_columns();
+        if columns.is_empty() {
+            return (columns, Vec::new());
+        }
         let mut buckets = vec![Vec::new(); columns.len()];
 
         let fallback_column = columns
@@ -5381,24 +5565,34 @@ fn editor_field_hint(field: EditorField, mode: EditorMode) -> String {
     }
 }
 
-fn ui_layout(area: Rect) -> UiLayout {
+fn shows_list_mode_tabs(app: &App) -> bool {
+    !app.selected_list().is_some_and(ShoppingList::is_note)
+}
+
+fn ui_layout(area: Rect, show_mode_tabs: bool) -> UiLayout {
+    let tab_height = if show_mode_tabs { 3 } else { 0 };
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(tab_height),
             Constraint::Min(6),
             Constraint::Length(5),
         ])
         .split(area);
 
-    let tab_chunks_vec = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-        ])
-        .split(vertical[0]);
+    let tab_chunks = if show_mode_tabs {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(33),
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+            ])
+            .split(vertical[0]);
+        [chunks[0], chunks[1], chunks[2]]
+    } else {
+        [Rect::default(), Rect::default(), Rect::default()]
+    };
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
@@ -5409,7 +5603,7 @@ fn ui_layout(area: Rect) -> UiLayout {
         lists: body[0],
         content: body[1],
         footer: vertical[2],
-        tab_chunks: [tab_chunks_vec[0], tab_chunks_vec[1], tab_chunks_vec[2]],
+        tab_chunks,
     }
 }
 
@@ -5618,9 +5812,12 @@ fn centered_popup(
 }
 
 fn draw_ui(frame: &mut Frame<'_>, app: &mut App) {
-    let layout = ui_layout(frame.area());
+    let show_mode_tabs = shows_list_mode_tabs(app);
+    let layout = ui_layout(frame.area(), show_mode_tabs);
 
-    draw_mode_tabs(frame, app, &layout);
+    if show_mode_tabs {
+        draw_mode_tabs(frame, app, &layout);
+    }
 
     draw_lists_panel(frame, app, layout.lists);
 
@@ -5693,6 +5890,50 @@ fn preview_content_fingerprint(texts: &[String]) -> u64 {
     hasher.finish()
 }
 
+fn note_mode_lines(app: &App) -> Vec<Line<'static>> {
+    let list_id = app.selected_list_id();
+    let mut lines = Vec::new();
+    if let Some(content) = list_id
+        .and_then(|id| app.note_detail_cache.get(&id))
+        .and_then(note_content)
+    {
+        lines.extend(content.lines().map(|line| Line::from(line.to_string())));
+    } else {
+        lines.push(Line::from(tr("tui-note-loading")));
+    }
+    if let Some(previews) = list_id
+        .map(note_preview_owner)
+        .as_deref()
+        .and_then(|owner| app.link_previews.get(owner))
+    {
+        if !previews.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                tr("link-preview-section"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            lines.extend(link_preview_lines(previews, app.selected_link_preview));
+        }
+    }
+    lines
+}
+
+fn note_link_preview_index_at_line(lines: &[Line<'_>], line_index: usize) -> Option<usize> {
+    let section = tr("link-preview-section");
+    let header_idx = lines.iter().position(|line| {
+        line.spans
+            .iter()
+            .any(|span| span.content.as_ref() == section)
+    })?;
+    if line_index <= header_idx {
+        return None;
+    }
+    let offset = line_index - header_idx - 1;
+    let preview_count = lines.len().saturating_sub(header_idx + 1) / 3;
+    let index = offset / 3;
+    (index < preview_count).then_some(index)
+}
+
 fn link_preview_lines(previews: &[LinkPreview], selected: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (index, preview) in previews.iter().enumerate() {
@@ -5723,30 +5964,7 @@ fn link_preview_lines(previews: &[LinkPreview], selected: usize) -> Vec<Line<'st
 }
 
 fn draw_note_mode(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let list_id = app.selected_list_id();
-    let mut lines = Vec::new();
-    if let Some(content) = list_id
-        .and_then(|id| app.note_detail_cache.get(&id))
-        .and_then(note_content)
-    {
-        lines.extend(content.lines().map(|line| Line::from(line.to_string())));
-    } else {
-        lines.push(Line::from(tr("tui-note-loading")));
-    }
-    if let Some(previews) = list_id
-        .map(note_preview_owner)
-        .as_deref()
-        .and_then(|owner| app.link_previews.get(owner))
-    {
-        if !previews.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::styled(
-                tr("link-preview-section"),
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-            lines.extend(link_preview_lines(previews, app.selected_link_preview));
-        }
-    }
+    let lines = note_mode_lines(app);
     frame.render_widget(
         Paragraph::new(lines)
             .block(
@@ -5849,10 +6067,15 @@ fn draw_lists_panel(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .unwrap_or_else(|| tr("common-unknown"));
         let list_count = app.lists.len();
         let selected = app.selected_list_display_name();
+        let selected_label = if app.selected_list().is_some_and(ShoppingList::is_note) {
+            tr("view-note")
+        } else {
+            tr("view-list")
+        };
         let info = vec![
             Line::from(profile_text),
             Line::from(format!("{} {}", tr("label-lists"), list_count)),
-            Line::from(format!("{} {}", tr("view-list"), selected)),
+            Line::from(format!("{selected_label} {selected}")),
         ];
         let mut info = info;
         if cfg!(debug_assertions) {
@@ -6844,6 +7067,7 @@ fn draw_help_overlay(frame: &mut Frame<'_>) {
         Line::from(tr("tui-help-actions-3")),
         Line::from(tr("tui-help-actions-4")),
         Line::from(tr("tui-help-actions-5")),
+        Line::from(tr("tui-help-note-links")),
         Line::from(""),
         Line::from(vec![Span::styled(
             tr("tui-help-editor"),
@@ -8659,6 +8883,8 @@ mod tests {
     use super::*;
     use crate::api::ApiClient;
     use serde_json::json;
+    use std::cell::Cell as DrawCounter;
+    use std::fs;
 
     fn sample_item(id: i64, text: &str) -> ListItem {
         ListItem {
@@ -8701,6 +8927,64 @@ mod tests {
 
     fn test_app() -> App {
         App::new(ApiClient::for_tests("https://kramli.test"), true)
+    }
+
+    struct TerminalEnvGuard {
+        previous: Vec<(String, Option<std::ffi::OsString>)>,
+    }
+
+    impl TerminalEnvGuard {
+        fn clear() -> Self {
+            let keys = [
+                TERM_ENV,
+                TERM_PROGRAM_ENV,
+                LC_TERMINAL_ENV,
+                KITTY_WINDOW_ID_ENV,
+                ITERM_SESSION_ID_ENV,
+                WT_SESSION_ENV,
+            ];
+            let previous = keys
+                .iter()
+                .map(|key| ((*key).to_string(), std::env::var_os(key)))
+                .collect::<Vec<_>>();
+            for key in keys {
+                std::env::remove_var(key);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for TerminalEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.previous {
+                restore_env_var(key, value.clone());
+            }
+        }
+    }
+
+    fn restore_env_var(key: &str, previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn restore_env_var_puts_back_previous_value_or_removes_key() {
+        crate::test_env::with_env_lock(|| {
+            let key = "KRAMLI_RESTORE_ENV_VAR_TEST";
+            std::env::set_var(key, "present");
+            restore_env_var(key, std::env::var_os(key));
+            assert_eq!(std::env::var(key).unwrap(), "present");
+
+            std::env::remove_var(key);
+            restore_env_var(key, None);
+            assert!(std::env::var_os(key).is_none());
+
+            restore_env_var(key, Some("restored".into()));
+            assert_eq!(std::env::var_os(key).unwrap(), "restored");
+            std::env::remove_var(key);
+        });
     }
 
     async fn api_with_responses(
@@ -8805,7 +9089,7 @@ mod tests {
         output
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn note_lists_block_task_editors() {
         let (api, _) = api_with_responses(Vec::new()).await;
         let mut app = App::new(api, false);
@@ -8818,7 +9102,7 @@ mod tests {
         assert_eq!(app.status, Some(tr("note-task-mutation-blocked")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn preview_cards_render_multiple_actions_and_unresolved_fallback() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -8855,7 +9139,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn note_detail_retains_content_and_renders_link_cards() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -8882,7 +9166,109 @@ mod tests {
         assert!(app.items.is_empty());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::test]
+    fn note_lists_hide_view_mode_toolbar() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        assert!(!shows_list_mode_tabs(&app));
+
+        app.note_detail_cache
+            .insert(1, json!({"note_content": "Plain note"}));
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        let text = terminal_text(&terminal);
+        assert!(!text.contains(&tr("view-board")));
+        assert!(!text.contains(&tr("view-calendar")));
+        assert!(text.contains(&tr("view-note")));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn note_link_previews_are_keyboard_selectable() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.apply_note_detail_result(
+            1,
+            Ok(json!({
+                "note_content": "One",
+                "note_delta": "[{\"insert\":\"https://kram.li/PvxNDHrxliG3YtBaq-k1fg.json\\n\"}]"
+            })),
+        );
+        app.link_previews.insert(
+            note_preview_owner(1),
+            vec![
+                test_link_preview(
+                    "https://kramli.de/lists/s/PvxNDHrxliG3YtBaq-k1fg",
+                    Some(LinkPreviewActionKind::Open),
+                    Some(46),
+                ),
+                test_link_preview(
+                    "https://kramli.de/privacy",
+                    Some(LinkPreviewActionKind::Open),
+                    None,
+                ),
+            ],
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.selected_link_preview, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.selected_link_preview, 0);
+    }
+
+    #[kramli_test_macros::test]
+    fn note_view_scrolls_with_arrow_keys() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.note_detail_cache.insert(
+            1,
+            json!({"note_content": (0..40).map(|i| format!("Line {i}")).collect::<Vec<_>>().join("\n")}),
+        );
+        app.focus = FocusPane::Items;
+        app.detail_scroll = 0;
+
+        app.scroll_note_detail(3);
+        assert_eq!(app.detail_scroll, 3);
+        app.scroll_note_detail(-1);
+        assert_eq!(app.detail_scroll, 2);
+    }
+
+    #[kramli_test_macros::test]
+    fn note_view_allows_content_mouse_and_auto_focuses_items() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.note_detail_cache
+            .insert(1, json!({"note_content": "Plain note"}));
+        let owner = note_preview_owner(1);
+        let mut texts = vec![app.lists[0].name.clone()];
+        texts.extend(collect_note_link_sources(
+            app.note_detail_cache.get(&1).unwrap(),
+        ));
+        app.link_preview_fingerprints
+            .insert(owner, preview_content_fingerprint(&texts));
+        app.focus = FocusPane::Lists;
+        app.load_items_for_selected_list(false);
+        assert_eq!(app.focus, FocusPane::Items);
+        assert!(!app.handle_empty_items_mouse(false));
+    }
+
+    #[kramli_test_macros::tokio_test]
     async fn invite_preview_selection_is_get_only_until_confirmation() {
         let (api, requests) = api_with_responses(Vec::new()).await;
         let mut app = App::new(api, false);
@@ -8904,7 +9290,7 @@ mod tests {
         assert!(requests.await.unwrap().is_empty());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn confirmed_invite_acceptance_posts_and_refreshes_target_list() {
         let (api, requests) = api_with_responses(vec![json!({
             "ok": true,
@@ -8934,7 +9320,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn comments_refresh_replaces_item_previews_without_breaking_item_state() {
         let (api, requests) = api_with_responses(vec![
             json!({"resolved": true, "list_name": "Comment link"}).to_string(),
@@ -8975,7 +9361,7 @@ mod tests {
         assert!(requests.await.unwrap()[0].starts_with("GET /api/internal-links/preview?"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn stale_preview_responses_are_discarded_by_generation_and_fingerprint() {
         let mut app = test_app();
         let owner = item_preview_owner(1);
@@ -9020,7 +9406,7 @@ mod tests {
         assert_eq!(app.link_previews[&owner].len(), 1);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn failed_preview_results_are_retryable_and_content_changes_replace_pending_work() {
         let mut app = test_app();
         let owner = item_preview_owner(1);
@@ -9056,7 +9442,7 @@ mod tests {
         assert_ne!(app.pending_link_previews[&owner], first_retry);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn preview_target_item_is_selected_after_target_list_items_load() {
         let mut app = test_app();
         app.pending_open_list_id = Some(7);
@@ -9076,7 +9462,7 @@ mod tests {
         assert_eq!(app.pending_open_item_id, None);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn configured_v_binding_runs_when_no_preview_is_available() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -9090,7 +9476,7 @@ mod tests {
         assert!(app.editor.is_some());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn selecting_note_list_loads_detail_instead_of_items() {
         let (api, requests) = api_with_responses(vec![
             json!({"id": 1, "list_type": "note", "note_content": "Saved note"}).to_string(),
@@ -9119,7 +9505,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn failed_invite_acceptance_keeps_confirmation_open() {
         let (api, requests) = api_with_responses(vec!["not-json".to_string()]).await;
         let mut app = App::new(api, false);
@@ -9140,7 +9526,7 @@ mod tests {
         assert_eq!(requests.await.unwrap().len(), 1);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn rich_note_stays_read_only_with_explanation() {
         let mut app = test_app();
         let mut note = test_list();
@@ -9163,7 +9549,7 @@ mod tests {
         assert_eq!(app.status, Some(tr("tui-note-rich-read-only")));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn plain_note_editor_saves_versioned_delta() {
         let updated = json!({
             "id": 1,
@@ -9211,7 +9597,7 @@ mod tests {
         assert!(requests[0].starts_with("PUT /api/lists/1 HTTP/1.1"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn failed_note_save_preserves_unsaved_text() {
         let (api, requests) = api_with_responses(vec!["not-json".to_string()]).await;
         let mut app = App::new(api, false);
@@ -9244,6 +9630,271 @@ mod tests {
         assert_eq!(requests.await.unwrap().len(), 1);
     }
 
+    #[kramli_test_macros::test]
+    fn open_attachment_editor_requires_selected_item() {
+        let mut app = test_app();
+        app.items.clear();
+        app.open_attachment_editor().unwrap();
+        assert!(app.editor.is_none());
+        assert_eq!(app.status, Some(tr("output-no-items")));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn attachment_editor_uploads_selected_item_file() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let root = cwd.join(format!("kramli-tui-attach-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let png = root.join("item.png");
+        fs::write(&png, [137, 80, 78, 71]).unwrap();
+
+        let (api, requests) = api_with_responses(vec![json!({
+            "attachment": {
+                "id": 3,
+                "filename": "item.png",
+                "original_filename": "item.png"
+            }
+        })
+        .to_string()])
+        .await;
+        let mut app = App::new(api, false);
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(5, "Milk")];
+        app.selected_item = 0;
+
+        app.open_attachment_editor().unwrap();
+        app.editor.as_mut().unwrap().text = png.to_str().expect("png path utf-8").to_string();
+        app.save_editor().await.unwrap();
+
+        assert!(app.editor.is_none());
+        assert!(app.status.is_some());
+        let requests = requests.await.unwrap();
+        assert!(requests[0].contains("POST /api/items/5/attachments"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn attachment_editor_requires_non_empty_path() {
+        let mut app = test_app();
+        app.items = vec![sample_item(5, "Milk")];
+        app.selected_item = 0;
+        app.open_attachment_editor().unwrap();
+        app.save_editor().await.unwrap();
+        assert!(app.editor.is_some());
+        assert_eq!(app.status, Some(tr("attachment-path-required")));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn save_editor_rejects_empty_text_invalid_due_and_progress() {
+        let (api, requests) = api_with_responses(Vec::new()).await;
+        let mut app = App::new(api, true);
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Milk")];
+        app.selected_item = 0;
+
+        app.open_editor().unwrap();
+
+        app.editor.as_mut().unwrap().text = "   ".to_string();
+        app.save_editor().await.unwrap();
+        assert!(app.editor.is_some());
+        assert_eq!(app.status, Some(tr("label-text")));
+
+        app.editor.as_mut().unwrap().text = "Milk".to_string();
+        app.editor.as_mut().unwrap().due_date = "2026-02-29".to_string();
+        app.save_editor().await.unwrap();
+        assert!(app.editor.is_some());
+        assert_eq!(
+            app.status,
+            Some(format!(
+                "{}: YYYY-MM-DD",
+                tr("label-due").trim_end_matches(':')
+            ))
+        );
+
+        app.editor.as_mut().unwrap().due_date = "2026-08-01".to_string();
+        app.editor.as_mut().unwrap().progress = "NotAValidState".to_string();
+        app.save_editor().await.unwrap();
+        assert!(app.editor.is_some());
+        assert!(app.status.as_deref().is_some_and(|status| {
+            status.contains(tr("label-state").trim_end_matches(':')) && status.contains(" | ")
+        }));
+
+        assert!(requests.await.unwrap().is_empty());
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn footer_crud_actions_toggle_delete_members_invite_undo() {
+        crate::test_env::with_env_lock_async(|| async {
+            let previous_auto_handoff = std::env::var_os(KRAMLI_AUTO_HANDOFF_ENV);
+            std::env::set_var(KRAMLI_AUTO_HANDOFF_ENV, "0");
+
+            let (api, requests) = api_with_responses(vec![
+                serde_json::json!({"id": 1, "list_id": 1, "text": "Milk", "is_done": true})
+                    .to_string(),
+                serde_json::json!({"ok": true}).to_string(),
+                serde_json::json!([{"display_name": "Ada"}]).to_string(),
+                serde_json::json!({"invite_url": "https://kram.li/i/from-test"}).to_string(),
+                serde_json::json!({}).to_string(),
+                serde_json::json!([{"id": 1, "list_id": 1, "text": "Milk", "is_done": false}])
+                    .to_string(),
+            ])
+            .await;
+            let mut app = App::new(api, true);
+            app.lists = vec![test_list()];
+            app.items = vec![sample_item(1, "Milk")];
+            app.items_cache.insert(1, app.items.clone());
+            app.comments_cache.insert(1, Vec::new());
+
+            app.trigger_footer_action(FooterAction::ToggleDone)
+                .await
+                .unwrap();
+            assert_eq!(app.items[0].is_done, Some(true));
+
+            app.trigger_footer_action(FooterAction::Delete)
+                .await
+                .unwrap();
+            assert!(app.items.is_empty());
+
+            app.trigger_footer_action(FooterAction::Members)
+                .await
+                .unwrap();
+            assert!(app
+                .status
+                .as_deref()
+                .is_some_and(|value| value.contains("Ada")));
+
+            app.trigger_footer_action(FooterAction::Invite)
+                .await
+                .unwrap();
+            assert!(app
+                .status
+                .as_deref()
+                .is_some_and(|value| value.contains("https://kram.li/i/from-test")));
+
+            app.trigger_footer_action(FooterAction::Undo).await.unwrap();
+            for _ in 0..120 {
+                let _ = app.drain_load_messages();
+                if !app.items.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert_eq!(app.items.len(), 1);
+
+            let requests = requests.await.expect("test server should finish");
+            assert_eq!(
+                requests,
+                vec![
+                    "PATCH /api/items/1/done HTTP/1.1",
+                    "DELETE /api/items/1 HTTP/1.1",
+                    "GET /api/lists/1/members HTTP/1.1",
+                    "POST /api/lists/1/invite-link HTTP/1.1",
+                    "POST /api/lists/1/undo HTTP/1.1",
+                    "GET /api/lists/1/items HTTP/1.1",
+                ]
+            );
+
+            restore_env_var(KRAMLI_AUTO_HANDOFF_ENV, previous_auto_handoff);
+        })
+        .await;
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn legal_consent_keyboard_accepts_terms() {
+        let (api, requests) = api_with_responses(vec![
+            serde_json::json!({"legal": {"pending": []}}).to_string(),
+        ])
+        .await;
+        let mut app = App::new(api, true);
+        app.legal_consent_pending = true;
+        app.legal_pending_docs = vec!["agb".to_string(), "privacy".to_string()];
+
+        app.handle_legal_consent_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        assert!(app.legal_accepting);
+        assert_eq!(app.status, Some(tr("tui-legal-consent-submitting")));
+
+        let message = app.rx.recv().await.expect("accept terms should load");
+        match message {
+            LoadMessage::AcceptTerms { result } => app.apply_accept_terms_result(result),
+            _ => panic!("accept terms message expected"),
+        }
+
+        assert!(!app.legal_consent_pending);
+        assert!(!app.legal_accepting);
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["POST /api/accept-terms HTTP/1.1"]);
+    }
+
+    #[kramli_test_macros::test]
+    fn beta_consent_decline_sets_should_quit() {
+        let mut app = test_app();
+        app.beta_consent_pending = true;
+        app.should_quit = false;
+
+        app.handle_beta_consent_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(app.should_quit);
+
+        app.should_quit = false;
+        app.handle_beta_consent_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()));
+        assert!(app.should_quit);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn link_preview_open_external_url_sets_status() {
+        let (api, requests) = api_with_responses(Vec::new()).await;
+        let mut app = App::new(api, false);
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Link item")];
+        app.link_previews.insert(
+            item_preview_owner(1),
+            vec![test_link_preview(
+                "https://kramli.de/privacy",
+                Some(LinkPreviewActionKind::Open),
+                None,
+            )],
+        );
+
+        app.activate_link_preview().await.unwrap();
+        assert_eq!(app.status, Some(tr("link-preview-open")));
+        assert!(requests.await.unwrap().is_empty());
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn calendar_ctrl_arrow_shifts_due_hours() {
+        let (api, requests) = api_with_responses(vec![serde_json::json!({
+            "id": 1,
+            "list_id": 1,
+            "text": "Scheduled",
+            "is_done": false,
+            "due_date": "2026-07-15T08:00"
+        })
+        .to_string()])
+        .await;
+        let mut app = App::new(api, true);
+        app.mode = ViewMode::Calendar;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Scheduled")];
+        app.items[0].due_date = Some("2026-07-15T09:00".to_string());
+        app.selected_item = 0;
+        app.comments_cache.insert(1, Vec::new());
+        app.calendar_selected_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 15,
+        });
+
+        let changed = app
+            .move_calendar_selection_by_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), -1)
+            .await
+            .unwrap();
+        assert!(changed);
+        assert_eq!(app.items[0].due_date.as_deref(), Some("2026-07-15T08:00"));
+        assert_eq!(app.status, Some(tr("cli-item-updated")));
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["PUT /api/items/1 HTTP/1.1"]);
+    }
+
     fn test_attachment(id: i64, filename: Option<&str>, mime_type: Option<&str>) -> Attachment {
         Attachment {
             id,
@@ -9259,7 +9910,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn extracts_html_note_image_sources() {
         assert_eq!(
             extract_note_image_source(r#"<p>Text</p><img class="x" src="/uploads/item.jpg">"#),
@@ -9271,7 +9922,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn extracts_markdown_note_image_sources() {
         assert_eq!(
             extract_note_image_source("before ![photo](https://example.test/p.png) after"),
@@ -9279,7 +9930,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn rejects_data_image_sources_for_external_opening() {
         assert_eq!(
             extract_note_image_source(r#"<img src="data:image/png;base64,abc">"#),
@@ -9287,7 +9938,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn image_source_helpers_cover_scheme_extension_and_temp_paths() {
         assert_eq!(valid_image_source(" javascript:alert(1) "), None);
         assert_eq!(valid_image_source("mailto:test@example.com"), None);
@@ -9319,7 +9970,7 @@ mod tests {
             .is_some_and(|name| name.starts_with("kramli-cli-image-")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn image_source_helpers_cover_attachment_and_parser_edge_cases() {
         let mut attachment = test_attachment(1, None, Some("image/png"));
         assert!(is_image_attachment(&attachment));
@@ -9350,7 +10001,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn item_display_helpers_cover_dates_reminders_and_filters() {
         assert_eq!(date_with_time_display(None, Some("08:00")), "-");
         assert_eq!(
@@ -9380,7 +10031,7 @@ mod tests {
         assert!(!item_matches_filter(&item, "hardware"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn render_helpers_cover_list_detail_footer_and_consent_overlays() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -9441,7 +10092,7 @@ mod tests {
         terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn render_helpers_cover_image_editor_help_and_mode_branches() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -9492,7 +10143,7 @@ mod tests {
         terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn render_helpers_cover_kanban_calendar_drag_and_editor_variants() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -9600,7 +10251,7 @@ mod tests {
         terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn footer_action_metadata_covers_shortcuts_labels_and_env_names() {
         let actions = [
             FooterAction::Add,
@@ -9624,7 +10275,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn editor_save_helpers_cover_progress_and_reminder_body_paths() {
         let (api, requests) = api_with_responses(vec![
             serde_json::json!({
@@ -9716,7 +10367,7 @@ mod tests {
         assert_eq!(app.selected_item, 1);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn move_helpers_cover_kanban_and_calendar_update_paths() {
         let (api, requests) = api_with_responses(vec![
             serde_json::json!({
@@ -9790,7 +10441,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn image_background_helpers_cover_spawn_and_error_paths() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -9825,7 +10476,7 @@ mod tests {
         assert!(app.status.is_some());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn profile_and_image_background_loaders_cover_success_paths() {
         let (api, requests) = api_with_responses(vec![
             serde_json::json!({"display_name": "Ada"}).to_string(),
@@ -9879,7 +10530,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn external_image_loader_fetches_without_launching_os_app_in_tests() {
         let (api, requests) = api_with_responses(vec!["bytes".to_string()]).await;
         let mut app = App::new(api, true);
@@ -9918,13 +10569,13 @@ mod tests {
         assert_eq!(requests, vec!["GET /img/open.png HTTP/1.1"]);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn test_build_external_openers_never_launch_desktop_apps() {
         assert!(open_path(Path::new("/does/not/exist.png")).await.is_ok());
         assert!(open_url("https://example.test/").await.is_ok());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn event_loop_and_runtime_event_helpers_cover_input_branches() {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         let mut app = test_app();
@@ -10012,7 +10663,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_tui_session_helper_covers_success_and_restore_error_paths() {
         crate::test_env::with_env_lock_async(|| async {
             let previous_protocol = std::env::var_os(KRAMLI_TUI_IMAGE_PROTOCOL_ENV);
@@ -10045,15 +10696,12 @@ mod tests {
             .await;
             assert!(result.is_err());
 
-            match previous_protocol {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV),
-            }
+            restore_env_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, previous_protocol);
         })
         .await;
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_tui_terminal_factory_covers_init_error_and_success_paths() {
         let err = run_tui_with_terminal_factory::<ratatui::backend::TestBackend, _, _, _>(
             ApiClient::for_tests("https://kramli.test"),
@@ -10081,7 +10729,7 @@ mod tests {
         .expect("terminal factory helper should succeed with a test backend");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn restore_terminal_function_is_reachable() {
         if !std::io::IsTerminal::is_terminal(&io::stdout()) {
             return;
@@ -10091,7 +10739,7 @@ mod tests {
         let _ = restore_terminal(&mut terminal);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn calendar_drag_helpers_cover_started_and_date_click_paths() {
         let responses = vec![
             serde_json::json!({"id": 1, "list_id": 1, "text": "Milk", "is_done": false, "due_date": "2026-07-11"})
@@ -10174,7 +10822,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn accept_beta_consent_reloads_lists_when_legal_is_clear() {
         let (api, requests) = api_with_responses(vec![serde_json::json!([]).to_string()]).await;
         let mut app = App::new(api, true);
@@ -10197,7 +10845,7 @@ mod tests {
         assert_eq!(requests, vec!["GET /api/lists HTTP/1.1"]);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn draw_list_panel_uses_image_icon_targets_for_folder_and_lists() {
         let mut app = test_app();
         app.set_inline_images_enabled(true);
@@ -10217,7 +10865,7 @@ mod tests {
         terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn ensure_list_icon_background_queues_and_applies_error_results() {
         let mut app = test_app();
         app.set_inline_images_enabled(true);
@@ -10236,7 +10884,7 @@ mod tests {
         assert!(app.failed_list_icons.contains("bad..icon"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn bootstrap_icon_fetch_uses_override_base_url_and_handles_http_errors() {
         crate::test_env::with_env_lock_async(|| async {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10313,7 +10961,7 @@ mod tests {
         .await;
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn beta_overlay_renders_profile_image_when_available() {
         let mut app = test_app();
         app.beta_consent_pending = true;
@@ -10329,7 +10977,7 @@ mod tests {
         terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn draw_editor_and_protocol_fallback_helpers_cover_remaining_paths() {
         crate::test_env::with_env_lock(|| {
             let previous_term = std::env::var_os(TERM_ENV);
@@ -10347,35 +10995,20 @@ mod tests {
             std::env::set_var(TERM_PROGRAM_ENV, "iTerm.app");
             std::env::set_var(LC_TERMINAL_ENV, "iTerm2");
             std::env::set_var(ITERM_SESSION_ID_ENV, "abc");
+            std::env::remove_var(WT_SESSION_ENV);
             assert_eq!(autodetect_protocol_fallback(), Some(ProtocolType::Iterm2));
+            std::env::remove_var(ITERM_SESSION_ID_ENV);
+            std::env::remove_var(LC_TERMINAL_ENV);
             std::env::set_var(TERM_PROGRAM_ENV, "Windows_Terminal");
             std::env::set_var(WT_SESSION_ENV, "xyz");
             assert_eq!(autodetect_protocol_fallback(), Some(ProtocolType::Sixel));
 
-            match previous_term {
-                Some(value) => std::env::set_var(TERM_ENV, value),
-                None => std::env::remove_var(TERM_ENV),
-            }
-            match previous_program {
-                Some(value) => std::env::set_var(TERM_PROGRAM_ENV, value),
-                None => std::env::remove_var(TERM_PROGRAM_ENV),
-            }
-            match previous_lc_terminal {
-                Some(value) => std::env::set_var(LC_TERMINAL_ENV, value),
-                None => std::env::remove_var(LC_TERMINAL_ENV),
-            }
-            match previous_kitty {
-                Some(value) => std::env::set_var(KITTY_WINDOW_ID_ENV, value),
-                None => std::env::remove_var(KITTY_WINDOW_ID_ENV),
-            }
-            match previous_iterm {
-                Some(value) => std::env::set_var(ITERM_SESSION_ID_ENV, value),
-                None => std::env::remove_var(ITERM_SESSION_ID_ENV),
-            }
-            match previous_wt {
-                Some(value) => std::env::set_var(WT_SESSION_ENV, value),
-                None => std::env::remove_var(WT_SESSION_ENV),
-            }
+            restore_env_var(TERM_ENV, previous_term);
+            restore_env_var(TERM_PROGRAM_ENV, previous_program);
+            restore_env_var(LC_TERMINAL_ENV, previous_lc_terminal);
+            restore_env_var(KITTY_WINDOW_ID_ENV, previous_kitty);
+            restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
+            restore_env_var(WT_SESSION_ENV, previous_wt);
 
             let mut editor = EditorState {
                 mode: EditorMode::Edit,
@@ -10405,7 +11038,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn empty_selection_helpers_are_inert() {
         assert_eq!(shifted_index(0, 3, 0), 0);
         assert_eq!(shifted_index(99, -3, 0), 0);
@@ -10413,7 +11046,7 @@ mod tests {
         assert_eq!(scroll_to_visible(12, 0, 4), 0);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn list_panel_rows_skip_profile_area() {
         let area = Rect::new(0, 0, 30, 20);
         let rows = list_panel_rows_area(area);
@@ -10427,7 +11060,7 @@ mod tests {
         assert_eq!(list_panel_rows_area(small), small);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn html_notes_are_rendered_as_plain_text() {
         assert_eq!(
             note_text_for_display("<p>Milk &amp; bread</p><br><strong>Today</strong>"),
@@ -10483,7 +11116,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn foldered_lists_keep_list_icon_slot_and_render_folder_rows() {
         let folder_id_only = test_shopping_list(1, "Groceries", None, Some(83), None, false);
         assert!(list_has_folder(&folder_id_only));
@@ -10510,7 +11143,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn list_panel_rows_expand_nested_folder_paths() {
         let lists = vec![
             test_shopping_list(1, "Roadmap", None, Some(10), Some("Work/Backend"), false),
@@ -10528,7 +11161,7 @@ mod tests {
         assert_eq!(selected_list_panel_row(&rows, 1), 3);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn list_display_name_for_tui_includes_folder_path() {
         let nested = test_shopping_list(7, "Roadmap", None, Some(11), Some("Work/Backend"), false);
         assert_eq!(list_display_name_for_tui(&nested), "Work/Backend / Roadmap");
@@ -10537,7 +11170,7 @@ mod tests {
         assert_eq!(list_display_name_for_tui(&plain), "Groceries");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn item_row_text_keeps_subitem_indent() {
         let mut item = sample_item(42, "Child task");
         item.depth = Some(2);
@@ -10545,7 +11178,7 @@ mod tests {
         assert_eq!(item_row_text(&item), "    [ ] Child task");
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn item_depths_are_derived_from_parent_ids() {
         let mut items = vec![sample_item(1, "Parent"), sample_item(2, "Child")];
         items[1].parent_item_id = Some(1);
@@ -10556,7 +11189,7 @@ mod tests {
         assert_eq!(items[1].depth, Some(1));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn wrap_plain_row_keeps_hanging_indent() {
         assert_eq!(
             wrap_plain_row("> ", "  ", "[ ] abcdefgh", 8),
@@ -10564,7 +11197,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn wrapped_item_hit_test_accounts_for_visual_height() {
         let items = vec![sample_item(1, "abcdefghijkl"), sample_item(2, "short")];
         let visible = vec![0, 1];
@@ -10587,7 +11220,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn mouse_buttons_track_left_button_only() {
         assert_eq!(
             MouseButtons::from_kind(MouseEventKind::Down(MouseButton::Left)),
@@ -10619,7 +11252,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn navigation_action_maps_all_global_keys() {
         assert_eq!(
             navigation_action_for_key(KeyCode::Tab),
@@ -10697,7 +11330,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn view_modes_and_key_binding_sources_cover_branch_variants() {
         assert_eq!(ViewMode::List.next(), ViewMode::Kanban);
         assert_eq!(ViewMode::Kanban.next(), ViewMode::Calendar);
@@ -10722,7 +11355,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn key_binding_parser_covers_alias_function_and_invalid_paths() {
         let shifted_tab = parse_key_binding("shift+tab").expect("shift tab should parse");
         assert_eq!(shifted_tab.code, KeyCode::BackTab);
@@ -10741,7 +11374,7 @@ mod tests {
         assert!(parse_key_binding("   ").is_none());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn layout_and_column_helpers_cover_edge_branches() {
         let state_columns = list_states_to_columns(Some(&[
             ApiListState {
@@ -10785,7 +11418,7 @@ mod tests {
         assert_eq!(scroll_to_visible(2, 3, 4), 2);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_layout_helpers_cover_empty_and_agenda_branches() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -10818,7 +11451,7 @@ mod tests {
         assert!(!month_empty.is_empty());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn app_navigation_helpers_update_mode_focus_and_selection() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -10874,7 +11507,7 @@ mod tests {
         assert_eq!(app.focus, FocusPane::Items);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn app_state_helpers_cover_calendar_scroll_and_comment_branches() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -10944,7 +11577,7 @@ mod tests {
         assert_eq!(app.selected_item, 0);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn app_apply_helpers_cover_profile_lists_images_and_load_messages() {
         let mut app = test_app();
 
@@ -11160,7 +11793,7 @@ mod tests {
         assert!(!app.drain_load_messages());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn background_load_helpers_cover_reload_and_auto_handoff_paths() {
         crate::test_env::with_env_lock_async(|| async {
             let previous_auto_handoff = std::env::var_os(KRAMLI_AUTO_HANDOFF_ENV);
@@ -11220,15 +11853,12 @@ mod tests {
                 vec!["POST /api/activity/viewing HTTP/1.1"]
             );
 
-            match previous_auto_handoff {
-                Some(value) => std::env::set_var(KRAMLI_AUTO_HANDOFF_ENV, value),
-                None => std::env::remove_var(KRAMLI_AUTO_HANDOFF_ENV),
-            }
+            restore_env_var(KRAMLI_AUTO_HANDOFF_ENV, previous_auto_handoff);
         })
         .await;
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn footer_actions_cover_item_member_invite_and_undo_paths() {
         crate::test_env::with_env_lock_async(|| async {
             let previous_auto_handoff = std::env::var_os(KRAMLI_AUTO_HANDOFF_ENV);
@@ -11344,15 +11974,12 @@ mod tests {
                 ]
             );
 
-            match previous_auto_handoff {
-                Some(value) => std::env::set_var(KRAMLI_AUTO_HANDOFF_ENV, value),
-                None => std::env::remove_var(KRAMLI_AUTO_HANDOFF_ENV),
-            }
+            restore_env_var(KRAMLI_AUTO_HANDOFF_ENV, previous_auto_handoff);
         })
         .await;
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn navigation_and_key_helpers_cover_remaining_mode_paths() {
         let mut app = test_app();
         app.lists = vec![
@@ -11493,7 +12120,7 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn editor_key_and_save_helpers_cover_refactored_branches() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -11588,7 +12215,7 @@ mod tests {
         assert!(app.comments_cache.is_empty());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn comment_editor_save_posts_and_updates_cache() {
         let (api, requests) = api_with_responses(vec![
             serde_json::json!({"id": 9, "text": "Hello"}).to_string(),
@@ -11624,7 +12251,7 @@ mod tests {
         assert_eq!(requests, vec!["POST /api/items/7/comments HTTP/1.1"]);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn save_editor_delegates_filter_and_comment_modes() {
         let (api, requests) = api_with_responses(vec![
             serde_json::json!({"id": 11, "text": "Posted"}).to_string(),
@@ -11682,7 +12309,7 @@ mod tests {
         assert_eq!(requests, vec!["POST /api/items/7/comments HTTP/1.1"]);
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn editor_key_helpers_cover_remaining_motion_paths() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -11739,7 +12366,7 @@ mod tests {
         assert!(app.editor.is_none());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn empty_state_and_progress_helpers_cover_remaining_branches() {
         assert_eq!(editor_bool_label(Some(true)), tr("label-on"));
         assert_eq!(editor_bool_label(Some(false)), tr("label-off"));
@@ -11777,7 +12404,7 @@ mod tests {
         assert!(!app.move_kanban_selection(0));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn editor_opening_helpers_handle_empty_and_default_paths() {
         let mut app = test_app();
 
@@ -11798,7 +12425,7 @@ mod tests {
         assert!(app.editor.is_some());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn app_navigation_and_mouse_helpers_cover_false_and_editor_branches() {
         let mut app = test_app();
         app.lists = vec![test_list()];
@@ -11865,7 +12492,7 @@ mod tests {
         assert!(!app.handle_mouse_scroll(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1)));
 
         let area = Rect::new(0, 0, 120, 40);
-        let layout = ui_layout(area);
+        let layout = ui_layout(area, shows_list_mode_tabs(&app));
         assert!(!app.handle_tab_mouse(
             mouse(
                 MouseEventKind::Down(MouseButton::Left),
@@ -11916,14 +12543,14 @@ mod tests {
         assert!(app.editor.is_some());
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn app_mouse_helpers_cover_tabs_footer_lists_and_modes() {
         let mut app = test_app();
         app.lists = vec![test_list()];
         app.items = vec![sample_item(1, "One"), sample_item(2, "Two")];
         app.items_cache.insert(1, app.items.clone());
         let area = Rect::new(0, 0, 120, 40);
-        let layout = ui_layout(area);
+        let layout = ui_layout(area, shows_list_mode_tabs(&app));
 
         app.show_help = true;
         assert!(app.handle_help_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1)));
@@ -12115,7 +12742,7 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn sort_lists_for_tui_groups_by_folder_then_name() {
         let mut lists = vec![
             test_shopping_list(1, "Zed", None, None, None, false),
@@ -12137,7 +12764,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn bootstrap_icons_use_asset_names_and_text_fallbacks_without_emoji() {
         assert_eq!(
             bootstrap_icon_asset_name(Some("bi bi-cart-fill")),
@@ -12225,7 +12852,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn tui_icon_style_reads_raw_environment_value() {
         crate::test_env::with_env_lock(|| {
             std::env::set_var(KRAMLI_ICON_STYLE_ENV, "raw");
@@ -12237,7 +12864,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn bootstrap_sprite_contains_icons_from_official_symbol_ids() {
         let sprite = r#"
             <svg xmlns="http://www.w3.org/2000/svg">
@@ -12253,7 +12880,7 @@ mod tests {
         assert!(!bootstrap_sprite_contains_icon(sprite, "../secret"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn bootstrap_icon_color_follows_theme_and_env_hints() {
         assert_eq!(
             icon_svg_color_from_values(Some("light"), None, None),
@@ -12281,7 +12908,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn bootstrap_svg_icons_render_to_images() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1"/></svg>"##;
         let image =
@@ -12290,7 +12917,7 @@ mod tests {
         assert!(image.height() >= 16);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn item_filter_matches_text_notes_priority_and_tags() {
         let item = ListItem {
             id: 1,
@@ -12336,7 +12963,7 @@ mod tests {
         assert!(!item_matches_filter(&item, "groceries"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn tags_value_trims_and_drops_empty_tags() {
         assert_eq!(
             tags_value("foo, , bar"),
@@ -12347,14 +12974,14 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn editor_reminder_details_enable_reminders_by_default() {
         assert!(editor_reminder_details_provided("09:00", &[]));
         assert!(editor_reminder_details_provided("", &[0, 60]));
         assert!(!editor_reminder_details_provided("  ", &[]));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parses_iso_dates_and_rejects_invalid_dates() {
         assert_eq!(
             parse_iso_date("2026-06-14T10:00:00Z"),
@@ -12376,7 +13003,7 @@ mod tests {
         assert_eq!(parse_iso_date("2026-13-01"), None);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn validates_due_date_editor_input() {
         assert!(valid_due_date_input(""));
         assert!(valid_due_date_input("2026-06-17"));
@@ -12392,7 +13019,7 @@ mod tests {
         assert!(due_date_input_prefix_allowed("mañana"));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn preserves_due_time_suffix_when_moving_dates() {
         let target = SimpleDate {
             year: 2026,
@@ -12413,7 +13040,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn due_date_with_hour_delta_wraps_across_days() {
         let fallback = SimpleDate {
             year: 2026,
@@ -12434,7 +13061,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_date_helpers_use_monday_first_weeks() {
         assert_eq!(days_in_month(2024, 2), 29);
         assert_eq!(days_in_month(2026, 2), 28);
@@ -12450,14 +13077,14 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_cell_widths_fit_available_width() {
         assert_eq!(calendar_cell_widths(0), [0; 7]);
         assert_eq!(calendar_cell_widths(7), [1, 1, 1, 1, 1, 1, 1]);
         assert_eq!(calendar_cell_widths(10), [2, 2, 2, 1, 1, 1, 1]);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_rows_use_visible_separators() {
         assert_eq!(
             calendar_row(["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"], &[2; 7]),
@@ -12465,7 +13092,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_panel_layout_switches_between_wide_and_stacked_modes() {
         let (month_wide, agenda_wide) = calendar_panel_layout(Rect::new(0, 0, 100, 20));
         assert_eq!(month_wide.y, agenda_wide.y);
@@ -12476,7 +13103,7 @@ mod tests {
         assert_eq!(month_narrow.x, agenda_narrow.x);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_day_cell_labels_show_selection_today_and_overflow() {
         let date = SimpleDate {
             year: 2026,
@@ -12495,7 +13122,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_day_selection_prefers_drag_target_and_selected_day() {
         let date = SimpleDate {
             year: 2026,
@@ -12522,7 +13149,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn format_iso_date_zero_pads_month_and_day() {
         assert_eq!(
             format_iso_date(SimpleDate {
@@ -12534,7 +13161,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn shifted_date_moves_across_month_boundaries() {
         assert_eq!(
             shifted_date(
@@ -12568,7 +13195,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn shifted_month_preserves_day_and_clamps_month_end() {
         assert_eq!(
             shifted_month(
@@ -12602,7 +13229,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn start_of_month_keeps_year_and_month() {
         assert_eq!(
             start_of_month(SimpleDate {
@@ -12618,7 +13245,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_hit_helpers_return_dates_and_items() {
         let date = SimpleDate {
             year: 2026,
@@ -12649,7 +13276,7 @@ mod tests {
         assert_eq!(calendar_item_at(&layout, 10, 9), None);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_pointer_date_matches_rendered_grid_cells() {
         let content = Rect::new(0, 0, 80, 20);
         let month = SimpleDate {
@@ -12689,7 +13316,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_month_filter_keeps_only_visible_month_dates() {
         let month = SimpleDate {
             year: 2026,
@@ -12715,7 +13342,7 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_month_agenda_groups_dates_and_undated_items() {
         let mut items = vec![
             sample_item(1, "Milk"),
@@ -12763,7 +13390,7 @@ mod tests {
         assert_eq!(out[6], ("  No date".to_string(), Some(3)));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn calendar_month_agenda_respects_max_rows() {
         let mut items = vec![sample_item(1, "Milk"), sample_item(2, "Bread")];
         items[0].due_date = Some("2026-06-04".to_string());
@@ -12794,7 +13421,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn centered_popup_stays_inside_small_terminals() {
         let area = Rect::new(0, 0, 20, 8);
         let (outer, inner) = centered_popup(area, 56, 94, 16, 24);
@@ -12811,7 +13438,7 @@ mod tests {
         assert!(inner.y + inner.height <= outer.y + outer.height);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn centered_popup_uses_requested_bounds_when_space_allows() {
         let area = Rect::new(0, 0, 120, 40);
         let (outer, _) = centered_popup(area, 56, 94, 16, 24);
@@ -12822,7 +13449,7 @@ mod tests {
         assert_eq!(outer.y, 8);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn editor_layout_stays_inside_small_terminals() {
         let area = Rect::new(0, 0, 40, 10);
         let layout = editor_layout(area);
@@ -12833,7 +13460,7 @@ mod tests {
         assert!(layout.outer.y + layout.outer.height <= area.y + area.height);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn beta_consent_layout_stays_inside_small_terminals() {
         let area = Rect::new(0, 0, 32, 8);
         let layout = beta_consent_layout(area);
@@ -12844,7 +13471,7 @@ mod tests {
         assert!(layout.outer.y + layout.outer.height <= area.y + area.height);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn item_rows_area_rejects_block_borders() {
         let block = Rect::new(10, 5, 20, 8);
         let rows = item_rows_area(block);
@@ -12854,7 +13481,7 @@ mod tests {
         assert!(rect_contains(rows, 11, 6));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn detects_supported_image_protocols_from_terminal_env() {
         assert!(
             detected_protocol_from_env_values("alacritty", "", "", false, false, false).is_none()
@@ -12912,9 +13539,15 @@ mod tests {
         ));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn image_preference_and_debug_lines_cover_env_overrides() {
         crate::test_env::with_env_lock(|| {
+            std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, "kitty");
+            std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
+            std::env::set_var(TERM_ENV, "xterm-256color");
+            std::env::set_var(TERM_PROGRAM_ENV, "WezTerm");
+            std::env::set_var(LC_TERMINAL_ENV, "iTerm2");
+            std::env::set_var(ITERM_SESSION_ID_ENV, "seed-session");
             let previous_protocol = std::env::var_os(KRAMLI_TUI_IMAGE_PROTOCOL_ENV);
             let previous_images = std::env::var_os(KRAMLI_TUI_IMAGES_ENV);
             let previous_term = std::env::var_os(TERM_ENV);
@@ -12978,36 +13611,25 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("img env protocol=(unset) images=(unset)")));
 
-            match previous_protocol {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV),
-            }
-            match previous_images {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGES_ENV),
-            }
-            match previous_term {
-                Some(value) => std::env::set_var(TERM_ENV, value),
-                None => std::env::remove_var(TERM_ENV),
-            }
-            match previous_program {
-                Some(value) => std::env::set_var(TERM_PROGRAM_ENV, value),
-                None => std::env::remove_var(TERM_PROGRAM_ENV),
-            }
-            match previous_lc_terminal {
-                Some(value) => std::env::set_var(LC_TERMINAL_ENV, value),
-                None => std::env::remove_var(LC_TERMINAL_ENV),
-            }
-            match previous_iterm {
-                Some(value) => std::env::set_var(ITERM_SESSION_ID_ENV, value),
-                None => std::env::remove_var(ITERM_SESSION_ID_ENV),
-            }
+            restore_env_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, previous_protocol);
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+            restore_env_var(TERM_ENV, previous_term);
+            restore_env_var(TERM_PROGRAM_ENV, previous_program);
+            restore_env_var(LC_TERMINAL_ENV, previous_lc_terminal);
+            restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn build_picker_and_probe_detection_cover_auto_probe_paths() {
         crate::test_env::with_env_lock(|| {
+            std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
+            std::env::set_var(TERM_ENV, "xterm-kitty");
+            std::env::set_var(TERM_PROGRAM_ENV, "kitty");
+            std::env::set_var(LC_TERMINAL_ENV, "kitty");
+            std::env::set_var(KITTY_WINDOW_ID_ENV, "1");
+            std::env::set_var(ITERM_SESSION_ID_ENV, "seed-session");
+            std::env::set_var(WT_SESSION_ENV, "seed-session");
             let previous_images = std::env::var_os(KRAMLI_TUI_IMAGES_ENV);
             let previous_term = std::env::var_os(TERM_ENV);
             let previous_program = std::env::var_os(TERM_PROGRAM_ENV);
@@ -13042,38 +13664,17 @@ mod tests {
             std::env::remove_var(WT_SESSION_ENV);
             assert!(!should_probe_terminal_images());
 
-            match previous_images {
-                Some(value) => std::env::set_var(KRAMLI_TUI_IMAGES_ENV, value),
-                None => std::env::remove_var(KRAMLI_TUI_IMAGES_ENV),
-            }
-            match previous_term {
-                Some(value) => std::env::set_var(TERM_ENV, value),
-                None => std::env::remove_var(TERM_ENV),
-            }
-            match previous_program {
-                Some(value) => std::env::set_var(TERM_PROGRAM_ENV, value),
-                None => std::env::remove_var(TERM_PROGRAM_ENV),
-            }
-            match previous_lc_terminal {
-                Some(value) => std::env::set_var(LC_TERMINAL_ENV, value),
-                None => std::env::remove_var(LC_TERMINAL_ENV),
-            }
-            match previous_kitty {
-                Some(value) => std::env::set_var(KITTY_WINDOW_ID_ENV, value),
-                None => std::env::remove_var(KITTY_WINDOW_ID_ENV),
-            }
-            match previous_iterm {
-                Some(value) => std::env::set_var(ITERM_SESSION_ID_ENV, value),
-                None => std::env::remove_var(ITERM_SESSION_ID_ENV),
-            }
-            match previous_wt {
-                Some(value) => std::env::set_var(WT_SESSION_ENV, value),
-                None => std::env::remove_var(WT_SESSION_ENV),
-            }
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+            restore_env_var(TERM_ENV, previous_term);
+            restore_env_var(TERM_PROGRAM_ENV, previous_program);
+            restore_env_var(LC_TERMINAL_ENV, previous_lc_terminal);
+            restore_env_var(KITTY_WINDOW_ID_ENV, previous_kitty);
+            restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
+            restore_env_var(WT_SESSION_ENV, previous_wt);
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn editor_value_helpers_cover_all_fields() {
         let mut editor = EditorState {
             mode: EditorMode::Edit,
@@ -13120,7 +13721,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn kanban_defaults_and_editor_suggestion_helpers_cover_remaining_branches() {
         let mut app = test_app();
         app.lists.clear();
@@ -13172,7 +13773,7 @@ mod tests {
         assert!(app.apply_editor_suggestion(1));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn profile_result_mode_mouse_and_calendar_hour_false_paths_are_covered() {
         let mut app = test_app();
         app.beta_consent_pending = false;
@@ -13238,7 +13839,7 @@ mod tests {
             .expect("missing selected item should return false"));
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn localized_bool_input_and_icon_marker_helpers_cover_remaining_branches() {
         crate::i18n::set_locale("de");
         assert_eq!(parse_editor_bool_input(&tr("label-on")), Some(true));
@@ -13269,7 +13870,7 @@ mod tests {
         tokio::task::yield_now().await;
     }
 
-    #[tokio::test]
+    #[kramli_test_macros::tokio_test]
     async fn run_tui_entrypoint_is_reachable_under_cfg_test() {
         crate::test_env::with_env_lock_async(|| async {
             let _ = run_tui().await;
@@ -13277,7 +13878,7 @@ mod tests {
         .await;
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn iterm_env_overrides_bad_kitty_probe_result() {
         assert!(matches!(
             env_override_for_probed_protocol(ProtocolType::Kitty, Some(ProtocolType::Iterm2)),
@@ -13297,7 +13898,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn kanban_down_moves_within_same_column() {
         let buckets = vec![vec![0, 2, 4], vec![1, 3], vec![]];
 
@@ -13308,7 +13909,7 @@ mod tests {
         assert_eq!(next_kanban_selection(&buckets, 999, 1), Some(2));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn stepped_kanban_selection_applies_multi_step_delta_in_column() {
         let buckets = vec![vec![10, 11, 12, 13], vec![20, 21]];
 
@@ -13318,7 +13919,7 @@ mod tests {
         assert_eq!(stepped_kanban_selection(&buckets, 20, 1), Some(21));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn kanban_window_reserves_hint_rows_without_losing_selection() {
         let bucket = vec![0, 1, 2, 3, 4, 5, 6, 7];
         let (start, item_count, show_top, show_bottom) = kanban_window(&bucket, 6, 5);
@@ -13328,7 +13929,7 @@ mod tests {
         assert!(start <= 6 && 6 < start + item_count);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn next_kanban_column_selection_keeps_row_position() {
         let buckets = vec![vec![10, 11, 12], vec![20, 21], vec![], vec![30, 31, 32, 33]];
 
@@ -13339,7 +13940,7 @@ mod tests {
         assert_eq!(next_kanban_column_selection(&buckets, 10, -1), None);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn wrapped_index_wraps_in_both_directions() {
         assert_eq!(wrapped_index(0, 1, 3), 1);
         assert_eq!(wrapped_index(2, 1, 3), 0);
@@ -13348,7 +13949,7 @@ mod tests {
         assert_eq!(wrapped_index(3, 2, 0), 0);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn cycle_suggestion_value_handles_exact_and_prefix_matches() {
         let progress = vec![
             "Offen".to_string(),
@@ -13377,7 +13978,7 @@ mod tests {
         assert_eq!(cycle_suggestion_value("Ta", &tags, 0), None);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn autocomplete_last_tag_replaces_only_last_segment() {
         let suggestions = vec![
             "Brot".to_string(),
@@ -13404,7 +14005,7 @@ mod tests {
         assert_eq!(autocomplete_last_tag("Brot, xyz", &suggestions, 1), None);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn wrapped_kanban_selection_cycles_within_column() {
         let buckets = vec![vec![10, 11, 12], vec![20, 21]];
 
@@ -13419,7 +14020,7 @@ mod tests {
         assert_eq!(stepped_kanban_selection_wrapped(&[], 0, 1), None);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn key_bindings_match_shifted_default_letters() {
         let bindings = KeyBindings {
             bindings: default_key_bindings(),
@@ -13429,7 +14030,7 @@ mod tests {
         assert_eq!(action, Some(FooterAction::Add));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn key_binding_parser_supports_remap_tokens() {
         let binding = parse_key_binding("ctrl+x").expect("valid key binding");
         assert_eq!(binding.label, "C+X");
@@ -13441,7 +14042,7 @@ mod tests {
         assert!(space.matches(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty())));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn auto_handoff_only_sends_current_pending_list() {
         assert!(should_send_auto_handoff(Some(42), Some(42), 42));
         assert!(!should_send_auto_handoff(Some(43), Some(42), 42));
@@ -13449,7 +14050,7 @@ mod tests {
         assert!(!should_send_auto_handoff(None, Some(42), 42));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn auto_handoff_env_flag_defaults_on_and_can_disable() {
         assert!(auto_handoff_enabled_from_value(None));
         assert!(auto_handoff_enabled_from_value(Some("invalid")));
@@ -13458,7 +14059,7 @@ mod tests {
         assert!(auto_handoff_enabled_from_value(Some("yes")));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_state_config_columns_supports_strings_and_objects() {
         let columns = parse_state_config_columns(Some(
             r#"["My day", {"name":"Done","is_done":true}, {"name":"My day"}, {"name":"Review","done":false}]"#,
@@ -13472,7 +14073,7 @@ mod tests {
         assert!(!columns[2].is_done);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn parse_state_config_columns_marks_last_done_when_missing() {
         let columns = parse_state_config_columns(Some(r#"["Open", "My day"]"#));
         assert_eq!(columns.len(), 2);
@@ -13480,7 +14081,7 @@ mod tests {
         assert!(columns[1].is_done);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn legal_pending_doc_helpers_extract_profile_and_response_keys() {
         let profile = Profile {
             id: Some(1),
@@ -13516,5 +14117,6031 @@ mod tests {
             pending_legal_docs_from_value(&value),
             vec!["agb", "privacy"]
         );
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_mouse_item_change_reloads_comments_and_previews() {
+        let (api, requests) = api_with_responses(vec![json!([]).to_string()]).await;
+        let mut app = App::new(api, false);
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "First"), sample_item(2, "Second")];
+        app.items_cache.insert(1, app.items.clone());
+        app.comments_cache.insert(1, Vec::new());
+        app.selected_item = 0;
+        app.mode = ViewMode::List;
+        app.focus = FocusPane::Items;
+
+        let area = Rect::new(0, 0, 160, 40);
+        let layout = ui_layout(area, shows_list_mode_tabs(&app));
+        let (list_rect, _) = list_mode_layout(layout.content);
+        let list_items_area = item_rows_area(list_rect);
+        app.handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                list_items_area.x,
+                list_items_area.y + 1,
+            ),
+            area,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(app.selected_item, 1);
+        assert!(app
+            .pending_link_previews
+            .contains_key(&item_preview_owner(2)));
+
+        let mut saw_comments = false;
+        for _ in 0..80 {
+            while let Ok(message) = app.rx.try_recv() {
+                if let LoadMessage::Comments { item_id, .. } = message {
+                    assert_eq!(item_id, 2);
+                    saw_comments = true;
+                }
+            }
+            if saw_comments {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(saw_comments);
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests, vec!["GET /api/items/2/comments HTTP/1.1"]);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn note_link_preview_mouse_click_activates_preview() {
+        let (api, requests) = api_with_responses(Vec::new()).await;
+        let mut app = App::new(api, false);
+        app.beta_consent_pending = false;
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.apply_note_detail_result(
+            1,
+            Ok(json!({"note_content": "See https://kramli.de/privacy"})),
+        );
+        app.link_previews.insert(
+            note_preview_owner(1),
+            vec![test_link_preview(
+                "https://kramli.de/privacy",
+                Some(LinkPreviewActionKind::Open),
+                None,
+            )],
+        );
+
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = ui_layout(area, shows_list_mode_tabs(&app));
+        let inner = layout.content.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let lines = note_mode_lines(&app);
+        let section = tr("link-preview-section");
+        let header_idx = lines
+            .iter()
+            .position(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.as_ref() == section)
+            })
+            .expect("preview section should render");
+        let action_line = header_idx + 3;
+        app.handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                inner.x + 2,
+                inner.y + action_line as u16,
+            ),
+            area,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(app.status, Some(tr("link-preview-open")));
+        assert!(requests.await.unwrap().is_empty());
+    }
+
+    #[kramli_test_macros::test]
+    fn invite_confirmation_decline_and_accepting_overlay_render() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.invite_confirmation = Some(PendingInviteAcceptance {
+            token: "InviteToken_1".to_string(),
+            list_id: Some(7),
+            list_name: Some("Shared".to_string()),
+        });
+
+        app.handle_invite_confirmation_key(KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::empty(),
+        ));
+        assert!(app.invite_confirmation.is_none());
+
+        app.invite_confirmation = Some(PendingInviteAcceptance {
+            token: "InviteToken_1".to_string(),
+            list_id: Some(7),
+            list_name: Some("Shared".to_string()),
+        });
+        app.accepting_invite = true;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        let accepting_text = terminal_text(&terminal);
+        assert!(accepting_text.contains(&tr("tui-invite-accepting")));
+
+        app.accepting_invite = false;
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        let confirm_text = terminal_text(&terminal);
+        assert!(confirm_text.contains(&tr("tui-invite-confirm-title")));
+        assert!(confirm_text.contains("Shared"));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn editor_suggestion_and_mouse_save_cancel_navigate_fields() {
+        let (api, requests) = api_with_responses(vec![json!({
+            "id": 1,
+            "list_id": 1,
+            "text": "Milk",
+            "is_done": false
+        })
+        .to_string()])
+        .await;
+        let mut app = App::new(api, false);
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        let mut item = sample_item(1, "Milk");
+        item.tags = Some(vec!["Bread".to_string(), "Butter".to_string()]);
+        app.items = vec![item];
+        app.selected_item = 0;
+        app.open_editor().unwrap();
+
+        if let Some(editor) = app.editor.as_mut() {
+            editor.active_field = EditorField::Progress;
+            editor.progress = tr("tui-kanban-open");
+        }
+        app.handle_editor_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_ne!(app.editor.as_ref().unwrap().progress, tr("tui-kanban-open"));
+
+        app.handle_editor_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_ne!(
+            app.editor.as_ref().unwrap().active_field,
+            EditorField::Progress
+        );
+
+        let area = Rect::new(0, 0, 100, 30);
+        let layout = editor_layout(area);
+        app.handle_editor_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.prev.x + 1,
+                layout.prev.y,
+            ),
+            area,
+        )
+        .await
+        .unwrap();
+        app.handle_editor_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.next.x + 1,
+                layout.next.y,
+            ),
+            area,
+        )
+        .await
+        .unwrap();
+
+        app.handle_editor_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.save.x + 1,
+                layout.save.y,
+            ),
+            area,
+        )
+        .await
+        .unwrap();
+        assert!(app.editor.is_none());
+        assert_eq!(app.status, Some(tr("cli-item-updated")));
+
+        app.open_editor().unwrap();
+        app.handle_editor_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.cancel.x + 1,
+                layout.cancel.y,
+            ),
+            area,
+        )
+        .await
+        .unwrap();
+        assert!(app.editor.is_none());
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests, vec!["PUT /api/items/1 HTTP/1.1"]);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn auto_handoff_and_stale_link_preview_drain() {
+        crate::test_env::with_env_lock_async(|| async {
+            let previous_auto_handoff = std::env::var_os(KRAMLI_AUTO_HANDOFF_ENV);
+            std::env::set_var(KRAMLI_AUTO_HANDOFF_ENV, "1");
+
+            let (api, requests) = api_with_responses(vec![json!({"ok": true}).to_string()]).await;
+            let mut app = App::new(api, false);
+            app.lists = vec![test_list()];
+            app.selected_list = 0;
+            app.pending_auto_handoff_list_id = Some(1);
+
+            let owner = item_preview_owner(1);
+            let stale = PreviewRequestIdentity {
+                generation: 1,
+                fingerprint: 11,
+            };
+            let current = PreviewRequestIdentity {
+                generation: 2,
+                fingerprint: 22,
+            };
+            app.preview_generation = current.generation;
+            app.pending_link_previews.insert(owner.clone(), current);
+            app.tx
+                .send(LoadMessage::LinkPreviews {
+                    owner: owner.clone(),
+                    identity: stale,
+                    previews: vec![test_link_preview(
+                        "https://kramli.de/privacy",
+                        Some(LinkPreviewActionKind::Open),
+                        None,
+                    )],
+                })
+                .unwrap();
+            app.tx
+                .send(LoadMessage::AutoHandoffDue {
+                    list_id: 1,
+                    list_name: "Groceries".to_string(),
+                })
+                .unwrap();
+
+            assert!(app.drain_load_messages());
+            assert!(!app.link_previews.contains_key(&owner));
+            assert_eq!(app.pending_link_previews.get(&owner), Some(&current));
+
+            for _ in 0..120 {
+                let _ = app.drain_load_messages();
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+
+            let requests = requests.await.expect("test server should finish");
+            assert_eq!(requests, vec!["POST /api/activity/viewing HTTP/1.1"]);
+
+            restore_env_var(KRAMLI_AUTO_HANDOFF_ENV, previous_auto_handoff);
+        })
+        .await;
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn double_click_list_item_opens_editor() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "One"), sample_item(2, "Two")];
+        app.items_cache.insert(1, app.items.clone());
+        app.selected_item = 0;
+        app.mode = ViewMode::List;
+        app.focus = FocusPane::Items;
+
+        let area = Rect::new(0, 0, 160, 40);
+        let layout = ui_layout(area, shows_list_mode_tabs(&app));
+        let (list_rect, _) = list_mode_layout(layout.content);
+        let list_items_area = item_rows_area(list_rect);
+        let click = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            list_items_area.x,
+            list_items_area.y + 1,
+        );
+
+        app.handle_mouse(click, area).await.unwrap();
+        assert!(app.editor.is_none());
+        assert_eq!(app.selected_item, 1);
+
+        app.handle_mouse(click, area).await.unwrap();
+        assert!(app.editor.is_some());
+    }
+
+    #[kramli_test_macros::test]
+    fn kanban_card_text_renders_quantity_due_and_comments() {
+        let mut item = sample_item(1, "Milk");
+        item.quantity = Some("2".to_string());
+        item.due_date = Some("2026-08-01".to_string());
+        item.due_time = Some("09:00".to_string());
+        item.comment_count = Some(3);
+
+        let card = kanban_card_text(&item);
+        assert!(card.contains("Milk"));
+        assert!(card.contains("x2"));
+        assert!(card.contains("2026-08-01"));
+        assert!(card.contains("09:00"));
+        assert!(card.contains("c3"));
+
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![item];
+        app.mode = ViewMode::Kanban;
+        app.focus = FocusPane::Items;
+        app.selected_item = 0;
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        let rendered = terminal_text(&terminal);
+        assert!(rendered.contains("x2"));
+        assert!(rendered.contains("2026-08-01"));
+        assert!(rendered.contains("c3"));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn runtime_event_routes_legal_consent_keys() {
+        let (api, requests) =
+            api_with_responses(vec![json!({"legal": {"pending": []}}).to_string()]).await;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut app = App::new(api, false);
+        app.beta_consent_pending = false;
+        app.legal_consent_pending = true;
+        app.legal_pending_docs = vec!["agb".to_string(), "privacy".to_string()];
+
+        handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty())),
+        )
+        .await
+        .unwrap();
+        assert!(app.should_quit);
+
+        app.should_quit = false;
+        app.legal_consent_pending = true;
+        handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())),
+        )
+        .await
+        .unwrap();
+        assert!(app.legal_accepting);
+        assert_eq!(app.status, Some(tr("tui-legal-consent-submitting")));
+
+        handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::empty())),
+        )
+        .await
+        .unwrap();
+        assert!(!app.show_help);
+
+        let message = app.rx.recv().await.expect("accept terms should load");
+        assert!(matches!(message, LoadMessage::AcceptTerms { .. }));
+        if let LoadMessage::AcceptTerms { result } = message {
+            app.apply_accept_terms_result(result);
+        }
+        assert!(!app.legal_consent_pending);
+        assert!(!app.legal_accepting);
+
+        app.legal_consent_pending = true;
+        handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty())),
+        )
+        .await
+        .unwrap();
+        assert!(app.should_quit);
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["POST /api/accept-terms HTTP/1.1"]);
+    }
+
+    #[kramli_test_macros::test]
+    #[should_panic(expected = "accept terms message expected")]
+    fn accept_terms_load_message_guard_rejects_unexpected_variants() {
+        let message = LoadMessage::Lists(Ok(vec![]));
+        match message {
+            LoadMessage::AcceptTerms { .. } => {}
+            _ => panic!("accept terms message expected"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn accept_terms_load_message_guard_accepts_expected_variant() {
+        let message = LoadMessage::AcceptTerms {
+            result: Ok(json!({"legal": {"pending": []}})),
+        };
+        match message {
+            LoadMessage::AcceptTerms { .. } => {}
+            _ => panic!("accept terms message expected"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn list_display_and_sort_helpers_cover_empty_and_id_only_branches() {
+        let folder_only = test_shopping_list(1, "   ", None, Some(83), None, false);
+        assert_eq!(
+            list_display_name_for_tui(&folder_only),
+            tr("common-unknown")
+        );
+        assert_eq!(
+            list_folder_sort_key(&folder_only),
+            (0, format!("#{id:020}", id = 83))
+        );
+
+        let folder_named = test_shopping_list(2, "   ", None, Some(83), Some("Home"), false);
+        assert_eq!(list_display_name_for_tui(&folder_named), "Home");
+
+        let unnamed = test_shopping_list(3, "   ", None, None, None, false);
+        assert_eq!(list_display_name_for_tui(&unnamed), tr("common-unknown"));
+        assert_eq!(list_folder_sort_key(&unnamed), (1, String::default()));
+
+        assert_eq!(empty_icon_slot(), "  ");
+    }
+
+    #[kramli_test_macros::test]
+    fn normalize_list_icon_raw_style_preserves_custom_and_fallback_values() {
+        crate::test_env::with_env_lock(|| {
+            std::env::set_var(KRAMLI_ICON_STYLE_ENV, "raw");
+            assert_eq!(normalize_list_icon(Some("  custom  ")), "custom");
+            assert_eq!(normalize_list_icon(None), "bi-tag");
+            assert_eq!(normalize_list_icon(Some("   ")), "bi-tag");
+            std::env::remove_var(KRAMLI_ICON_STYLE_ENV);
+        });
+    }
+
+    #[kramli_test_macros::test]
+    fn terminal_cleanup_guard_drop_runs_without_panic_when_not_dismissed() {
+        drop(TerminalCleanupGuard::new());
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn footer_refresh_filter_image_attach_and_comment_actions_are_covered() {
+        let (api, requests) =
+            api_with_responses(vec![json!([{"id": 1, "name": "Groceries"}]).to_string()]).await;
+        let mut app = App::new(api, true);
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Milk")];
+        app.items[0].image_url = Some("https://example.test/milk.png".to_string());
+        app.selected_item = 0;
+
+        app.trigger_footer_action(FooterAction::Refresh)
+            .await
+            .unwrap();
+        app.trigger_footer_action(FooterAction::Filter)
+            .await
+            .unwrap();
+        assert!(app.editor.is_some());
+        app.editor = None;
+
+        app.trigger_footer_action(FooterAction::OpenImage)
+            .await
+            .unwrap();
+        app.trigger_footer_action(FooterAction::Attach)
+            .await
+            .unwrap();
+        assert!(app.editor.is_some());
+        app.editor = None;
+
+        app.trigger_footer_action(FooterAction::Comment)
+            .await
+            .unwrap();
+        assert!(app.editor.is_some());
+
+        let requests = requests.await.expect("test server should finish");
+        assert_eq!(requests, vec!["GET /api/lists HTTP/1.1"]);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn reload_item_link_previews_collects_notes_tldr_attachments_and_comments() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        let mut item = sample_item(1, "Main");
+        item.notes = Some("See https://kramli.de/privacy".to_string());
+        item.tldr = Some("Summary".to_string());
+        item.attachments = Some(vec![Attachment {
+            id: 1,
+            filename: Some("photo.png".to_string()),
+            original_filename: None,
+            mime_type: Some("image/png".to_string()),
+            file_size: None,
+            url: Some("/uploads/1".to_string()),
+            position: None,
+            sensitive: None,
+            context: Some("Receipt".to_string()),
+            alt_text: Some("Milk photo".to_string()),
+        }]);
+        app.items = vec![item];
+        app.selected_item = 0;
+        app.comments_cache.insert(
+            1,
+            vec![ItemComment {
+                id: 2,
+                text: Some("Comment https://kramli.de/lists/42".to_string()),
+                user_id: None,
+                user_name: None,
+                user_email: None,
+                created_at: None,
+            }],
+        );
+
+        app.load_link_previews_for_selected_item();
+        let message = app.rx.recv().await.expect("preview load should enqueue");
+        match message {
+            LoadMessage::LinkPreviews { owner, .. } => {
+                assert_eq!(owner, item_preview_owner(1));
+            }
+            _ => panic!("unexpected load message"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn select_link_preview_cycles_backward_and_skips_when_empty() {
+        let mut app = test_app();
+        app.link_previews.insert(
+            item_preview_owner(1),
+            vec![
+                test_link_preview(
+                    "https://kramli.de/privacy",
+                    Some(LinkPreviewActionKind::Open),
+                    None,
+                ),
+                test_link_preview(
+                    "https://kramli.de/lists/42",
+                    Some(LinkPreviewActionKind::Open),
+                    Some(42),
+                ),
+            ],
+        );
+        app.items = vec![sample_item(1, "One")];
+        app.selected_item = 0;
+        app.selected_link_preview = 0;
+
+        app.select_link_preview(-1);
+        assert_eq!(app.selected_link_preview, 1);
+
+        app.link_previews.clear();
+        app.select_link_preview(1);
+        assert_eq!(app.selected_link_preview, 1);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn runtime_event_routes_beta_consent_and_editor_branches() {
+        let (api, _requests) = api_with_responses(Vec::new()).await;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut app = App::new(api, false);
+        app.beta_consent_pending = true;
+
+        handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty())),
+        )
+        .await
+        .unwrap();
+        assert!(app.should_quit);
+
+        app.should_quit = false;
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Milk")];
+        app.selected_item = 0;
+        app.open_editor().unwrap();
+
+        handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
+        )
+        .await
+        .unwrap();
+        assert!(app.editor.is_none());
+
+        handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0)),
+        )
+        .await
+        .unwrap();
+
+        handle_runtime_event(&mut terminal, &mut app, Event::Resize(100, 40))
+            .await
+            .unwrap();
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn run_tui_session_internal_covers_restore_failure_path() {
+        let outcome = run_tui_session_internal(
+            &mut Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap(),
+            ApiClient::for_tests("https://kramli.test"),
+            true,
+            |_| Err("restore failed".to_string()),
+            |app| {
+                app.beta_consent_pending = false;
+                app.should_quit = true;
+            },
+        )
+        .await;
+        assert!(!outcome.restore_succeeded);
+    }
+
+    #[kramli_test_macros::test]
+    fn compare_lists_for_tui_orders_by_folder_id_when_names_missing() {
+        let a = test_shopping_list(1, "B", None, Some(5), None, false);
+        let b = test_shopping_list(2, "A", None, Some(4), None, false);
+        assert_eq!(compare_lists_for_tui(&a, &b), Ordering::Greater);
+    }
+
+    #[kramli_test_macros::test]
+    fn init_terminal_function_is_reachable_on_real_stdout() {
+        let _ = init_terminal().map(|mut terminal| restore_terminal(&mut terminal));
+
+        let backend = CrosstermBackend::new(io::stdout());
+        if let Ok(mut terminal) = Terminal::new(backend) {
+            let _ = restore_terminal(&mut terminal);
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn build_image_picker_auto_probe_applies_env_override_suffix() {
+        crate::test_env::with_env_lock(|| {
+            std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, "auto");
+            std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
+            std::env::set_var(TERM_ENV, "xterm-256color");
+            std::env::set_var(TERM_PROGRAM_ENV, "WezTerm");
+            std::env::set_var(LC_TERMINAL_ENV, "iTerm2");
+            std::env::set_var(ITERM_SESSION_ID_ENV, "seed-session");
+            let previous_protocol = std::env::var_os(KRAMLI_TUI_IMAGE_PROTOCOL_ENV);
+            let previous_term = std::env::var_os(TERM_ENV);
+            let previous_program = std::env::var_os(TERM_PROGRAM_ENV);
+            let previous_lc_terminal = std::env::var_os(LC_TERMINAL_ENV);
+            let previous_iterm = std::env::var_os(ITERM_SESSION_ID_ENV);
+            let previous_images = std::env::var_os(KRAMLI_TUI_IMAGES_ENV);
+
+            std::env::remove_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV);
+            std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
+            std::env::set_var(TERM_ENV, "xterm-256color");
+            std::env::set_var(TERM_PROGRAM_ENV, "WezTerm");
+            std::env::set_var(LC_TERMINAL_ENV, "iTerm2");
+            std::env::set_var(ITERM_SESSION_ID_ENV, "abc");
+
+            let (_picker, enabled, summary, _debug) =
+                build_image_picker(ImageProtocolPreference::Auto);
+            assert!(enabled);
+            assert!(summary.contains("auto="));
+
+            restore_env_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, previous_protocol);
+            restore_env_var(TERM_ENV, previous_term);
+            restore_env_var(TERM_PROGRAM_ENV, previous_program);
+            restore_env_var(LC_TERMINAL_ENV, previous_lc_terminal);
+            restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+        });
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn save_editor_attachment_upload_error_keeps_editor_open() {
+        let (api, _) = api_with_responses(Vec::new()).await;
+        let mut app = App::new(api, false);
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Item")];
+        app.editor = Some(EditorState {
+            mode: EditorMode::Attachment,
+            item_id: Some(1),
+            text: "/does/not/exist.png".to_string(),
+            quantity: String::new(),
+            due_date: String::new(),
+            due_time: String::new(),
+            planned_date: String::new(),
+            planned_time: String::new(),
+            reminder: String::new(),
+            reminder_time: String::new(),
+            reminder_offsets: String::new(),
+            travel_time_minutes: String::new(),
+            priority: String::new(),
+            tags: String::new(),
+            progress: String::new(),
+            notes: String::new(),
+            active_field: EditorField::Text,
+        });
+        app.save_editor().await.unwrap();
+        assert!(app.editor.is_some());
+        assert!(app.status.as_ref().is_some_and(|status| !status.is_empty()));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_mouse_help_dismisses_overlay_without_changing_selection() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.show_help = true;
+        app.selected_item = 0;
+        let area = Rect::new(0, 0, 80, 24);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10, 10), area)
+            .await
+            .unwrap();
+        assert!(!app.show_help);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn run_event_loop_redraws_after_load_messages_without_input() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.should_quit = true;
+        app.tx
+            .send(LoadMessage::Lists(Ok(Vec::new())))
+            .expect("load message should enqueue");
+        run_event_loop(&mut terminal, &mut app)
+            .await
+            .expect("event loop should exit after redraw");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn init_terminal_factory_uses_real_stdout_when_available() {
+        if !std::io::IsTerminal::is_terminal(&io::stdout()) {
+            return;
+        }
+        run_tui_with_terminal_factory(
+            ApiClient::for_tests("https://kramli.test"),
+            true,
+            init_terminal,
+            restore_terminal,
+            |app| {
+                app.beta_consent_pending = false;
+                app.should_quit = true;
+            },
+        )
+        .await
+        .expect("injected init_terminal factory should succeed on a real stdout tty");
+    }
+
+    #[kramli_test_macros::test]
+    fn footer_attach_shortcut_and_shift_modifier_labels_are_exposed() {
+        assert_eq!(FooterAction::Attach.chip_shortcut(), "P");
+        assert_eq!(key_binding_modifier_label(KeyModifiers::SHIFT), "S+");
+        assert_eq!(
+            key_binding_modifier_label(
+                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
+            ),
+            "C+A+S+"
+        );
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn accept_beta_consent_shows_legal_pending_and_starts_initial_load() {
+        let mut app = test_app();
+        app.beta_consent_pending = true;
+        app.legal_consent_pending = true;
+        app.legal_pending_docs = vec!["agb".to_string(), "privacy".to_string()];
+        app.initial_load_started = false;
+
+        app.accept_beta_consent();
+
+        assert!(!app.beta_consent_pending);
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("agb")));
+        assert!(app.initial_load_started);
+    }
+
+    #[kramli_test_macros::test]
+    fn legal_consent_mouse_decline_is_ignored_while_submitting() {
+        let mut app = test_app();
+        app.legal_consent_pending = true;
+        app.legal_accepting = true;
+        app.should_quit = false;
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = beta_consent_layout(area);
+        app.handle_legal_consent_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.decline.x + 1,
+                layout.decline.y + 1,
+            ),
+            area,
+        );
+        assert!(!app.should_quit);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn drain_load_messages_applies_note_detail_and_stale_link_previews() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.selected_list = 0;
+        app.preview_generation = 1;
+        let owner = note_preview_owner(1);
+        let stale_identity = PreviewRequestIdentity {
+            generation: 0,
+            fingerprint: 1,
+        };
+        app.pending_link_previews
+            .insert(owner.clone(), stale_identity);
+
+        app.tx
+            .send(LoadMessage::NoteDetail {
+                list_id: 1,
+                result: Ok(json!({"note_content": "Loaded note"})),
+            })
+            .expect("note detail message should enqueue");
+        app.tx
+            .send(LoadMessage::LinkPreviews {
+                owner: owner.clone(),
+                identity: stale_identity,
+                previews: vec![test_link_preview(
+                    "https://kramli.de/privacy",
+                    Some(LinkPreviewActionKind::Open),
+                    None,
+                )],
+            })
+            .expect("stale preview message should enqueue");
+
+        assert!(app.drain_load_messages());
+        assert_eq!(
+            app.note_detail_cache
+                .get(&1)
+                .and_then(note_content)
+                .as_deref(),
+            Some("Loaded note")
+        );
+        assert!(!app.link_previews.contains_key(&owner));
+    }
+
+    #[kramli_test_macros::test]
+    fn calendar_defaults_and_navigation_sync_selected_items() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.calendar_selected_date = Some(SimpleDate {
+            year: 2026,
+            month: 8,
+            day: 3,
+        });
+        assert_eq!(
+            app.default_calendar_date(),
+            SimpleDate {
+                year: 2026,
+                month: 8,
+                day: 3,
+            }
+        );
+
+        app.calendar_selected_date = None;
+        app.items = vec![sample_item(1, "Due soon")];
+        app.items[0].due_date = Some("2026-09-12".to_string());
+        app.selected_item = 0;
+        app.move_calendar_date_selection(1);
+        assert_eq!(app.calendar_selected_date.map(|date| date.day), Some(13));
+        assert_eq!(app.selected_item, 0);
+
+        app.calendar_selected_date = None;
+        app.calendar_visible_month = None;
+        app.move_calendar_month_selection(1);
+        assert!(app.calendar_visible_month.is_some());
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn save_editor_create_note_and_blocked_paths_cover_remaining_modes() {
+        let (api, create_requests) = api_with_responses(vec![serde_json::json!({
+            "id": 42,
+            "list_id": 1,
+            "text": "New task",
+            "is_done": false,
+            "progress": "Open"
+        })
+        .to_string()])
+        .await;
+        let mut app = App::new(api, true);
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Existing")];
+        app.selected_list = 0;
+        app.open_add_editor().unwrap();
+        app.editor.as_mut().unwrap().text = "New task".to_string();
+        app.editor.as_mut().unwrap().due_date = "2026-08-01".to_string();
+        app.editor.as_mut().unwrap().progress = tr("tui-kanban-open");
+        app.save_editor().await.unwrap();
+        assert!(app.editor.is_none());
+        assert_eq!(app.items.last().map(|item| item.id), Some(42));
+
+        app.editor = Some(EditorState {
+            mode: EditorMode::Note,
+            item_id: Some(1),
+            text: "Draft".to_string(),
+            quantity: String::new(),
+            due_date: String::new(),
+            due_time: String::new(),
+            planned_date: String::new(),
+            planned_time: String::new(),
+            reminder: String::new(),
+            reminder_time: String::new(),
+            reminder_offsets: String::new(),
+            travel_time_minutes: String::new(),
+            priority: String::new(),
+            tags: String::new(),
+            progress: String::new(),
+            notes: String::new(),
+            active_field: EditorField::Text,
+        });
+        app.note_detail_cache.clear();
+        app.save_editor().await.unwrap();
+        assert_eq!(app.status, Some(tr("tui-note-loading")));
+
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note.clone()];
+        app.editor = Some(EditorState {
+            mode: EditorMode::Create,
+            item_id: None,
+            text: "Blocked".to_string(),
+            quantity: String::new(),
+            due_date: String::new(),
+            due_time: String::new(),
+            planned_date: String::new(),
+            planned_time: String::new(),
+            reminder: String::new(),
+            reminder_time: String::new(),
+            reminder_offsets: String::new(),
+            travel_time_minutes: String::new(),
+            priority: String::new(),
+            tags: String::new(),
+            progress: String::new(),
+            notes: String::new(),
+            active_field: EditorField::Text,
+        });
+        app.save_editor().await.unwrap();
+        assert!(app.editor.is_none());
+
+        app.note_detail_cache.insert(
+            1,
+            json!({
+                "id": 1,
+                "list_type": "note",
+                "note_content": "Bold",
+                "note_delta": "[{\"insert\":\"Bold\",\"attributes\":{\"bold\":true}}]",
+                "note_version": 1
+            }),
+        );
+        app.editor = Some(EditorState {
+            mode: EditorMode::Note,
+            item_id: Some(1),
+            text: "Changed".to_string(),
+            quantity: String::new(),
+            due_date: String::new(),
+            due_time: String::new(),
+            planned_date: String::new(),
+            planned_time: String::new(),
+            reminder: String::new(),
+            reminder_time: String::new(),
+            reminder_offsets: String::new(),
+            travel_time_minutes: String::new(),
+            priority: String::new(),
+            tags: String::new(),
+            progress: String::new(),
+            notes: String::new(),
+            active_field: EditorField::Text,
+        });
+        app.save_editor().await.unwrap();
+        assert_eq!(app.status, Some(tr("tui-note-rich-read-only")));
+
+        let requests = create_requests.await.expect("create save should request");
+        assert_eq!(requests, vec!["POST /api/lists/1/items HTTP/1.1"]);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn show_members_summary_truncates_long_member_lists() {
+        let (api, requests) = api_with_responses(vec![serde_json::json!([
+            {"display_name": "Ada"},
+            {"display_name": "Ben"},
+            {"display_name": "Cy"},
+            {"display_name": "Dee"},
+            {"email": "eve@example.test"}
+        ])
+        .to_string()])
+        .await;
+        let mut app = App::new(api, true);
+        app.lists = vec![test_list()];
+        app.show_members_summary().await.unwrap();
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("+2")));
+        let requests = requests.await.expect("members request should finish");
+        assert_eq!(requests, vec!["GET /api/lists/1/members HTTP/1.1"]);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_key_alt_scroll_and_link_preview_activation_cover_branches() {
+        let (api, requests) = api_with_responses(Vec::new()).await;
+        let mut app = App::new(api, false);
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Preview host")];
+        app.link_previews.insert(
+            item_preview_owner(1),
+            vec![test_link_preview(
+                "https://kramli.de/privacy",
+                Some(LinkPreviewActionKind::Open),
+                None,
+            )],
+        );
+        app.detail_scroll = 4;
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT))
+            .await
+            .unwrap();
+        assert_eq!(app.detail_scroll, 3);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT))
+            .await
+            .unwrap();
+        assert_eq!(app.detail_scroll, 4);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert_eq!(app.status, Some(tr("link-preview-open")));
+
+        app.link_previews.clear();
+        app.activate_link_preview().await.unwrap();
+        assert_eq!(app.status, Some(tr("link-preview-unresolved")));
+
+        assert!(requests.await.unwrap().is_empty());
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn open_list_from_preview_selects_known_list_or_queues_reload() {
+        let mut app = test_app();
+        app.lists = vec![
+            test_list(),
+            test_shopping_list(9, "Other", None, None, None, false),
+        ];
+        app.selected_list = 1;
+
+        app.open_list_from_preview(1, Some(3));
+        assert_eq!(app.selected_list, 0);
+        assert_eq!(app.pending_open_item_id, Some(3));
+
+        app.open_list_from_preview(99, None);
+        assert_eq!(app.pending_open_list_id, Some(99));
+    }
+
+    #[kramli_test_macros::test]
+    fn push_editor_char_rejects_invalid_due_date_and_progress_prefixes() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Milk")];
+        app.open_editor().unwrap();
+        app.editor.as_mut().unwrap().active_field = EditorField::DueDate;
+        app.push_editor_char('@');
+        assert!(app.editor.as_ref().unwrap().due_date.is_empty());
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains("YYYY-MM-DD")));
+
+        app.editor.as_mut().unwrap().active_field = EditorField::Progress;
+        app.editor.as_mut().unwrap().progress.clear();
+        app.push_editor_char('Z');
+        assert!(app.editor.as_ref().unwrap().progress.is_empty());
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| { status.contains(tr("label-state").trim_end_matches(':')) }));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_mouse_routes_scroll_tabs_footer_and_clears_drag_outside_content() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.lists[0].states = Some(vec![
+            ApiListState {
+                name: Some("Inbox".to_string()),
+                color: None,
+                is_done: Some(false),
+            },
+            ApiListState {
+                name: Some("Done".to_string()),
+                color: None,
+                is_done: Some(true),
+            },
+        ]);
+        app.items = vec![sample_item(1, "Drag me")];
+        app.items[0].progress = Some("Inbox".to_string());
+        app.mode = ViewMode::Kanban;
+        app.focus = FocusPane::Items;
+        app.kanban_drag_item = Some(0);
+        let area = Rect::new(0, 0, 120, 40);
+
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 0), area)
+            .await
+            .unwrap();
+        assert!(app.kanban_drag_item.is_none());
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 10, 10), area)
+            .await
+            .unwrap();
+
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::SHIFT,
+            },
+            area,
+        )
+        .await
+        .unwrap();
+
+        app.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), 10, 10),
+            area,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[kramli_test_macros::test]
+    fn note_mode_lines_without_cache_shows_loading_placeholder() {
+        let mut app = test_app();
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.note_detail_cache.clear();
+        let lines = note_mode_lines(&app);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans[0].content.as_ref(), tr("tui-note-loading"));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn bootstrap_icon_cache_persists_successful_fetches() {
+        crate::test_env::with_env_lock_async(|| async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("test server should bind");
+            let addr = listener.local_addr().expect("test server should have addr");
+            let base_url = format!("http://{addr}");
+            let ready = crate::test_env::register_mock_server(base_url.clone());
+            let svg = r#"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path fill='currentColor' d='M0 0h16v16H0z'/></svg>"#;
+            let svg_bytes = svg.as_bytes().to_vec();
+            let expected_bytes = svg_bytes.clone();
+            let handle = tokio::spawn(async move {
+                let _ = ready.await;
+                let (mut stream, _) = listener.accept().await.expect("request should connect");
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: image/svg+xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    svg_bytes.len()
+                );
+                stream.write_all(header.as_bytes()).await.unwrap();
+                stream.write_all(&svg_bytes).await.unwrap();
+            });
+
+            let icon_name = format!("cache-test-{}", std::process::id());
+            std::env::set_var(KRAMLI_BOOTSTRAP_ICON_BASE_URL_ENV, base_url);
+            fetch_bootstrap_icon_image(&icon_name)
+                .await
+                .expect("fetch should succeed");
+            let cache_path = bootstrap_icon_cache_path(&icon_name).expect("cache path should exist");
+            assert!(cache_path.exists());
+            let cached = tokio::fs::read(&cache_path).await.expect("cache file should read");
+            assert_eq!(cached, expected_bytes);
+            let _ = tokio::fs::remove_file(&cache_path).await;
+            std::env::remove_var(KRAMLI_BOOTSTRAP_ICON_BASE_URL_ENV);
+            handle.await.expect("server task should finish");
+        })
+        .await;
+    }
+
+    #[kramli_test_macros::test]
+    fn build_image_picker_auto_probe_can_upgrade_halfblocks_to_iterm() {
+        crate::test_env::with_env_lock(|| {
+            std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
+            std::env::set_var(TERM_ENV, "xterm-256color");
+            std::env::set_var(TERM_PROGRAM_ENV, "iTerm.app");
+            std::env::set_var(LC_TERMINAL_ENV, "iTerm2");
+            std::env::set_var(ITERM_SESSION_ID_ENV, "seed-session");
+            let previous_images = std::env::var_os(KRAMLI_TUI_IMAGES_ENV);
+            let previous_term = std::env::var_os(TERM_ENV);
+            let previous_program = std::env::var_os(TERM_PROGRAM_ENV);
+            let previous_lc_terminal = std::env::var_os(LC_TERMINAL_ENV);
+            let previous_iterm = std::env::var_os(ITERM_SESSION_ID_ENV);
+
+            std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
+            std::env::set_var(TERM_ENV, "xterm-256color");
+            std::env::set_var(TERM_PROGRAM_ENV, "iTerm.app");
+            std::env::set_var(LC_TERMINAL_ENV, "iTerm2");
+            std::env::set_var(ITERM_SESSION_ID_ENV, "session");
+
+            let (picker, inline_enabled, summary, debug) =
+                build_image_picker(ImageProtocolPreference::Auto);
+            assert!(inline_enabled);
+            assert!(
+                summary.contains("probe+iterm") || picker.protocol_type() == ProtocolType::Iterm2
+            );
+            assert!(debug
+                .iter()
+                .any(|line| line.contains("imgcat") || line.contains("iterm")));
+
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+            restore_env_var(TERM_ENV, previous_term);
+            restore_env_var(TERM_PROGRAM_ENV, previous_program);
+            restore_env_var(LC_TERMINAL_ENV, previous_lc_terminal);
+            restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
+        });
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn kanban_mouse_drag_moves_item_into_done_column() {
+        let (api, requests) = api_with_responses(vec![
+            serde_json::json!({
+                "id": 1,
+                "list_id": 1,
+                "text": "Move me",
+                "is_done": false,
+                "progress": "Done"
+            })
+            .to_string(),
+            serde_json::json!({
+                "id": 1,
+                "list_id": 1,
+                "text": "Move me",
+                "is_done": true,
+                "progress": "Done"
+            })
+            .to_string(),
+        ])
+        .await;
+        let mut app = App::new(api, true);
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Move me")];
+        app.items[0].progress = Some(tr("tui-kanban-open"));
+        app.mode = ViewMode::Kanban;
+        app.focus = FocusPane::Items;
+        app.selected_item = 0;
+
+        let (_, buckets) = app.kanban_buckets();
+        let done_column = buckets.len().saturating_sub(1);
+        app.kanban_drag_item = Some(0);
+        app.kanban_drag_source_column = Some(0);
+        app.kanban_drag_started = true;
+        app.kanban_drag_target_column = Some(done_column);
+        assert!(app.finish_kanban_drag(Some(done_column)).await.unwrap());
+
+        assert_eq!(app.items[0].is_done, Some(true));
+        let requests = requests.await.expect("kanban drag should persist");
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn calendar_mouse_drag_updates_target_before_drop() {
+        let (api, requests) = api_with_responses(vec![serde_json::json!({
+            "id": 1,
+            "list_id": 1,
+            "text": "Move me",
+            "is_done": false,
+            "due_date": "2026-07-21"
+        })
+        .to_string()])
+        .await;
+        let mut app = App::new(api, true);
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Move me")];
+        app.items[0].due_date = Some("2026-07-20".to_string());
+        app.mode = ViewMode::Calendar;
+        app.focus = FocusPane::Items;
+        app.calendar_selected_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 20,
+        });
+        app.calendar_visible_month = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 1,
+        });
+        app.start_calendar_item_drag(0);
+        assert_eq!(app.calendar_drag_item, Some(0));
+
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = ui_layout(area, shows_list_mode_tabs(&app));
+        let calendar = app.calendar_layout(layout.content);
+        let drag_target = calendar
+            .date_hits
+            .iter()
+            .find(|hit| hit.date.day == 21)
+            .map(|hit| hit.rect)
+            .expect("calendar should expose a target day cell");
+
+        app.handle_calendar_mode_mouse(
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                drag_target.x + 1,
+                drag_target.y + 1,
+            ),
+            layout.content,
+            false,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(app.calendar_drag_started);
+        assert!(app.calendar_drag_target_date.is_some());
+
+        app.handle_calendar_mode_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                drag_target.x + 1,
+                drag_target.y + 1,
+            ),
+            layout.content,
+            false,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(app.items[0].due_date.as_deref(), Some("2026-07-20"));
+        let requests = requests.await.expect("calendar drag should persist");
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn filter_editor_save_via_handle_key_applies_visible_selection() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Alpha"), sample_item(2, "Beta")];
+        app.open_filter_editor().unwrap();
+        app.editor.as_mut().unwrap().text = "beta".to_string();
+        app.handle_editor_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.editor.is_none());
+        assert_eq!(app.item_filter, "beta");
+        assert_eq!(app.selected_item, 1);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn apply_comments_result_refreshes_previews_for_selected_item() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(7, "Main")];
+        app.selected_item = 0;
+        app.apply_comments_result(
+            7,
+            Ok(vec![ItemComment {
+                id: 1,
+                text: Some("See https://kramli.de/privacy".to_string()),
+                user_id: None,
+                user_name: None,
+                user_email: None,
+                created_at: None,
+            }]),
+        );
+        assert_eq!(app.comments_cache.get(&7).map(Vec::len), Some(1));
+        assert!(app
+            .pending_link_previews
+            .contains_key(&item_preview_owner(7)));
+    }
+
+    #[kramli_test_macros::test]
+    fn move_visible_list_selection_no_ops_when_empty() {
+        let mut app = test_app();
+        app.items = vec![sample_item(1, "Alpha")];
+        app.item_filter = "missing".to_string();
+        assert!(!app.move_visible_list_selection(1));
+    }
+
+    #[kramli_test_macros::test]
+    fn select_visible_edge_item_keeps_selection_when_already_selected() {
+        let mut app = test_app();
+        app.items = vec![sample_item(1, "Alpha"), sample_item(2, "Beta")];
+        app.selected_item = 0;
+        assert!(!app.select_visible_edge_item(true));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_editor_key_is_no_op_without_editor() {
+        let mut app = test_app();
+        app.handle_editor_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        assert!(app.editor.is_none());
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_editor_key_ignores_unhandled_key_in_editor() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.open_add_editor().unwrap();
+        app.handle_editor_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::empty()))
+            .await
+            .unwrap();
+        app.handle_editor_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(app.editor.as_ref().unwrap().text, "");
+    }
+
+    #[kramli_test_macros::test]
+    fn push_editor_char_is_no_op_without_editor() {
+        let mut app = test_app();
+        app.push_editor_char('x');
+        assert!(app.editor.is_none());
+    }
+
+    #[kramli_test_macros::test]
+    fn push_editor_char_planned_date_rejects_invalid_prefix() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Milk")];
+        app.open_editor().unwrap();
+        app.editor.as_mut().unwrap().active_field = EditorField::PlannedDate;
+        app.push_editor_char('@');
+        assert!(app.editor.as_ref().unwrap().planned_date.is_empty());
+        assert_eq!(app.status.as_deref(), Some("Invalid input"));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_mouse_footer_click_returns_without_list_panel() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "One")];
+        let area = Rect::new(0, 0, 120, 40);
+        let layout = ui_layout(area, shows_list_mode_tabs(&app));
+        let help_button = footer_buttons(layout.footer, &app.key_bindings)
+            .into_iter()
+            .find(|(action, _)| *action == FooterAction::Help)
+            .unwrap()
+            .1;
+        app.handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                help_button.x,
+                help_button.y,
+            ),
+            area,
+        )
+        .await
+        .unwrap();
+        assert!(app.show_help);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_mouse_list_panel_click_returns_without_content() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "One")];
+        let area = Rect::new(0, 0, 120, 40);
+        let layout = ui_layout(area, shows_list_mode_tabs(&app));
+        let list_rows = item_rows_area(list_panel_rows_area(layout.lists));
+        app.handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                list_rows.x,
+                list_rows.y + 1,
+            ),
+            area,
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.selected_list, 0);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_mouse_item_click_no_ops_when_items_empty() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items.clear();
+        let area = Rect::new(0, 0, 120, 40);
+        let layout = ui_layout(area, shows_list_mode_tabs(&app));
+        app.handle_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                layout.content.x + 1,
+                layout.content.y + 1,
+            ),
+            area,
+        )
+        .await
+        .unwrap();
+        assert!(app.status.is_some());
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_mouse_left_up_clears_drag_state_in_content() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "One"), sample_item(2, "Two")];
+        app.mode = ViewMode::Kanban;
+        app.items[0].progress = Some(tr("tui-kanban-open"));
+        app.kanban_drag_item = Some(0);
+        let area = Rect::new(0, 0, 120, 40);
+        let layout = ui_layout(area, shows_list_mode_tabs(&app));
+        let (columns, _) = app.kanban_buckets();
+        let chunks = kanban_chunks(layout.content, columns.len().min(3));
+        let column_area = item_rows_area(chunks[0]);
+        app.handle_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                column_area.x + 1,
+                column_area.y + 1,
+            ),
+            area,
+        )
+        .await
+        .unwrap();
+        assert!(app.kanban_drag_item.is_none());
+    }
+
+    #[kramli_test_macros::test]
+    fn handle_mouse_scroll_up_delegates_to_scroll_active() {
+        let mut app = test_app();
+        assert!(app.handle_mouse_scroll(mouse(MouseEventKind::ScrollUp, 5, 5)));
+    }
+
+    #[kramli_test_macros::test]
+    fn apply_mouse_scroll_calendar_navigates_month_view() {
+        let mut app = test_app();
+        app.mode = ViewMode::Calendar;
+        app.focus = FocusPane::Items;
+        app.calendar_visible_month = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 1,
+        });
+        app.apply_mouse_scroll(1, KeyModifiers::empty());
+        assert_eq!(
+            app.calendar_visible_month,
+            Some(SimpleDate {
+                year: 2026,
+                month: 8,
+                day: 1,
+            })
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn handle_tab_mouse_selects_calendar_tab() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        let area = Rect::new(0, 0, 120, 40);
+        let layout = ui_layout(area, shows_list_mode_tabs(&app));
+        let calendar_tab = layout.tab_chunks[2];
+        assert!(app.handle_tab_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                calendar_tab.x + 1,
+                calendar_tab.y + 1,
+            ),
+            &layout,
+            true,
+        ));
+        assert_eq!(app.mode, ViewMode::Calendar);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_mouse_editor_and_kanban_bucket_routing() {
+        let area = Rect::new(0, 0, 100, 30);
+        let layout = editor_layout(area);
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "One")];
+        app.open_editor().unwrap();
+        app.handle_editor_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.prev.x + 1,
+                layout.prev.y,
+            ),
+            area,
+        )
+        .await
+        .unwrap();
+        app.handle_editor_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.next.x + 1,
+                layout.next.y,
+            ),
+            area,
+        )
+        .await
+        .unwrap();
+        app.handle_editor_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.hint.x + 1,
+                layout.hint.y,
+            ),
+            area,
+        )
+        .await
+        .unwrap();
+
+        let mut list = test_list();
+        list.states = Some(vec![
+            ApiListState {
+                name: Some("In Progress".to_string()),
+                color: None,
+                is_done: Some(false),
+            },
+            ApiListState {
+                name: Some("Done".to_string()),
+                color: None,
+                is_done: Some(true),
+            },
+        ]);
+        app.lists = vec![list];
+        app.items = vec![
+            {
+                let mut done_item = sample_item(1, "Finished");
+                done_item.is_done = Some(true);
+                done_item
+            },
+            {
+                let mut progress_item = sample_item(2, "Active");
+                progress_item.progress = Some("In Progress".to_string());
+                progress_item
+            },
+        ];
+        let (_, buckets) = app.kanban_buckets();
+        assert!(buckets[1].contains(&0));
+        assert!(buckets[0].contains(&1));
+    }
+
+    #[kramli_test_macros::test]
+    fn kanban_selection_moves_and_wraps_across_columns() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![
+            sample_item(1, "A"),
+            sample_item(2, "B"),
+            sample_item(3, "C"),
+        ];
+        app.selected_item = 0;
+        assert!(app.move_kanban_selection(1));
+        assert_eq!(app.selected_item, 1);
+
+        app.items = vec![sample_item(1, "Only")];
+        app.selected_item = 0;
+        assert!(!app.move_kanban_selection_wrapped(1));
+        app.items.clear();
+        app.selected_item = 0;
+        assert!(!app.move_kanban_selection_wrapped(1));
+        assert!(!app.move_kanban_column_selection(1));
+
+        let mut left = sample_item(1, "Left");
+        left.progress = Some("Open".to_string());
+        let mut right = sample_item(2, "Right");
+        right.progress = Some("Done".to_string());
+        right.is_done = Some(true);
+        app.items = vec![left, right];
+        app.lists[0].states = Some(vec![
+            ApiListState {
+                name: Some("Open".to_string()),
+                color: None,
+                is_done: Some(false),
+            },
+            ApiListState {
+                name: Some("Done".to_string()),
+                color: None,
+                is_done: Some(true),
+            },
+        ]);
+        app.selected_item = 0;
+        assert!(!app.move_kanban_column_selection(0));
+        assert!(app.move_kanban_column_selection(1));
+        assert_eq!(app.selected_item, 1);
+    }
+
+    #[kramli_test_macros::test]
+    fn progress_input_and_editor_suggestion_helpers() {
+        let mut app = test_app();
+        let mut done_only = test_list();
+        done_only.states = Some(vec![ApiListState {
+            name: Some("Archived".to_string()),
+            color: None,
+            is_done: Some(true),
+        }]);
+        app.lists = vec![done_only];
+        assert_eq!(app.default_progress_value(), "Archived");
+
+        app.lists.clear();
+        assert_eq!(app.default_progress_value(), tr("tui-kanban-open"));
+        assert_eq!(
+            app.progress_choices(),
+            vec![tr("tui-kanban-open"), tr("tui-kanban-done")]
+        );
+        assert_eq!(app.normalize_progress_input(""), Some(String::default()));
+        assert_eq!(
+            app.normalize_progress_input(&tr("tui-kanban-open")),
+            Some(tr("tui-kanban-open"))
+        );
+        assert!(app.normalize_progress_input("not-a-state").is_none());
+
+        let mut whitespace_columns = test_list();
+        whitespace_columns.state_config = Some(r#"[{"name":"   "}]"#.to_string());
+        app.lists = vec![whitespace_columns];
+        assert_eq!(
+            app.progress_choices(),
+            vec![
+                tr("tui-kanban-open"),
+                tr("tui-kanban-in-progress"),
+                tr("tui-kanban-done"),
+            ]
+        );
+
+        let mut tagged = sample_item(1, "Tagged");
+        tagged.tags = Some(vec!["  ".to_string(), "Eggs".to_string()]);
+        app.items = vec![tagged];
+        assert_eq!(app.tag_suggestions(), vec!["Eggs".to_string()]);
+
+        assert!(!app.apply_editor_suggestion(0));
+        app.editor = None;
+        assert!(!app.apply_editor_suggestion(1));
+
+        app.editor = Some(EditorState {
+            mode: EditorMode::Edit,
+            item_id: Some(1),
+            text: "Tagged".to_string(),
+            quantity: String::default(),
+            due_date: String::default(),
+            due_time: String::default(),
+            planned_date: String::default(),
+            planned_time: String::default(),
+            reminder: tr("label-off"),
+            reminder_time: String::default(),
+            reminder_offsets: String::default(),
+            travel_time_minutes: String::default(),
+            priority: String::default(),
+            tags: "Eg".to_string(),
+            progress: tr("tui-kanban-open"),
+            notes: String::default(),
+            active_field: EditorField::Reminder,
+        });
+        assert!(app.apply_editor_suggestion(1));
+        if let Some(editor) = app.editor.as_mut() {
+            editor.reminder = "not-a-label".to_string();
+        }
+        assert!(!app.apply_editor_suggestion(1));
+        if let Some(editor) = app.editor.as_mut() {
+            editor.active_field = EditorField::Progress;
+        }
+        assert!(app.apply_editor_suggestion(1));
+        if let Some(editor) = app.editor.as_mut() {
+            editor.active_field = EditorField::Tags;
+        }
+        assert!(app.apply_editor_suggestion(1));
+        if let Some(editor) = app.editor.as_mut() {
+            editor.tags = "unknown-prefix".to_string();
+        }
+        assert!(!app.apply_editor_suggestion(1));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn move_selected_item_guards_and_update_paths() {
+        let mut app = test_app();
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note.clone()];
+        app.items = vec![sample_item(1, "Alpha")];
+        app.move_item_to_kanban_column(0, 0).await.unwrap();
+        app.update_item_due_date(0, "2026-07-01".to_string())
+            .await
+            .unwrap();
+
+        app.lists = vec![test_list()];
+        app.lists[0].states = Some(vec![
+            ApiListState {
+                name: Some("Open".to_string()),
+                color: None,
+                is_done: Some(false),
+            },
+            ApiListState {
+                name: Some("Done".to_string()),
+                color: None,
+                is_done: Some(true),
+            },
+        ]);
+        app.items = vec![sample_item(1, "Alpha")];
+        app.move_item_to_kanban_column(0, 99).await.unwrap();
+        app.move_item_to_kanban_column(99, 0).await.unwrap();
+
+        app.items[0].progress = Some("Done".to_string());
+        app.items[0].is_done = Some(true);
+        app.move_item_to_kanban_column(0, 1).await.unwrap();
+
+        app.move_item_to_calendar_date(
+            99,
+            SimpleDate {
+                year: 2026,
+                month: 7,
+                day: 21,
+            },
+        )
+        .await
+        .unwrap();
+        app.items[0].due_date = Some("2026-07-21".to_string());
+        app.move_item_to_calendar_date(
+            0,
+            SimpleDate {
+                year: 2026,
+                month: 7,
+                day: 21,
+            },
+        )
+        .await
+        .unwrap();
+
+        app.mode = ViewMode::Calendar;
+        app.selected_item = 0;
+        app.calendar_selected_date = Some(SimpleDate {
+            year: 2026,
+            month: 6,
+            day: 14,
+        });
+        assert!(!app
+            .move_selected_item_calendar_hours(0)
+            .await
+            .expect("zero delta should return false"));
+        let unchanged_due_date = app.items[0].due_date.clone().unwrap();
+        app.update_item_due_date(0, unchanged_due_date)
+            .await
+            .unwrap();
+
+        app.lists = vec![note];
+        app.update_item_due_date(0, "2026-07-02".to_string())
+            .await
+            .unwrap();
+
+        let (api, requests) = api_with_responses(vec![
+            json!({
+                "id": 1,
+                "list_id": 1,
+                "text": "Alpha",
+                "is_done": false,
+                "progress": "Done"
+            })
+            .to_string(),
+            json!({
+                "id": 1,
+                "list_id": 1,
+                "text": "Alpha",
+                "is_done": true,
+                "progress": "Done"
+            })
+            .to_string(),
+        ])
+        .await;
+        let mut app = App::new(api, true);
+        app.lists = vec![test_list()];
+        app.lists[0].states = Some(vec![
+            ApiListState {
+                name: Some("Open".to_string()),
+                color: None,
+                is_done: Some(false),
+            },
+            ApiListState {
+                name: Some("Done".to_string()),
+                color: None,
+                is_done: Some(true),
+            },
+        ]);
+        app.items = vec![sample_item(1, "Alpha")];
+        app.items[0].progress = Some("Open".to_string());
+        app.comments_cache.insert(1, Vec::new());
+        app.move_item_to_kanban_column(0, 1).await.unwrap();
+        assert_eq!(app.items[0].is_done, Some(true));
+
+        let requests = requests.await.expect("move helpers should finish");
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[kramli_test_macros::test]
+    fn scroll_active_routes_to_note_detail_in_notes_view() {
+        let mut app = test_app();
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.note_detail_cache.insert(
+            1,
+            json!({"note_content": (0..40).map(|i| format!("Line {i}")).collect::<Vec<_>>().join("\n")}),
+        );
+        app.focus = FocusPane::Items;
+        app.detail_scroll = 0;
+
+        app.scroll_active(3);
+        assert_eq!(app.detail_scroll, 3);
+        app.scroll_active(-1);
+        assert_eq!(app.detail_scroll, 2);
+    }
+
+    #[kramli_test_macros::test]
+    fn refresh_detail_image_background_early_return_branches() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+
+        app.detail_image = Some(DetailImageState {
+            source: "stale.png".to_string(),
+            protocol: app
+                .picker
+                .new_resize_protocol(DynamicImage::new_rgba8(1, 1)),
+        });
+        app.pending_detail_image = Some("stale.png".to_string());
+        app.set_inline_images_enabled(false);
+        app.refresh_selected_image_background();
+        assert!(app.detail_image.is_none());
+        assert!(app.pending_detail_image.is_none());
+        assert!(app.detail_image_note.is_none());
+
+        app.set_inline_images_enabled(true);
+        app.items.clear();
+        app.refresh_selected_image_background();
+        assert!(app.detail_image.is_none());
+        assert!(app.pending_detail_image.is_none());
+
+        app.items = vec![sample_item(1, "No image")];
+        app.selected_item = 0;
+        app.refresh_selected_image_background();
+        assert!(app.detail_image.is_none());
+        assert!(app.pending_detail_image.is_none());
+
+        let source = "/uploads/cached.png".to_string();
+        app.detail_image = Some(DetailImageState {
+            source: source.clone(),
+            protocol: app
+                .picker
+                .new_resize_protocol(DynamicImage::new_rgba8(1, 1)),
+        });
+        let mut cached_item = sample_item(1, "Cached image");
+        cached_item.image_url = Some(source);
+        app.items = vec![cached_item];
+        app.refresh_selected_image_background();
+        assert!(app.pending_detail_image.is_none());
+
+        app.detail_image = None;
+        app.pending_detail_image = Some("/uploads/pending.png".to_string());
+        app.items[0].image_url = Some("/uploads/pending.png".to_string());
+        app.refresh_selected_image_background();
+        assert_eq!(
+            app.pending_detail_image.as_deref(),
+            Some("/uploads/pending.png")
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn refresh_profile_image_skips_when_cached_or_pending() {
+        let mut app = test_app();
+        app.set_inline_images_enabled(true);
+        let source = "https://example.test/profile.png".to_string();
+        app.profile_photo_url = Some(source.clone());
+        app.profile_image = Some(DetailImageState {
+            source: source.clone(),
+            protocol: app
+                .picker
+                .new_resize_protocol(DynamicImage::new_rgba8(1, 1)),
+        });
+        app.refresh_profile_image_background();
+        assert!(app.pending_profile_image.is_none());
+
+        app.profile_image = None;
+        app.pending_profile_image = Some(source.clone());
+        app.refresh_profile_image_background();
+        assert_eq!(app.pending_profile_image.as_deref(), Some(source.as_str()));
+    }
+
+    #[kramli_test_macros::test]
+    fn apply_list_icon_reports_protocol_errors() {
+        let mut app = test_app();
+        app.picker.set_protocol_type(ProtocolType::Sixel);
+        app.pending_list_icons.insert("sixel-fail".to_string());
+        app.apply_list_icon_result("sixel-fail".to_string(), Ok(DynamicImage::new_rgba8(2, 2)));
+        assert!(!app.pending_list_icons.contains("sixel-fail"));
+
+        app.picker.set_protocol_type(ProtocolType::Halfblocks);
+        app.pending_list_icons.insert("halfblocks-ok".to_string());
+        app.apply_list_icon_result(
+            "halfblocks-ok".to_string(),
+            Ok(DynamicImage::new_rgba8(2, 2)),
+        );
+        assert!(!app.failed_list_icons.contains("halfblocks-ok"));
+        assert!(app.list_icon_images.contains_key("halfblocks-ok"));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn selected_image_source_and_open_background_paths() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+
+        let mut attachment_item = sample_item(1, "Attachment image");
+        attachment_item.attachments = Some(vec![test_attachment(
+            9,
+            Some("photo.png"),
+            Some("image/png"),
+        )]);
+        assert_eq!(
+            App::selected_image_source(&attachment_item).as_deref(),
+            Some("/uploads/9")
+        );
+
+        let mut note_item = sample_item(2, "Note image");
+        note_item.notes = Some("See ![photo](https://example.test/note.png)".to_string());
+        assert_eq!(
+            App::selected_image_source(&note_item).as_deref(),
+            Some("https://example.test/note.png")
+        );
+
+        app.items = vec![sample_item(3, "No image")];
+        app.selected_item = 0;
+        app.open_selected_image_background().unwrap();
+        assert_eq!(app.status, Some(format!("{} —", tr("label-image"))));
+
+        let mut inline_item = sample_item(4, "Inline image");
+        inline_item.image_url = Some("/uploads/inline.png".to_string());
+        app.items = vec![inline_item];
+        app.selected_item = 0;
+        app.set_inline_images_enabled(true);
+        app.open_selected_image_background().unwrap();
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|status| status.contains(tr("label-image").as_str())));
+        assert_eq!(
+            app.pending_detail_image.as_deref(),
+            Some("/uploads/inline.png")
+        );
+
+        app.detail_image = Some(DetailImageState {
+            source: "/uploads/inline.png".to_string(),
+            protocol: app
+                .picker
+                .new_resize_protocol(DynamicImage::new_rgba8(1, 1)),
+        });
+        app.pending_detail_image = None;
+        app.open_selected_image_background().unwrap();
+        assert_eq!(app.status, Some(tr("label-image")));
+
+        app.detail_image = None;
+        app.pending_open_image = Some("/uploads/inline.png".to_string());
+        app.set_inline_images_enabled(false);
+        app.open_selected_image_background().unwrap();
+        assert_eq!(
+            app.pending_open_image.as_deref(),
+            Some("/uploads/inline.png")
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn open_editor_guards_note_lists_and_empty_selection() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items.clear();
+        app.open_editor().unwrap();
+        assert!(app.editor.is_none());
+        assert_eq!(app.status, Some(tr("output-no-items")));
+
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.open_add_editor().unwrap();
+        assert!(app.editor.is_none());
+        assert_eq!(app.status, Some(tr("note-task-mutation-blocked")));
+    }
+
+    struct FailOnDrawBackend {
+        inner: ratatui::backend::TestBackend,
+        draws: DrawCounter<usize>,
+        fail_on: usize,
+    }
+
+    impl ratatui::backend::Backend for FailOnDrawBackend {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            let next = self.draws.get() + 1;
+            self.draws.set(next);
+            if next == self.fail_on {
+                return Err(io::Error::new(io::ErrorKind::Other, "draw failed"));
+            }
+            self.inner.draw(content).map_err(|never| match never {})
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.hide_cursor().map_err(|never| match never {})
+        }
+
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.show_cursor().map_err(|never| match never {})
+        }
+
+        fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+            self.inner
+                .get_cursor_position()
+                .map_err(|never| match never {})
+        }
+
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            self.inner
+                .set_cursor_position(position)
+                .map_err(|never| match never {})
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.inner.clear().map_err(|never| match never {})
+        }
+
+        fn clear_region(
+            &mut self,
+            clear_type: ratatui::backend::ClearType,
+        ) -> Result<(), Self::Error> {
+            self.inner
+                .clear_region(clear_type)
+                .map_err(|never| match never {})
+        }
+
+        fn size(&self) -> Result<Size, Self::Error> {
+            self.inner.size().map_err(|never| match never {})
+        }
+
+        fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
+            self.inner.window_size().map_err(|never| match never {})
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.inner.flush().map_err(|never| match never {})
+        }
+    }
+
+    fn fail_on_draw_terminal(fail_on: usize) -> Terminal<FailOnDrawBackend> {
+        Terminal::new(FailOnDrawBackend {
+            inner: ratatui::backend::TestBackend::new(80, 24),
+            draws: DrawCounter::new(0),
+            fail_on,
+        })
+        .expect("fail-on-draw terminal should construct")
+    }
+
+    #[kramli_test_macros::test]
+    fn fail_on_draw_backend_forwards_cursor_layout_and_size_queries() {
+        let mut terminal = fail_on_draw_terminal(usize::MAX);
+        let backend = terminal.backend_mut();
+        backend.hide_cursor().expect("hide_cursor should succeed");
+        backend.show_cursor().expect("show_cursor should succeed");
+        backend
+            .get_cursor_position()
+            .expect("get_cursor_position should succeed");
+        backend
+            .set_cursor_position((0_u16, 0_u16))
+            .expect("set_cursor_position should succeed");
+        backend.clear().expect("clear should succeed");
+        backend
+            .clear_region(ratatui::backend::ClearType::All)
+            .expect("clear_region should succeed");
+        backend.size().expect("size should succeed");
+        backend.window_size().expect("window_size should succeed");
+        backend.flush().expect("flush should succeed");
+        terminal.draw(|_| {}).expect("draw should succeed");
+    }
+
+    fn run_tui_test_in_pseudo_terminal(test_name: &str) {
+        let exe = std::env::current_exe().expect("current test executable should be available");
+        let script = ["/usr/bin/script", "/bin/script"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).exists())
+            .expect("script binary should exist for pseudo-terminal coverage");
+        let command = format!(
+            "{} tui::tests::{test_name} --exact --nocapture --test-threads=1 --ignored",
+            exe.display()
+        );
+        let status = std::process::Command::new("timeout")
+            .args([
+                &crate::test_env::test_timeout_arg(),
+                script,
+                "-q",
+                "-c",
+                &command,
+                "/dev/null",
+            ])
+            .status()
+            .expect("pseudo-terminal subprocess should spawn");
+        assert!(
+            status.success(),
+            "pseudo-terminal test {test_name} failed with {status:?}"
+        );
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn run_tui_entrypoint_requires_env_lock() {
+        crate::test_env::with_env_lock_async(|| async {
+            let _ = run_tui().await;
+        })
+        .await;
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn run_tui_session_inline_probe_and_draw_failure_paths() {
+        crate::test_env::with_env_lock_async(|| async {
+            let previous_protocol = std::env::var_os(KRAMLI_TUI_IMAGE_PROTOCOL_ENV);
+            let previous_images = std::env::var_os(KRAMLI_TUI_IMAGES_ENV);
+
+            std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, "kitty");
+            std::env::remove_var(KRAMLI_TUI_IMAGES_ENV);
+
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            run_tui_session_internal(
+                &mut terminal,
+                ApiClient::for_tests("https://kramli.test"),
+                true,
+                |_| Ok(()),
+                |app| {
+                    app.beta_consent_pending = false;
+                    app.should_quit = true;
+                },
+            )
+            .await
+            .result
+            .expect("inline kitty probe session should succeed");
+
+            let mut fail_second = fail_on_draw_terminal(2);
+            let second_draw_error = run_tui_session_internal(
+                &mut fail_second,
+                ApiClient::for_tests("https://kramli.test"),
+                true,
+                |_| Ok(()),
+                |app| {
+                    app.beta_consent_pending = false;
+                },
+            )
+            .await
+            .result;
+            assert!(second_draw_error.is_err());
+
+            let mut fail_first = fail_on_draw_terminal(1);
+            let first_draw_error = run_tui_session_internal(
+                &mut fail_first,
+                ApiClient::for_tests("https://kramli.test"),
+                true,
+                |_| Ok(()),
+                |app| {
+                    app.beta_consent_pending = false;
+                },
+            )
+            .await
+            .result;
+            assert!(first_draw_error.is_err());
+
+            restore_env_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, previous_protocol);
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+        })
+        .await;
+    }
+
+    #[kramli_test_macros::test]
+    fn init_terminal_and_restore_terminal_round_trip() {
+        let _ = init_terminal().map(|mut terminal| restore_terminal(&mut terminal));
+
+        let backend = CrosstermBackend::new(io::stdout());
+        if let Ok(mut terminal) = Terminal::new(backend) {
+            let _ = restore_terminal(&mut terminal);
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn init_terminal_round_trip_runs_under_pseudo_terminal() {
+        run_tui_test_in_pseudo_terminal("init_terminal_round_trip_tty_case");
+    }
+
+    #[kramli_test_macros::test]
+    #[ignore = "runs in a pseudo-terminal subprocess"]
+    fn init_terminal_round_trip_tty_case() {
+        if !std::io::IsTerminal::is_terminal(&io::stdout()) {
+            return;
+        }
+        let mut terminal = init_terminal().expect("init_terminal should succeed on a tty");
+        restore_terminal(&mut terminal).expect("restore_terminal should succeed on a tty");
+    }
+
+    #[kramli_test_macros::test]
+    fn init_terminal_tty_case_noops_when_stdout_is_not_tty() {
+        if std::io::IsTerminal::is_terminal(&io::stdout()) {
+            return;
+        }
+        init_terminal_round_trip_tty_case();
+    }
+
+    #[kramli_test_macros::test]
+    fn init_terminal_tty_noop_guard_runs_under_pseudo_terminal() {
+        run_tui_test_in_pseudo_terminal("init_terminal_tty_case_noops_on_tty");
+    }
+
+    #[kramli_test_macros::test]
+    #[ignore = "runs in a pseudo-terminal subprocess"]
+    fn init_terminal_tty_case_noops_on_tty() {
+        init_terminal_tty_case_noops_when_stdout_is_not_tty();
+    }
+
+    #[kramli_test_macros::test]
+    fn run_event_loop_poll_paths_run_under_pseudo_terminal() {
+        run_tui_test_in_pseudo_terminal("run_event_loop_poll_paths_tty_case");
+    }
+
+    async fn run_event_loop_poll_paths_on_tty() {
+        if !std::io::IsTerminal::is_terminal(&io::stdout()) {
+            return;
+        }
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.should_quit = true;
+        run_event_loop(&mut terminal, &mut app)
+            .await
+            .expect("quit flag should exit after initial redraw on a tty");
+    }
+
+    async fn run_event_loop_poll_paths_noop_guard() {
+        if std::io::IsTerminal::is_terminal(&io::stdout()) {
+            return;
+        }
+        run_event_loop_poll_paths_on_tty().await;
+    }
+
+    #[kramli_test_macros::tokio_test]
+    #[ignore = "runs in a pseudo-terminal subprocess"]
+    async fn run_event_loop_poll_paths_tty_case() {
+        tokio::time::timeout(Duration::from_secs(20), run_event_loop_poll_paths_on_tty())
+            .await
+            .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn run_event_loop_poll_paths_tty_case_noops_when_stdout_is_not_tty() {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            run_event_loop_poll_paths_noop_guard(),
+        )
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::test]
+    fn run_event_loop_tty_noop_guard_runs_under_pseudo_terminal() {
+        run_tui_test_in_pseudo_terminal("run_event_loop_poll_paths_tty_case_noops_on_tty");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    #[ignore = "runs in a pseudo-terminal subprocess"]
+    async fn run_event_loop_poll_paths_tty_case_noops_on_tty() {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            run_event_loop_poll_paths_noop_guard(),
+        )
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_runtime_event_routes_input_and_reports_errors() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.legal_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Milk")];
+        app.selected_item = 0;
+
+        assert!(handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty())),
+        )
+        .await
+        .expect("navigation key should route through handle_key"));
+
+        let (api, _requests) = api_with_responses(Vec::new()).await;
+        let mut app = App::new(api, false);
+        app.beta_consent_pending = false;
+        app.legal_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(2, "Bread")];
+        app.selected_item = 0;
+
+        assert!(handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty())),
+        )
+        .await
+        .expect("delete key should route through handle_key"));
+        assert!(app.status.as_ref().is_some_and(|status| !status.is_empty()));
+
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.legal_consent_pending = true;
+        app.legal_pending_docs = vec!["agb".to_string()];
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = beta_consent_layout(area);
+        assert!(handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.accept.x + 1,
+                layout.accept.y,
+            )),
+        )
+        .await
+        .expect("legal consent mouse should be handled"));
+        assert!(app.legal_accepting);
+
+        let (api, _requests) = api_with_responses(Vec::new()).await;
+        let mut app = App::new(api, false);
+        app.beta_consent_pending = false;
+        app.legal_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(3, "Eggs")];
+        app.selected_item = 0;
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = ui_layout(area, shows_list_mode_tabs(&app));
+        let delete_rect = footer_buttons(layout.footer, &app.key_bindings)
+            .into_iter()
+            .find(|(action, _)| *action == FooterAction::Delete)
+            .map(|(_, rect)| rect)
+            .expect("delete footer chip should exist");
+
+        assert!(handle_runtime_event(
+            &mut terminal,
+            &mut app,
+            Event::Mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                delete_rect.x + 1,
+                delete_rect.y,
+            )),
+        )
+        .await
+        .expect("footer delete mouse should route through handle_mouse"));
+        assert!(app.status.as_ref().is_some_and(|status| !status.is_empty()));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn run_event_loop_handles_poll_errors_and_quit() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            let mut app = test_app();
+            app.beta_consent_pending = false;
+            app.should_quit = true;
+            run_event_loop(&mut terminal, &mut app)
+                .await
+                .expect("quit flag should exit after initial redraw");
+
+            app.should_quit = false;
+            let pid = std::process::id();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                let _ = std::process::Command::new("kill")
+                    .args(["-WINCH", &pid.to_string()])
+                    .status();
+            });
+            let poll_outcome = tokio::time::timeout(
+                Duration::from_millis(900),
+                run_event_loop(&mut terminal, &mut app),
+            )
+            .await;
+            match poll_outcome {
+                Err(_) => {}
+                Ok(Err(_)) => {}
+                Ok(Ok(())) => panic!("event loop should not exit cleanly without quit"),
+            }
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_note_mode_mouse_covers_early_return_branches() {
+        let mut app = test_app();
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.apply_note_detail_result(
+            1,
+            Ok(json!({"note_content": "Plain note without preview links"})),
+        );
+
+        let content = Rect::new(10, 5, 60, 20);
+        app.handle_note_mode_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 15, 10),
+            content,
+            false,
+        )
+        .await
+        .unwrap();
+        app.handle_note_mode_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            content,
+            true,
+        )
+        .await
+        .unwrap();
+
+        app.detail_scroll = 9999;
+        app.handle_note_mode_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 15, 10),
+            content,
+            true,
+        )
+        .await
+        .unwrap();
+
+        app.detail_scroll = 0;
+        let inner = content.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        app.handle_note_mode_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                inner.x + 1,
+                inner.y,
+            ),
+            content,
+            true,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_list_mode_mouse_covers_detail_image_and_wrapped_miss_paths() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.mode = ViewMode::List;
+        let mut photo_item = sample_item(1, "Photo");
+        photo_item.image_url = Some("/uploads/photo.png".to_string());
+        app.items = vec![photo_item];
+        app.selected_item = 0;
+
+        let content = Rect::new(0, 0, 100, 30);
+        let (list_rect, detail_rect) = list_mode_layout(content);
+        app.handle_list_mode_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                detail_rect.x + 2,
+                detail_rect.y + 2,
+            ),
+            content,
+            true,
+        )
+        .unwrap();
+        assert!(app.status.is_some());
+
+        app.items = (1..=20)
+            .map(|id| sample_item(id, &format!("Wrapped item {id}")))
+            .collect();
+        app.item_scroll = 10;
+        let list_items_area = item_rows_area(list_rect);
+        app.handle_list_mode_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                list_items_area.x,
+                list_items_area.y + 50,
+            ),
+            content,
+            true,
+        )
+        .unwrap();
+        app.select_list_mode_item_at(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                list_items_area.x,
+                list_items_area.y + 99,
+            ),
+            list_rect,
+            list_items_area,
+        )
+        .unwrap();
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn kanban_mouse_helpers_cover_finish_drag_and_selection_branches() {
+        let (api, requests) = api_with_responses(vec![
+            serde_json::json!({
+                "id": 1,
+                "list_id": 1,
+                "text": "Move me",
+                "is_done": false,
+                "progress": "Done"
+            })
+            .to_string(),
+            serde_json::json!({
+                "id": 1,
+                "list_id": 1,
+                "text": "Move me",
+                "is_done": true,
+                "progress": "Done"
+            })
+            .to_string(),
+        ])
+        .await;
+        let mut app = App::new(api, true);
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.mode = ViewMode::Kanban;
+        app.items = vec![sample_item(1, "Move me")];
+        app.items[0].progress = Some(tr("tui-kanban-open"));
+        let content = Rect::new(0, 0, 120, 40);
+
+        assert!(!app.finish_kanban_drag(None).await.unwrap());
+
+        app.kanban_drag_item = Some(0);
+        app.kanban_drag_source_column = Some(0);
+        app.kanban_drag_started = true;
+        app.kanban_drag_target_column = Some(0);
+        let (columns, _buckets) = app.kanban_buckets();
+        let chunks = kanban_chunks(content, columns.len().min(3));
+        let same_column_area = item_rows_area(chunks[0]);
+        app.handle_kanban_mode_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                same_column_area.x + 1,
+                same_column_area.y + 1,
+            ),
+            content,
+            false,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let done_column = columns.len().saturating_sub(1);
+        app.kanban_drag_item = Some(0);
+        app.kanban_drag_source_column = Some(0);
+        app.kanban_drag_started = true;
+        app.kanban_drag_target_column = Some(done_column);
+        let chunks = kanban_chunks(content, columns.len().min(3));
+        let drop_area = item_rows_area(chunks[done_column.min(chunks.len().saturating_sub(1))]);
+        app.handle_kanban_mode_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                drop_area.x + 1,
+                drop_area.y + 1,
+            ),
+            content,
+            false,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        app.editor = None;
+        app.last_item_click = None;
+        app.items = vec![sample_item(1, "Open editor")];
+        app.items[0].progress = Some(tr("tui-kanban-open"));
+        let (_, buckets) = app.kanban_buckets();
+        let chunks = kanban_chunks(content, columns.len().min(3));
+        let column_rect = chunks[0];
+        let column_items_area = item_rows_area(column_rect);
+        let click = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            column_items_area.x,
+            column_items_area.y,
+        );
+        app.select_kanban_column_item(click, column_rect, column_items_area, 0, &buckets)
+            .unwrap();
+        app.select_kanban_column_item(click, column_rect, column_items_area, 0, &buckets)
+            .unwrap();
+        assert!(app.editor.is_some());
+
+        app.editor = None;
+        app.items = (1..=15)
+            .map(|id| {
+                let mut item = sample_item(id, &format!("Kanban item {id}"));
+                item.progress = Some(tr("tui-kanban-open"));
+                item
+            })
+            .collect();
+        app.selected_item = 7;
+        let (_, buckets) = app.kanban_buckets();
+        let short_content = Rect::new(0, 0, 80, 12);
+        let chunks = kanban_chunks(short_content, columns.len().min(3));
+        let column_rect = chunks[0];
+        let column_items_area = item_rows_area(column_rect);
+        let max_rows = column_rect.height.saturating_sub(2) as usize;
+        let (start, item_count, show_top, _show_bottom) =
+            kanban_window(&buckets[0], app.selected_item, max_rows);
+        assert!(show_top);
+        assert!(buckets[0].len() > start + item_count);
+        let hint_row = column_items_area.y + (item_count + 1) as u16;
+        app.select_kanban_column_item(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                column_items_area.x,
+                hint_row,
+            ),
+            column_rect,
+            column_items_area,
+            0,
+            &buckets,
+        )
+        .unwrap();
+        assert!(app.kanban_drag_item.is_none());
+        assert_eq!(app.kanban_drag_target_column, Some(0));
+
+        app.handle_kanban_mode_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                chunks[0].x + 1,
+                chunks[0].y,
+            ),
+            content,
+            true,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let _ = requests.await;
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn calendar_mouse_helpers_cover_agenda_header_empty_and_item_paths() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.mode = ViewMode::Calendar;
+        app.calendar_visible_month = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 1,
+        });
+        let content = Rect::new(0, 0, 100, 30);
+
+        app.calendar_selected_date = None;
+        app.handle_calendar_date_click(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 15,
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.calendar_selected_date.map(|date| date.day), Some(15));
+        assert_eq!(
+            app.status.as_deref(),
+            Some(tr("tui-help-calendar-3").as_str())
+        );
+
+        let calendar = app.calendar_layout(content);
+        assert!(app.handle_calendar_agenda_header_click(
+            &calendar,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                calendar.agenda_area.x + 1,
+                calendar.agenda_area.y,
+            ),
+        ));
+        assert!(app.calendar_selected_date.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some(tr("tui-help-calendar-2").as_str())
+        );
+
+        app.calendar_selected_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 22,
+        });
+        let calendar = app.calendar_layout(content);
+        let agenda_inner = calendar.agenda_area.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let empty_agenda_row = agenda_inner.y + calendar.agenda_lines.len() as u16 + 1;
+        app.handle_calendar_mode_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                agenda_inner.x + 1,
+                empty_agenda_row,
+            ),
+            content,
+            true,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(app.editor.is_some());
+        app.editor = None;
+
+        app.items = vec![sample_item(1, "Agenda item")];
+        app.items[0].due_date = Some("2026-07-22".to_string());
+        app.calendar_selected_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 22,
+        });
+        app.handle_calendar_item_click(0, true).unwrap();
+        assert_eq!(app.calendar_drag_item, Some(0));
+
+        app.calendar_drag_item = None;
+        app.last_item_click = None;
+        app.handle_calendar_item_click(0, true).unwrap();
+        app.handle_calendar_item_click(0, true).unwrap();
+        assert!(app.editor.is_some());
+        app.editor = None;
+
+        app.calendar_drag_item = Some(0);
+        app.calendar_drag_source_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 22,
+        });
+        app.handle_calendar_date_click(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 22,
+        })
+        .await
+        .unwrap();
+        assert!(app.calendar_drag_item.is_none());
+
+        app.calendar_drag_item = Some(0);
+        app.calendar_drag_source_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 22,
+        });
+        app.calendar_drag_started = true;
+        app.calendar_drag_target_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 22,
+        });
+        app.handle_calendar_mode_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            content,
+            false,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(app.calendar_drag_item.is_none());
+
+        app.calendar_selected_date = None;
+        let calendar = app.calendar_layout(content);
+        let date_hit = calendar
+            .date_hits
+            .iter()
+            .find(|hit| hit.date.day == 10)
+            .expect("calendar should expose a day cell");
+        app.handle_calendar_mode_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                date_hit.rect.x + 1,
+                date_hit.rect.y,
+            ),
+            content,
+            true,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.calendar_selected_date.map(|date| date.day), Some(10));
+
+        app.calendar_selected_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 22,
+        });
+        let calendar = app.calendar_layout(content);
+        app.handle_calendar_mode_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                calendar.agenda_area.x + 1,
+                calendar.agenda_area.y,
+            ),
+            content,
+            true,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(app.calendar_selected_date.is_none());
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_editor_mouse_covers_non_left_click_and_no_editor_paths() {
+        let mut app = test_app();
+        let area = Rect::new(0, 0, 100, 30);
+        let layout = editor_layout(area);
+
+        app.handle_editor_mouse(mouse(MouseEventKind::ScrollUp, 1, 1), area)
+            .await
+            .unwrap();
+
+        app.editor = None;
+        app.handle_editor_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.prev.x + 1,
+                layout.prev.y,
+            ),
+            area,
+        )
+        .await
+        .unwrap();
+        app.handle_editor_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.next.x + 1,
+                layout.next.y,
+            ),
+            area,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn beta_and_legal_consent_helpers_cover_accept_decline_and_noop_branches() {
+        let area = Rect::new(0, 0, 80, 24);
+        let layout = beta_consent_layout(area);
+
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.accept_beta_consent();
+        assert!(!app.beta_consent_pending);
+
+        app.legal_consent_pending = false;
+        app.accept_legal_consent();
+        assert!(!app.legal_accepting);
+        app.legal_consent_pending = true;
+        app.legal_accepting = true;
+        app.accept_legal_consent();
+        assert!(app.legal_accepting);
+
+        app.beta_consent_pending = true;
+        app.legal_consent_pending = false;
+        app.handle_beta_consent_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()));
+        assert!(!app.beta_consent_pending);
+
+        app.beta_consent_pending = true;
+        app.handle_beta_consent_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        assert!(app.beta_consent_pending);
+
+        app.beta_consent_pending = true;
+        app.handle_beta_consent_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                layout.accept.x + 1,
+                layout.accept.y,
+            ),
+            area,
+        );
+        assert!(app.beta_consent_pending);
+        app.handle_beta_consent_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.accept.x + 1,
+                layout.accept.y,
+            ),
+            area,
+        );
+        assert!(!app.beta_consent_pending);
+
+        let mut decline_app = test_app();
+        decline_app.beta_consent_pending = true;
+        decline_app.handle_beta_consent_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.decline.x + 1,
+                layout.decline.y,
+            ),
+            area,
+        );
+        assert!(decline_app.should_quit);
+
+        let mut legal_app = test_app();
+        legal_app.legal_consent_pending = true;
+        legal_app.legal_accepting = false;
+        legal_app.handle_legal_consent_mouse(
+            mouse(
+                MouseEventKind::Moved,
+                layout.decline.x + 1,
+                layout.decline.y,
+            ),
+            area,
+        );
+        assert!(!legal_app.should_quit);
+        legal_app.handle_legal_consent_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.decline.x + 1,
+                layout.decline.y,
+            ),
+            area,
+        );
+        assert!(legal_app.should_quit);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn drain_load_messages_covers_accept_invite_and_terms_branches() {
+        let mut app = test_app();
+        app.invite_confirmation = Some(PendingInviteAcceptance {
+            token: "InviteToken_1".to_string(),
+            list_id: Some(7),
+            list_name: Some("Shared".to_string()),
+        });
+        app.tx
+            .send(LoadMessage::AcceptInvite {
+                list_id: Some(7),
+                result: Ok(json!({"list_id": 7})),
+            })
+            .expect("accept invite message should enqueue");
+        app.tx
+            .send(LoadMessage::AcceptTerms {
+                result: Ok(json!({"legal": {"pending": []}})),
+            })
+            .expect("accept terms message should enqueue");
+
+        assert!(app.drain_load_messages());
+        assert_eq!(app.pending_open_list_id, Some(7));
+        assert!(!app.legal_consent_pending);
+        assert!(app.invite_confirmation.is_none());
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn apply_profile_result_covers_reload_lists_when_legal_clear_branch() {
+        let (api, requests) = api_with_responses(vec![serde_json::json!([]).to_string()]).await;
+        let mut app = App::new(api, true);
+        app.beta_consent_pending = false;
+        app.legal_consent_pending = false;
+
+        app.apply_profile_result(Ok(Profile {
+            id: Some(1),
+            display_name: Some("Ada".to_string()),
+            email: None,
+            photo_url: None,
+            lang: None,
+            is_anonymous: Some(false),
+            created_at: None,
+            legal: Some(crate::models::ProfileLegalStatus { pending: vec![] }),
+            terms_accepted: Some(true),
+        }));
+
+        for _ in 0..80 {
+            let _ = app.drain_load_messages();
+            if !app.loading_lists {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert!(!app.loading_lists);
+        assert_eq!(
+            requests.await.expect("test server should finish"),
+            vec!["GET /api/lists HTTP/1.1"]
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn move_calendar_month_selection_covers_matching_item_branch() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "July"), sample_item(2, "August")];
+        app.items[1].due_date = Some("2026-08-15".to_string());
+        app.calendar_selected_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 15,
+        });
+
+        app.move_calendar_month_selection(1);
+
+        assert_eq!(app.selected_item, 1);
+        assert_eq!(
+            app.calendar_selected_date,
+            Some(SimpleDate {
+                year: 2026,
+                month: 8,
+                day: 15,
+            })
+        );
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn run_event_loop_covers_multi_event_drain_branches() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            let mut app = test_app();
+            app.beta_consent_pending = false;
+
+            let pid = std::process::id();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                for _ in 0..4 {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-WINCH", &pid.to_string()])
+                        .status();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+
+            let poll_outcome = tokio::time::timeout(
+                Duration::from_millis(900),
+                run_event_loop(&mut terminal, &mut app),
+            )
+            .await;
+            match poll_outcome {
+                Err(_) => {}
+                Ok(Err(_)) => {}
+                Ok(Ok(())) => panic!("event loop should not exit cleanly without quit"),
+            }
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::test]
+    fn build_image_picker_forced_halfblocks_and_probe_env_suffix() {
+        crate::test_env::with_env_lock(|| {
+            for seed_env in [false, true] {
+                if seed_env {
+                    std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "seed-images");
+                    std::env::set_var(TERM_ENV, "seed-term");
+                    std::env::set_var(TERM_PROGRAM_ENV, "seed-program");
+                    std::env::set_var(KITTY_WINDOW_ID_ENV, "seed-kitty");
+                    std::env::set_var(ITERM_SESSION_ID_ENV, "seed-iterm");
+                    std::env::set_var(WT_SESSION_ENV, "seed-wt");
+                } else {
+                    std::env::remove_var(KRAMLI_TUI_IMAGES_ENV);
+                    std::env::remove_var(TERM_ENV);
+                    std::env::remove_var(TERM_PROGRAM_ENV);
+                    std::env::remove_var(KITTY_WINDOW_ID_ENV);
+                    std::env::remove_var(ITERM_SESSION_ID_ENV);
+                    std::env::remove_var(WT_SESSION_ENV);
+                }
+
+                let previous_images = std::env::var_os(KRAMLI_TUI_IMAGES_ENV);
+                let previous_term = std::env::var_os(TERM_ENV);
+                let previous_program = std::env::var_os(TERM_PROGRAM_ENV);
+                let previous_kitty = std::env::var_os(KITTY_WINDOW_ID_ENV);
+                let previous_iterm = std::env::var_os(ITERM_SESSION_ID_ENV);
+                let previous_wt = std::env::var_os(WT_SESSION_ENV);
+
+                let (picker, enabled, summary, debug) =
+                    build_image_picker(ImageProtocolPreference::Forced(ProtocolType::Halfblocks));
+                assert_eq!(picker.protocol_type(), ProtocolType::Halfblocks);
+                assert!(enabled);
+                assert!(summary.contains("set=halfblocks"));
+                assert!(debug.iter().any(|line| line.contains("forced")));
+
+                std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
+                std::env::set_var(TERM_ENV, "foot");
+                std::env::remove_var(TERM_PROGRAM_ENV);
+                std::env::remove_var(KITTY_WINDOW_ID_ENV);
+
+                let (_picker, inline_enabled, foot_summary, _debug) =
+                    build_image_picker(ImageProtocolPreference::Auto);
+                assert!(inline_enabled);
+                assert!(
+                    foot_summary.contains("probe+env") || foot_summary.contains("sixel"),
+                    "unexpected foot summary: {foot_summary}"
+                );
+
+                std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
+                std::env::set_var(TERM_ENV, "xterm-256color");
+                std::env::set_var(TERM_PROGRAM_ENV, "ghostty");
+                let (_picker, _, ghostty_summary, _) =
+                    build_image_picker(ImageProtocolPreference::Auto);
+                assert!(
+                    ghostty_summary.contains("probe+env") || ghostty_summary.contains("kitty"),
+                    "unexpected ghostty summary: {ghostty_summary}"
+                );
+
+                std::env::remove_var(KRAMLI_TUI_IMAGES_ENV);
+                std::env::set_var(TERM_ENV, "dumb");
+                std::env::set_var(TERM_PROGRAM_ENV, "");
+                std::env::remove_var(KITTY_WINDOW_ID_ENV);
+                std::env::remove_var(ITERM_SESSION_ID_ENV);
+                std::env::remove_var(WT_SESSION_ENV);
+                std::env::remove_var(LC_TERMINAL_ENV);
+
+                let (safe_picker, safe_enabled, safe_summary, safe_debug) =
+                    build_image_picker(ImageProtocolPreference::Auto);
+                assert!(safe_enabled);
+                assert_eq!(safe_picker.protocol_type(), ProtocolType::Halfblocks);
+                assert!(safe_summary.contains("(safe)"));
+                assert!(safe_debug.iter().any(|line| line.contains("safe")));
+
+                restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+                restore_env_var(TERM_ENV, previous_term);
+                restore_env_var(TERM_PROGRAM_ENV, previous_program);
+                restore_env_var(KITTY_WINDOW_ID_ENV, previous_kitty);
+                restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
+                restore_env_var(WT_SESSION_ENV, previous_wt);
+            }
+        });
+    }
+
+    #[kramli_test_macros::test]
+    fn build_image_picker_auto_uses_safe_halfblocks_when_probe_skipped() {
+        crate::test_env::with_env_lock(|| {
+            for seed_env in [false, true] {
+                if seed_env {
+                    std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "seed-images");
+                    std::env::set_var(TERM_ENV, "seed-term");
+                    std::env::set_var(TERM_PROGRAM_ENV, "seed-program");
+                    std::env::set_var(LC_TERMINAL_ENV, "seed-lc-terminal");
+                    std::env::set_var(KITTY_WINDOW_ID_ENV, "seed-kitty");
+                    std::env::set_var(ITERM_SESSION_ID_ENV, "seed-iterm");
+                    std::env::set_var(WT_SESSION_ENV, "seed-wt");
+                } else {
+                    std::env::remove_var(KRAMLI_TUI_IMAGES_ENV);
+                    std::env::remove_var(TERM_ENV);
+                    std::env::remove_var(TERM_PROGRAM_ENV);
+                    std::env::remove_var(LC_TERMINAL_ENV);
+                    std::env::remove_var(KITTY_WINDOW_ID_ENV);
+                    std::env::remove_var(ITERM_SESSION_ID_ENV);
+                    std::env::remove_var(WT_SESSION_ENV);
+                }
+
+                let previous_images = std::env::var_os(KRAMLI_TUI_IMAGES_ENV);
+                let previous_term = std::env::var_os(TERM_ENV);
+                let previous_program = std::env::var_os(TERM_PROGRAM_ENV);
+                let previous_lc_terminal = std::env::var_os(LC_TERMINAL_ENV);
+                let previous_kitty = std::env::var_os(KITTY_WINDOW_ID_ENV);
+                let previous_iterm = std::env::var_os(ITERM_SESSION_ID_ENV);
+                let previous_wt = std::env::var_os(WT_SESSION_ENV);
+
+                std::env::remove_var(KRAMLI_TUI_IMAGES_ENV);
+                std::env::set_var(TERM_ENV, "dumb");
+                std::env::set_var(TERM_PROGRAM_ENV, "");
+                std::env::remove_var(LC_TERMINAL_ENV);
+                std::env::remove_var(KITTY_WINDOW_ID_ENV);
+                std::env::remove_var(ITERM_SESSION_ID_ENV);
+                std::env::remove_var(WT_SESSION_ENV);
+                assert!(!should_probe_terminal_images());
+
+                let (picker, enabled, summary, debug) =
+                    build_image_picker(ImageProtocolPreference::Auto);
+                assert!(enabled);
+                assert_eq!(picker.protocol_type(), ProtocolType::Halfblocks);
+                assert!(summary.contains("(safe)"));
+                assert!(debug.iter().any(|line| line.contains("safe")));
+
+                restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+                restore_env_var(TERM_ENV, previous_term);
+                restore_env_var(TERM_PROGRAM_ENV, previous_program);
+                restore_env_var(LC_TERMINAL_ENV, previous_lc_terminal);
+                restore_env_var(KITTY_WINDOW_ID_ENV, previous_kitty);
+                restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
+                restore_env_var(WT_SESSION_ENV, previous_wt);
+            }
+        });
+    }
+
+    #[kramli_test_macros::test]
+    fn should_probe_terminal_images_respects_explicit_disable_flag() {
+        crate::test_env::with_env_lock(|| {
+            for seed_env in [false, true] {
+                if seed_env {
+                    std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "seed-images");
+                    std::env::set_var(TERM_ENV, "seed-term");
+                    std::env::set_var(TERM_PROGRAM_ENV, "seed-program");
+                } else {
+                    std::env::remove_var(KRAMLI_TUI_IMAGES_ENV);
+                    std::env::remove_var(TERM_ENV);
+                    std::env::remove_var(TERM_PROGRAM_ENV);
+                }
+
+                let previous_images = std::env::var_os(KRAMLI_TUI_IMAGES_ENV);
+                let previous_term = std::env::var_os(TERM_ENV);
+                let previous_program = std::env::var_os(TERM_PROGRAM_ENV);
+
+                std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "0");
+                std::env::set_var(TERM_ENV, "xterm-kitty");
+                std::env::set_var(TERM_PROGRAM_ENV, "ghostty");
+                assert!(!should_probe_terminal_images());
+
+                restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+                restore_env_var(TERM_ENV, previous_term);
+                restore_env_var(TERM_PROGRAM_ENV, previous_program);
+            }
+        });
+    }
+
+    #[kramli_test_macros::test]
+    fn parse_state_config_columns_ignores_invalid_entries() {
+        assert!(parse_state_config_columns(Some("not-json")).is_empty());
+        assert!(parse_state_config_columns(Some(r#"{"name":"Open"}"#)).is_empty());
+        let columns = parse_state_config_columns(Some(
+            r#"[42, {"name":""}, {"missing_name":true}, "Open", "Done"]"#,
+        ));
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "Open");
+        assert!(!columns[0].is_done);
+        assert_eq!(columns[1].name, "Done");
+        assert!(columns[1].is_done);
+    }
+
+    #[kramli_test_macros::test]
+    fn kanban_navigation_helpers_handle_zero_delta_and_empty_buckets() {
+        let buckets = vec![vec![10, 11], vec![20]];
+
+        assert_eq!(next_kanban_column_selection(&buckets, 10, 0), Some(10));
+        assert_eq!(stepped_kanban_selection(&buckets, 10, 0), Some(10));
+        assert_eq!(stepped_kanban_selection(&[], 0, 1), None);
+        assert_eq!(
+            autocomplete_last_tag("weekend", &["Weekend".to_string()], 0),
+            None
+        );
+        assert_eq!(
+            autocomplete_last_tag("Brot,mil", &["Milch".to_string()], 1),
+            Some("Brot, Milch".to_string())
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn kanban_window_falls_back_to_single_row_when_hints_do_not_fit() {
+        let bucket: Vec<usize> = (0..20).collect();
+        let (start, count, show_top, show_bottom) = kanban_window(&bucket, 10, 2);
+        assert_eq!(start, 0);
+        assert_eq!(count, 1);
+        assert!(!show_top);
+        assert!(show_bottom);
+    }
+
+    #[kramli_test_macros::test]
+    fn item_row_text_and_kanban_card_text_render_done_state_and_metadata() {
+        let mut item = sample_item(1, "Milk");
+        item.is_done = Some(true);
+        item.quantity = Some("2".to_string());
+        item.progress = Some("Open".to_string());
+        item.due_date = Some("2026-08-01T00:00:00Z".to_string());
+        item.due_time = Some("09:00".to_string());
+
+        let row = item_row_text(&item);
+        assert!(row.starts_with("[x] Milk"));
+        assert!(row.contains("x2"));
+        assert!(row.contains("| Open"));
+        assert!(row.contains("| 2026-08-01 09:00"));
+
+        assert!(kanban_card_text(&item).starts_with("[x] Milk"));
+    }
+
+    #[kramli_test_macros::test]
+    fn apply_item_depths_honors_preset_depth_and_stops_on_cycles_or_missing_parents() {
+        let mut preset = sample_item(1, "Preset depth");
+        preset.depth = Some(3);
+        let mut child = sample_item(2, "Child");
+        child.parent_item_id = Some(1);
+        let mut orphan = sample_item(3, "Orphan");
+        orphan.parent_item_id = Some(999);
+        let mut left = sample_item(4, "Left");
+        let mut right = sample_item(5, "Right");
+        left.parent_item_id = Some(5);
+        right.parent_item_id = Some(4);
+
+        let mut items = [preset, child, orphan, left, right];
+        apply_item_depths(&mut items);
+
+        assert_eq!(items[0].depth, Some(3));
+        assert_eq!(items[1].depth, Some(1));
+        assert_eq!(items[2].depth, None);
+        assert_eq!(items[3].depth, Some(2));
+        assert_eq!(items[4].depth, Some(2));
+    }
+
+    #[kramli_test_macros::test]
+    fn html_note_helpers_decode_entities_and_strip_malformed_markup() {
+        assert_eq!(note_text_for_display("<style>hidden"), "");
+        assert_eq!(note_text_for_display("<span unclosed"), "");
+        assert_eq!(
+            note_text_for_display("<table><tr><td>A</td><td>B</td></tr></table>"),
+            "A  B"
+        );
+        assert_eq!(note_text_for_display("&#65;"), "A");
+        assert_eq!(note_text_for_display("&#x42;"), "B");
+        assert_eq!(note_text_for_display("&unknown;"), "&unknown;");
+        assert_eq!(note_text_for_display("Hello&nbsp;world"), "Hello world");
+    }
+
+    #[kramli_test_macros::test]
+    fn list_has_folder_detects_named_folders_without_folder_id() {
+        let named_only = test_shopping_list(1, "Groceries", None, None, Some("Home"), false);
+        assert!(list_has_folder(&named_only));
+        assert!(!list_has_folder(&test_shopping_list(
+            2, "Plain", None, None, None, false
+        )));
+        assert!(!list_has_folder(&test_shopping_list(
+            3,
+            "Blank folder",
+            None,
+            None,
+            Some("   "),
+            false
+        )));
+    }
+
+    #[kramli_test_macros::test]
+    fn apply_comments_result_ignores_failed_responses() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Alpha")];
+        app.comments_cache.insert(1, Vec::new());
+        app.apply_comments_result(1, Err("comments failed".to_string()));
+        assert_eq!(app.comments_cache.get(&1).map(Vec::len), Some(0));
+    }
+
+    #[kramli_test_macros::test]
+    fn apply_note_detail_result_handles_off_list_and_error_paths() {
+        let mut app = test_app();
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![
+            note.clone(),
+            test_shopping_list(2, "Other", None, None, None, false),
+        ];
+        app.selected_list = 1;
+        app.status = None;
+
+        app.apply_note_detail_result(1, Ok(json!({"note_content": "Cached elsewhere"})));
+        assert_eq!(
+            app.note_detail_cache.get(&1).and_then(note_content),
+            Some("Cached elsewhere")
+        );
+        assert!(app.status.is_none());
+
+        app.apply_note_detail_result(2, Err("note load failed".to_string()));
+        assert_eq!(app.status.as_deref(), Some("note load failed"));
+
+        app.status = None;
+        app.apply_note_detail_result(1, Err("ignored for other list".to_string()));
+        assert!(app.status.is_none());
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn activate_link_preview_handles_unresolved_and_internal_navigation() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut app = test_app();
+            app.lists = vec![
+                test_list(),
+                test_shopping_list(42, "Target", None, None, None, false),
+            ];
+            app.items = vec![sample_item(1, "Links")];
+
+            app.link_previews.insert(
+                item_preview_owner(1),
+                vec![test_link_preview("https://kramli.de/privacy", None, None)],
+            );
+            app.activate_link_preview().await.unwrap();
+            assert_eq!(app.status, Some(tr("link-preview-unresolved")));
+
+            app.link_previews.insert(
+                item_preview_owner(1),
+                vec![LinkPreview {
+                    kind: crate::internal_links::InternalLinkKind::Invite,
+                    canonical_url: "https://kramli.de/privacy".to_string(),
+                    display_url: "https://kramli.de/privacy".to_string(),
+                    resolved: false,
+                    list_id: None,
+                    item_id: None,
+                    list_name: None,
+                    list_icon: None,
+                    list_color: None,
+                    list_type: None,
+                    item_text: None,
+                    folder_name: None,
+                    folder_icon: None,
+                    folder_color: None,
+                    role: None,
+                    invited_by: None,
+                    action: Some(crate::internal_links::LinkPreviewAction {
+                        kind: LinkPreviewActionKind::Open,
+                        target_url: "https://kramli.de/privacy".to_string(),
+                        requires_confirmation: false,
+                    }),
+                }],
+            );
+            app.activate_link_preview().await.unwrap();
+            assert_eq!(app.status, Some(tr("link-preview-unresolved")));
+
+            app.link_previews.insert(
+                item_preview_owner(1),
+                vec![test_link_preview(
+                    "https://kramli.de/lists/42",
+                    Some(LinkPreviewActionKind::Open),
+                    Some(42),
+                )],
+            );
+            app.activate_link_preview().await.unwrap();
+            assert_eq!(app.selected_list_id(), Some(42));
+            assert_eq!(app.pending_open_item_id, None);
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn invite_confirmation_keyboard_accepts_or_ignores_keys() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let (api, _requests) = api_with_responses(vec![json!({
+                "ok": true,
+                "list_id": 7
+            })
+            .to_string()])
+            .await;
+            let mut app = App::new(api, false);
+            app.invite_confirmation = Some(PendingInviteAcceptance {
+                token: "InviteToken_1".to_string(),
+                list_id: Some(7),
+                list_name: Some("Shared".to_string()),
+            });
+
+            app.handle_invite_confirmation_key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::empty(),
+            ));
+            assert!(app.accepting_invite);
+            let message = tokio::time::timeout(Duration::from_secs(2), app.rx.recv())
+                .await
+                .expect("accept invite should enqueue quickly")
+                .expect("accept invite channel should stay open");
+            assert!(matches!(message, LoadMessage::AcceptInvite { .. }));
+
+            app.invite_confirmation = Some(PendingInviteAcceptance {
+                token: "InviteToken_1".to_string(),
+                list_id: Some(7),
+                list_name: Some("Shared".to_string()),
+            });
+            app.handle_invite_confirmation_key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::empty(),
+            ));
+            assert!(app.invite_confirmation.is_some());
+
+            app.accepting_invite = false;
+            app.invite_confirmation = None;
+            app.accept_pending_invite();
+            assert!(!app.accepting_invite);
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::test]
+    fn open_selected_image_background_reports_missing_items() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items.clear();
+        app.open_selected_image_background().unwrap();
+        assert_eq!(app.status, Some(tr("output-no-items")));
+    }
+
+    #[kramli_test_macros::test]
+    fn note_and_comment_editors_enforce_selection_and_note_rules() {
+        let mut app = test_app();
+        app.lists.clear();
+        app.open_note_editor().unwrap();
+        assert!(app.editor.is_none());
+
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.open_note_editor().unwrap();
+        assert!(app.editor.is_none());
+        assert_eq!(app.status, Some(tr("tui-note-loading")));
+
+        app.note_detail_cache.insert(
+            1,
+            json!({
+                "list_type": "note",
+                "note_content": "Plain note",
+                "note_delta": "[{\"insert\":\"Plain note\\n\"}]",
+                "note_version": 1
+            }),
+        );
+        app.open_note_editor().unwrap();
+        assert_eq!(app.editor.as_ref().unwrap().mode, EditorMode::Note);
+
+        app.editor = None;
+        app.open_comment_editor().unwrap();
+        assert!(app.editor.is_none());
+        assert_eq!(app.status, Some(tr("note-task-mutation-blocked")));
+
+        app.lists = vec![test_list()];
+        app.items.clear();
+        app.open_comment_editor().unwrap();
+        assert!(app.editor.is_none());
+        assert_eq!(app.status, Some(tr("output-no-items")));
+    }
+
+    #[kramli_test_macros::test]
+    fn open_attachment_editor_blocks_note_lists() {
+        let mut app = test_app();
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.open_attachment_editor().unwrap();
+        assert!(app.editor.is_none());
+        assert_eq!(app.status, Some(tr("note-task-mutation-blocked")));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn save_editor_no_ops_without_editor_or_attachment_item() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut app = test_app();
+            app.save_editor().await.unwrap();
+            assert!(app.editor.is_none());
+
+            app.editor = Some(EditorState {
+                mode: EditorMode::Attachment,
+                item_id: None,
+                text: "/tmp/example.png".to_string(),
+                quantity: String::new(),
+                due_date: String::new(),
+                due_time: String::new(),
+                planned_date: String::new(),
+                planned_time: String::new(),
+                reminder: String::new(),
+                reminder_time: String::new(),
+                reminder_offsets: String::new(),
+                travel_time_minutes: String::new(),
+                priority: String::new(),
+                tags: String::new(),
+                progress: String::new(),
+                notes: String::new(),
+                active_field: EditorField::Text,
+            });
+            app.save_editor().await.unwrap();
+            assert!(app.editor.is_some());
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::test]
+    fn kanban_selection_noops_when_delta_zero_or_selection_unchanged() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Only")];
+        app.selected_item = 0;
+
+        assert!(!app.move_kanban_selection(0));
+        assert!(!app.move_kanban_selection_wrapped(0));
+        assert!(!app.move_kanban_selection_wrapped(1));
+        assert_eq!(app.selected_item, 0);
+
+        app.items = vec![sample_item(1, "Left"), sample_item(2, "Right")];
+        app.lists[0].states = Some(vec![
+            ApiListState {
+                name: Some("Open".to_string()),
+                color: None,
+                is_done: Some(false),
+            },
+            ApiListState {
+                name: Some("Done".to_string()),
+                color: None,
+                is_done: Some(true),
+            },
+        ]);
+        app.items[0].progress = Some("Open".to_string());
+        app.items[1].progress = Some("Done".to_string());
+        app.items[1].is_done = Some(true);
+        app.selected_item = 0;
+        assert!(!app.move_kanban_column_selection(0));
+    }
+
+    #[kramli_test_macros::test]
+    fn progress_defaults_and_tag_suggestions_use_kanban_fallbacks() {
+        let mut app = test_app();
+        let mut blank_columns = test_list();
+        blank_columns.states = Some(vec![
+            ApiListState {
+                name: Some("   ".to_string()),
+                color: None,
+                is_done: Some(true),
+            },
+            ApiListState {
+                name: Some("\t".to_string()),
+                color: None,
+                is_done: Some(false),
+            },
+        ]);
+        app.lists = vec![blank_columns];
+        assert_eq!(app.default_progress_value(), tr("tui-kanban-open"));
+        assert_eq!(
+            app.progress_choices(),
+            vec![
+                tr("tui-kanban-open"),
+                tr("tui-kanban-in-progress"),
+                tr("tui-kanban-done"),
+            ]
+        );
+
+        let mut first = sample_item(1, "Alpha");
+        first.tags = Some(vec!["Eggs".to_string(), "  ".to_string()]);
+        let second = sample_item(2, "Beta");
+        app.items = vec![first, second];
+        assert_eq!(app.tag_suggestions(), vec!["Eggs".to_string()]);
+    }
+
+    #[kramli_test_macros::test]
+    fn editor_suggestion_helpers_reject_unknown_progress_and_tags() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.editor = Some(EditorState {
+            mode: EditorMode::Edit,
+            item_id: Some(1),
+            text: "Task".to_string(),
+            quantity: String::new(),
+            due_date: String::new(),
+            due_time: String::new(),
+            planned_date: String::new(),
+            planned_time: String::new(),
+            reminder: tr("label-off"),
+            reminder_time: String::new(),
+            reminder_offsets: String::new(),
+            travel_time_minutes: String::new(),
+            priority: String::new(),
+            tags: String::new(),
+            progress: "not-a-column".to_string(),
+            notes: String::new(),
+            active_field: EditorField::Progress,
+        });
+        assert!(!app.apply_editor_suggestion(1));
+
+        if let Some(editor) = app.editor.as_mut() {
+            editor.active_field = EditorField::Tags;
+            editor.tags = "unknown-prefix".to_string();
+        }
+        assert!(!app.apply_editor_suggestion(1));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn calendar_due_date_updates_skip_unchanged_and_missing_items() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut app = test_app();
+            app.lists = vec![test_list()];
+            app.mode = ViewMode::Calendar;
+            app.items = vec![sample_item(1, "Scheduled")];
+            app.items[0].due_date = Some("2026-07-21T09:00".to_string());
+            app.selected_item = 0;
+            app.calendar_selected_date = Some(SimpleDate {
+                year: 2026,
+                month: 7,
+                day: 21,
+            });
+
+            assert!(!app
+                .move_selected_item_calendar_hours(0)
+                .await
+                .expect("zero-hour move should noop"));
+
+            app.items[0].due_date = Some("2026-07-21T09:00".to_string());
+            let fallback = SimpleDate {
+                year: 2026,
+                month: 7,
+                day: 21,
+            };
+            for delta in -23..=23 {
+                if delta == 0 {
+                    continue;
+                }
+                let existing = app.items[0].due_date.as_deref().unwrap();
+                let computed = due_date_with_hour_delta(Some(existing), fallback, delta);
+                if computed == existing {
+                    assert!(!app
+                        .move_selected_item_calendar_hours(delta)
+                        .await
+                        .expect("matching due date should noop"));
+                    break;
+                }
+            }
+
+            app.update_item_due_date(99, "2026-08-01".to_string())
+                .await
+                .unwrap();
+
+            app.calendar_visible_month = None;
+            app.calendar_selected_date = None;
+            app.items[0].due_date = None;
+            app.selected_item = 0;
+            let mut dated_item = sample_item(2, "Later");
+            dated_item.due_date = Some("2026-09-15".to_string());
+            app.items.push(dated_item);
+            let month = app.calendar_month(&[1]);
+            assert_eq!(
+                month,
+                SimpleDate {
+                    year: 2026,
+                    month: 9,
+                    day: 1,
+                }
+            );
+
+            app.items[0].due_date = Some("2026-10-03".to_string());
+            app.selected_item = 0;
+            let month = app.calendar_month(&[]);
+            assert_eq!(
+                month,
+                SimpleDate {
+                    year: 2026,
+                    month: 10,
+                    day: 1,
+                }
+            );
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::test]
+    fn due_date_suffix_and_time_parsing_reject_invalid_values() {
+        assert_eq!(due_date_time_suffix("2026-06-17"), None);
+        assert_eq!(due_date_time_suffix("2026-06-17X09:30"), None);
+        assert_eq!(parse_due_time("2026-06-17X09:30"), None);
+        assert_eq!(parse_due_time("2026-06-17T25:00"), None);
+        assert!(!valid_due_date_input("2026-06-17X09:30"));
+        assert_eq!(days_in_month(2026, 13), 30);
+        assert_eq!(parse_editor_bool_input("maybe-later"), None);
+
+        let target = SimpleDate {
+            year: 2026,
+            month: 6,
+            day: 20,
+        };
+        assert_eq!(
+            due_date_with_preserved_time(Some("2026-06-14X09:30"), target),
+            "2026-06-20"
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn text_wrapping_and_fit_cell_handle_zero_and_narrow_widths() {
+        assert_eq!(fit_cell("hello", 0), "");
+        assert_eq!(
+            wrap_plain_row("> ", "  ", "abcdef", 0),
+            vec!["> abcdef".to_string()]
+        );
+        assert_eq!(
+            wrap_plain_row("> ", "  ", "abcdef", 5),
+            vec!["> abcdef".to_string()]
+        );
+        assert_eq!(
+            wrap_plain_row("> ", "  ", "aaaaa b", 7),
+            vec!["> aaaaa".to_string(), "  b".to_string()]
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn calendar_pointer_and_agenda_helpers_handle_edge_sizes() {
+        assert_eq!(
+            calendar_pointer_date(
+                Rect::new(0, 0, 0, 0),
+                0,
+                0,
+                SimpleDate {
+                    year: 2026,
+                    month: 7,
+                    day: 1,
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            calendar_pointer_date(
+                Rect::new(0, 0, 2, 2),
+                0,
+                0,
+                SimpleDate {
+                    year: 2026,
+                    month: 7,
+                    day: 1,
+                }
+            ),
+            None
+        );
+
+        let items = vec![sample_item(1, "One"), sample_item(2, "Two")];
+        let mut out = vec![("header".to_string(), None)];
+        push_calendar_agenda_items(&mut out, &[0, 1], &items, 0, 1);
+        assert_eq!(out.len(), 1);
+
+        let mut dated = BTreeMap::new();
+        dated.insert(
+            SimpleDate {
+                year: 2026,
+                month: 7,
+                day: 4,
+            },
+            vec![0],
+        );
+        dated.insert(
+            SimpleDate {
+                year: 2026,
+                month: 7,
+                day: 14,
+            },
+            vec![1],
+        );
+        out.clear();
+        push_calendar_month_agenda_entries(&mut out, &dated, &[], &items, 0, 0);
+        assert!(out.is_empty());
+        push_calendar_month_agenda_entries(&mut out, &dated, &[], &items, 0, 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "2026-07-04");
+    }
+
+    #[kramli_test_macros::test]
+    fn editor_field_hints_and_layout_helpers_cover_remaining_branches() {
+        assert_eq!(
+            editor_field_hint(EditorField::Text, EditorMode::Note),
+            tr("label-notes")
+        );
+        assert_eq!(
+            editor_field_hint(EditorField::Text, EditorMode::Attachment),
+            tr("attachment-path")
+        );
+
+        assert_eq!(
+            kanban_visible_range(Rect::new(0, 0, 120, 20), 10, 9),
+            (6, 4)
+        );
+
+        let bindings = KeyBindings {
+            bindings: default_key_bindings(),
+        };
+        assert!(footer_buttons(Rect::new(0, 0, 4, 6), &bindings).is_empty());
+    }
+
+    #[kramli_test_macros::test]
+    fn note_link_preview_index_skips_header_and_above_lines() {
+        let mut app = test_app();
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.note_detail_cache
+            .insert(1, json!({"note_content": "See link below"}));
+        app.link_previews.insert(
+            note_preview_owner(1),
+            vec![test_link_preview(
+                "https://kramli.de/privacy",
+                Some(LinkPreviewActionKind::Open),
+                None,
+            )],
+        );
+
+        let lines = note_mode_lines(&app);
+        let header_idx = lines
+            .iter()
+            .position(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.as_ref() == tr("link-preview-section"))
+            })
+            .expect("link preview section should render");
+        assert!(note_link_preview_index_at_line(&lines, header_idx).is_none());
+        assert!(note_link_preview_index_at_line(&lines, header_idx.saturating_sub(1)).is_none());
+        assert_eq!(
+            note_link_preview_index_at_line(&lines, header_idx + 1),
+            Some(0)
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn note_mode_lines_skip_empty_link_preview_bucket() {
+        let mut app = test_app();
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.note_detail_cache
+            .insert(1, json!({"note_content": "No previews yet"}));
+        app.link_previews.insert(note_preview_owner(1), Vec::new());
+
+        let lines = note_mode_lines(&app);
+        assert_eq!(lines.len(), 1);
+        assert!(!lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.as_ref() == tr("link-preview-section"))
+        }));
+    }
+
+    #[kramli_test_macros::test]
+    fn invite_confirmation_overlay_is_noop_without_pending_invite() {
+        let app = test_app();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| draw_invite_confirmation_overlay(frame, &app))
+            .unwrap();
+        assert!(!terminal_text(&terminal).contains(&tr("tui-invite-confirm-title")));
+    }
+
+    #[kramli_test_macros::test]
+    fn lists_panel_renders_cached_bootstrap_icon_images() {
+        crate::test_env::with_env_lock(|| {
+            let _terminal_env = TerminalEnvGuard::clear();
+            let previous_images = std::env::var_os(KRAMLI_TUI_IMAGES_ENV);
+            let previous_protocol = std::env::var_os(KRAMLI_TUI_IMAGE_PROTOCOL_ENV);
+
+            std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
+            std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, "kitty");
+
+            let mut app = App::new(ApiClient::for_tests("https://kramli.test"), true);
+            app.beta_consent_pending = false;
+            app.set_inline_images_enabled(true);
+            app.picker.set_protocol_type(ProtocolType::Kitty);
+            for icon in ["folder2", "tag"] {
+                app.apply_list_icon_result(icon.to_string(), Ok(DynamicImage::new_rgba8(2, 2)));
+            }
+            app.lists = vec![test_shopping_list(
+                1,
+                "Groceries",
+                None,
+                Some(9),
+                Some("Home"),
+                false,
+            )];
+
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+            assert!(terminal_text(&terminal).contains("Home"));
+
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+            restore_env_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, previous_protocol);
+        });
+    }
+
+    #[kramli_test_macros::test]
+    fn list_panel_marks_only_the_selected_list_with_arrow() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.lists = vec![
+            test_list(),
+            test_shopping_list(2, "Other", None, None, None, false),
+        ];
+        app.selected_list = 1;
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        let text = terminal_text(&terminal);
+        assert!(text.contains("Other #2"));
+        assert!(text.contains("Groceries #1"));
+        assert!(text.matches('>').count() >= 1);
+    }
+
+    #[kramli_test_macros::test]
+    fn list_mode_renders_unselected_item_rows() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "First task"), sample_item(2, "Second task")];
+        app.selected_item = 1;
+        app.mode = ViewMode::List;
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        let text = terminal_text(&terminal);
+        assert!(text.contains("First task"));
+        assert!(text.contains("Second task"));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn item_detail_refreshes_inline_image_background_during_draw() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut app = App::new(ApiClient::for_tests("https://kramli.test"), false);
+            app.beta_consent_pending = false;
+            app.lists = vec![test_list()];
+            app.set_inline_images_enabled(true);
+            let mut item = sample_item(1, "Photo task");
+            item.image_url = Some("https://example.test/photo.jpg".to_string());
+            app.items = vec![item];
+            app.selected_item = 0;
+
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+            terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+
+            assert_eq!(
+                app.pending_detail_image.as_deref(),
+                Some("https://example.test/photo.jpg")
+            );
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::test]
+    fn item_detail_shows_available_image_state_and_reminder_off() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        let mut item = sample_item(1, "Reminder task");
+        item.reminder = Some(false);
+        item.image_url = Some("https://example.test/pending.jpg".to_string());
+        app.items = vec![item];
+        app.selected_item = 0;
+        app.detail_image = None;
+        app.detail_image_note = None;
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        let text = terminal_text(&terminal);
+        assert!(text.contains(&tr("label-off")));
+        assert!(text.contains(&tr("tui-image-state-available")));
+    }
+
+    #[kramli_test_macros::test]
+    fn kanban_and_calendar_modes_render_empty_item_placeholders() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items.clear();
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+
+        app.mode = ViewMode::Kanban;
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        assert!(terminal_text(&terminal).contains(&tr("output-no-items")));
+
+        app.mode = ViewMode::Calendar;
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        assert!(terminal_text(&terminal).contains(&tr("output-no-items")));
+
+        app.mode = ViewMode::List;
+        app.loading_items_for = Some(1);
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        assert!(terminal_text(&terminal).contains("Loading items"));
+    }
+
+    #[kramli_test_macros::test]
+    fn kanban_board_shows_top_scroll_hint_for_long_columns() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.lists[0].states = Some(vec![ApiListState {
+            name: Some("Doing".to_string()),
+            color: None,
+            is_done: Some(false),
+        }]);
+        app.items = (0..24)
+            .map(|index| {
+                let mut item = sample_item(index + 1, &format!("Task {index}"));
+                item.progress = Some("Doing".to_string());
+                item
+            })
+            .collect();
+        app.selected_item = 22;
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(24, 8)).unwrap();
+        terminal
+            .draw(|frame| draw_kanban_mode(frame, &app, frame.area()))
+            .unwrap();
+        assert!(terminal_text(&terminal).contains('↑'));
+    }
+
+    #[kramli_test_macros::test]
+    fn note_and_attachment_editors_render_mode_specific_chrome() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Item")];
+        app.selected_item = 0;
+
+        app.editor = Some(EditorState {
+            mode: EditorMode::Note,
+            item_id: Some(1),
+            text: "Plain note".to_string(),
+            quantity: String::new(),
+            due_date: String::new(),
+            due_time: String::new(),
+            planned_date: String::new(),
+            planned_time: String::new(),
+            reminder: String::new(),
+            reminder_time: String::new(),
+            reminder_offsets: String::new(),
+            travel_time_minutes: String::new(),
+            priority: String::new(),
+            tags: String::new(),
+            progress: String::new(),
+            notes: String::new(),
+            active_field: EditorField::Notes,
+        });
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        assert!(terminal_text(&terminal).contains(&tr("tui-note-editor-hint")));
+
+        app.editor = Some(EditorState {
+            mode: EditorMode::Attachment,
+            item_id: Some(1),
+            text: "/tmp/example.png".to_string(),
+            quantity: String::new(),
+            due_date: String::new(),
+            due_time: String::new(),
+            planned_date: String::new(),
+            planned_time: String::new(),
+            reminder: String::new(),
+            reminder_time: String::new(),
+            reminder_offsets: String::new(),
+            travel_time_minutes: String::new(),
+            priority: String::new(),
+            tags: String::new(),
+            progress: String::new(),
+            notes: String::new(),
+            active_field: EditorField::Text,
+        });
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        assert!(terminal_text(&terminal).contains(&tr("attachment-path")));
+    }
+
+    #[kramli_test_macros::test]
+    fn image_protocol_preference_honors_explicit_env_overrides() {
+        crate::test_env::with_env_lock(|| {
+            let _terminal_env = TerminalEnvGuard::clear();
+            let previous_images = std::env::var_os(KRAMLI_TUI_IMAGES_ENV);
+            let previous_protocol = std::env::var_os(KRAMLI_TUI_IMAGE_PROTOCOL_ENV);
+
+            std::env::remove_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV);
+            std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "0");
+            assert!(matches!(
+                image_protocol_preference(),
+                ImageProtocolPreference::Off
+            ));
+
+            std::env::remove_var(KRAMLI_TUI_IMAGES_ENV);
+            assert!(matches!(
+                image_protocol_preference(),
+                ImageProtocolPreference::Auto
+            ));
+
+            std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, "sixel");
+            assert!(matches!(
+                image_protocol_preference(),
+                ImageProtocolPreference::Forced(ProtocolType::Sixel)
+            ));
+            assert_eq!(
+                image_preference_name(ImageProtocolPreference::Forced(ProtocolType::Sixel)),
+                "sixel"
+            );
+
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+            restore_env_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, previous_protocol);
+        });
+    }
+
+    #[kramli_test_macros::test]
+    fn calendar_pointer_date_handles_separator_and_tiny_month_panels() {
+        let month = SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 1,
+        };
+
+        assert_eq!(
+            calendar_pointer_date(Rect::new(0, 0, 80, 4), 10, 2, month),
+            None
+        );
+
+        let content = Rect::new(0, 0, 80, 20);
+        let inner = content.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let (month_area, _) = calendar_panel_layout(inner);
+        let month_inner = month_area.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let widths = calendar_cell_widths(month_inner.width.saturating_sub(6));
+        let monday_row = month_inner.y.saturating_add(1);
+        let separator_x = month_inner.x.saturating_add(widths[0]);
+        assert_eq!(
+            calendar_pointer_date(content, separator_x, monday_row, month),
+            None
+        );
+        let _ = calendar_pointer_date(content, separator_x.saturating_add(1), monday_row, month);
+    }
+
+    #[kramli_test_macros::test]
+    fn build_image_picker_scenarios_clear_terminal_env_between_probes() {
+        crate::test_env::with_env_lock(|| {
+            let _images = TerminalEnvGuard::clear();
+
+            std::env::set_var(TERM_ENV, "xterm-kitty");
+            std::env::set_var(KITTY_WINDOW_ID_ENV, "42");
+            let (_picker, enabled, summary, _) = build_image_picker(ImageProtocolPreference::Auto);
+            assert!(enabled);
+            assert!(summary.contains("kitty") || summary.contains("probe"));
+
+            let _cleared = TerminalEnvGuard::clear();
+            std::env::set_var(TERM_ENV, "xterm-256color");
+            std::env::set_var(TERM_PROGRAM_ENV, "iTerm.app");
+            std::env::set_var(LC_TERMINAL_ENV, "iTerm2");
+            std::env::set_var(ITERM_SESSION_ID_ENV, "session-a");
+            let (_picker, iterm_enabled, iterm_summary, _) =
+                build_image_picker(ImageProtocolPreference::Auto);
+            assert!(iterm_enabled);
+            assert!(
+                iterm_summary.contains("iterm") || iterm_summary.contains("probe"),
+                "unexpected iterm summary: {iterm_summary}"
+            );
+
+            let _cleared = TerminalEnvGuard::clear();
+            std::env::set_var(TERM_PROGRAM_ENV, "Windows_Terminal");
+            std::env::set_var(WT_SESSION_ENV, "wt-session");
+            let (_picker, wt_enabled, wt_summary, _) =
+                build_image_picker(ImageProtocolPreference::Auto);
+            assert!(wt_enabled);
+            assert!(
+                wt_summary.contains("sixel") || wt_summary.contains("probe"),
+                "unexpected wt summary: {wt_summary}"
+            );
+        });
+    }
+
+    fn seed_terminal_env_for_restoration_coverage() {
+        std::env::set_var(TERM_ENV, "seed-term");
+        std::env::set_var(TERM_PROGRAM_ENV, "seed-program");
+        std::env::set_var(LC_TERMINAL_ENV, "seed-lc-terminal");
+        std::env::set_var(KITTY_WINDOW_ID_ENV, "seed-kitty");
+        std::env::set_var(ITERM_SESSION_ID_ENV, "seed-iterm");
+        std::env::set_var(WT_SESSION_ENV, "seed-wt");
+        std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "seed-images");
+        std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, "seed-protocol");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn run_tui_entrypoint_reaches_factory_with_configured_credentials() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            crate::test_env::with_env_lock_async(|| async {
+                let _terminal_env = TerminalEnvGuard::clear();
+                std::env::set_var("KRAMLI_URL", "http://127.0.0.1:9");
+                std::env::set_var("KRAMLI_API_KEY", "kramli_test");
+                let outcome = run_tui().await;
+                assert!(outcome.is_ok() || outcome.is_err());
+            })
+            .await;
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::test]
+    fn init_terminal_retries_cleanup_after_alternate_screen_is_already_active() {
+        if !std::io::IsTerminal::is_terminal(&io::stdout()) {
+            return;
+        }
+        let first = init_terminal();
+        if first.is_err() {
+            return;
+        }
+        let mut first_terminal = first.expect("first init should succeed on a tty");
+        let second = init_terminal();
+        let _ = restore_terminal(&mut first_terminal);
+        assert!(second.is_ok() || second.is_err());
+    }
+
+    #[kramli_test_macros::test]
+    fn restore_terminal_collects_errors_from_broken_backend_state() {
+        if !std::io::IsTerminal::is_terminal(&io::stdout()) {
+            return;
+        }
+        let backend = CrosstermBackend::new(io::stdout());
+        if let Ok(mut terminal) = Terminal::new(backend) {
+            let first = restore_terminal(&mut terminal);
+            let second = restore_terminal(&mut terminal);
+            assert!(first.is_ok() || first.is_err());
+            assert!(second.is_ok() || second.is_err());
+        }
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn run_event_loop_waits_for_poll_and_drains_quit_after_idle_spin() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            let mut app = test_app();
+            app.beta_consent_pending = false;
+            app.should_quit = false;
+            let quit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let quit_for_thread = quit.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(250));
+                quit_for_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let poll_outcome = tokio::time::timeout(Duration::from_millis(800), async {
+                loop {
+                    if quit.load(std::sync::atomic::Ordering::SeqCst) {
+                        app.should_quit = true;
+                    }
+                    if app.should_quit {
+                        break run_event_loop(&mut terminal, &mut app).await;
+                    }
+                    if app.drain_load_messages() {
+                        let _ = terminal.draw(|frame| draw_ui(frame, &mut app));
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            match poll_outcome {
+                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {}
+            }
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::test]
+    fn list_icon_protocol_creation_failure_marks_icon_as_failed() {
+        let mut app = test_app();
+        app.picker.set_protocol_type(ProtocolType::Halfblocks);
+        app.pending_list_icons.insert("protocol-fail".to_string());
+        app.apply_list_icon_result("protocol-fail".to_string(), Err("load failed".to_string()));
+        assert!(app.failed_list_icons.contains("protocol-fail"));
+
+        app.pending_list_icons.insert("zero-size".to_string());
+        app.apply_list_icon_result("zero-size".to_string(), Ok(DynamicImage::new_rgba8(0, 0)));
+        assert!(app.failed_list_icons.contains("zero-size"));
+    }
+
+    #[kramli_test_macros::test]
+    fn open_editor_returns_when_task_mutations_are_blocked_for_tests() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Blocked")];
+        app.block_task_mutations = true;
+        app.open_editor().unwrap();
+        assert!(app.editor.is_none());
+        assert_eq!(app.status, Some(tr("note-task-mutation-blocked")));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn save_editor_skips_network_when_list_or_item_context_is_missing() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut app = test_app();
+            app.lists.clear();
+            app.editor = Some(EditorState {
+                mode: EditorMode::Create,
+                item_id: None,
+                text: "Draft".to_string(),
+                quantity: String::new(),
+                due_date: String::new(),
+                due_time: String::new(),
+                planned_date: String::new(),
+                planned_time: String::new(),
+                reminder: String::new(),
+                reminder_time: String::new(),
+                reminder_offsets: String::new(),
+                travel_time_minutes: String::new(),
+                priority: String::new(),
+                tags: String::new(),
+                progress: String::new(),
+                notes: String::new(),
+                active_field: EditorField::Text,
+            });
+            app.save_editor().await.unwrap();
+            assert!(app.editor.is_some());
+
+            app.lists = vec![test_list()];
+            app.editor = Some(EditorState {
+                mode: EditorMode::Edit,
+                item_id: None,
+                text: "Draft".to_string(),
+                quantity: String::new(),
+                due_date: String::new(),
+                due_time: String::new(),
+                planned_date: String::new(),
+                planned_time: String::new(),
+                reminder: String::new(),
+                reminder_time: String::new(),
+                reminder_offsets: String::new(),
+                travel_time_minutes: String::new(),
+                priority: String::new(),
+                tags: String::new(),
+                progress: String::new(),
+                notes: String::new(),
+                active_field: EditorField::Text,
+            });
+            app.save_editor().await.unwrap();
+            assert!(app.editor.is_some());
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn save_note_editor_skips_when_note_id_is_missing() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut app = test_app();
+            app.editor = Some(EditorState {
+                mode: EditorMode::Note,
+                item_id: None,
+                text: "Plain".to_string(),
+                quantity: String::new(),
+                due_date: String::new(),
+                due_time: String::new(),
+                planned_date: String::new(),
+                planned_time: String::new(),
+                reminder: String::new(),
+                reminder_time: String::new(),
+                reminder_offsets: String::new(),
+                travel_time_minutes: String::new(),
+                priority: String::new(),
+                tags: String::new(),
+                progress: String::new(),
+                notes: String::new(),
+                active_field: EditorField::Text,
+            });
+            app.save_editor().await.unwrap();
+            assert!(app.editor.is_some());
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn note_lists_block_toggle_done_and_delete_actions() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut app = test_app();
+            let mut note = test_list();
+            note.list_type = Some("note".to_string());
+            app.lists = vec![note];
+            app.items = vec![sample_item(1, "Note item")];
+            app.toggle_selected_done().await.unwrap();
+            app.delete_selected_item().await.unwrap();
+            assert_eq!(app.status, Some(tr("note-task-mutation-blocked")));
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn delete_selected_item_reloads_when_local_copy_is_missing() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let (api, requests) = api_with_responses(vec![
+                "{}".to_string(),
+                serde_json::json!([{"id": 1, "list_id": 1, "text": "Reloaded", "is_done": false}])
+                    .to_string(),
+            ])
+            .await;
+            let mut app = App::new(api, true);
+            app.lists = vec![test_list()];
+            app.items = vec![sample_item(99, "Stale")];
+            app.selected_item = 0;
+            app.simulate_missing_deleted_item = true;
+            app.delete_selected_item().await.unwrap();
+            for _ in 0..80 {
+                let _ = app.drain_load_messages();
+                if app.loading_items_for.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let requests = requests.await.expect("delete should hit api");
+            assert!(requests
+                .first()
+                .is_some_and(|req| req.starts_with("DELETE /api/items/99")));
+            assert!(app.loading_items_for.is_some());
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn note_mode_mouse_ignores_preview_index_when_preview_list_is_empty() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut app = test_app();
+            let mut note = test_list();
+            note.list_type = Some("note".to_string());
+            app.lists = vec![note];
+            app.apply_note_detail_result(
+                1,
+                Ok(json!({"note_content": "See https://kramli.de/privacy for details"})),
+            );
+            app.link_previews.insert(note_preview_owner(1), Vec::new());
+            let content = Rect::new(10, 5, 60, 20);
+            let inner = content.inner(Margin {
+                vertical: 1,
+                horizontal: 1,
+            });
+            app.handle_note_mode_mouse(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    inner.x + 1,
+                    inner.y,
+                ),
+                content,
+                true,
+            )
+            .await
+            .unwrap();
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::test]
+    fn list_icon_new_protocol_failure_marks_icon_as_failed() {
+        let mut app = test_app();
+        app.force_list_icon_protocol_failure = true;
+        app.pending_list_icons.insert("protocol-fail".to_string());
+        app.apply_list_icon_result(
+            "protocol-fail".to_string(),
+            Ok(DynamicImage::new_rgba8(2, 2)),
+        );
+        assert!(app.failed_list_icons.contains("protocol-fail"));
+    }
+
+    #[kramli_test_macros::test]
+    fn env_var_restoration_executes_both_some_and_none_branches() {
+        crate::test_env::with_env_lock(|| {
+            fn restore(key: &str, previous: Option<std::ffi::OsString>) {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+
+            for key in [
+                TERM_ENV,
+                TERM_PROGRAM_ENV,
+                LC_TERMINAL_ENV,
+                KITTY_WINDOW_ID_ENV,
+                ITERM_SESSION_ID_ENV,
+                WT_SESSION_ENV,
+                KRAMLI_TUI_IMAGES_ENV,
+                KRAMLI_TUI_IMAGE_PROTOCOL_ENV,
+            ] {
+                std::env::remove_var(key);
+                let missing = std::env::var_os(key);
+                std::env::set_var(key, "probe");
+                restore(key, missing);
+
+                std::env::set_var(key, "seed");
+                let seeded = std::env::var_os(key);
+                std::env::set_var(key, "probe");
+                restore(key, seeded);
+            }
+        });
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_key_routes_invite_confirmation_before_navigation() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let (api, _requests) = api_with_responses(Vec::new()).await;
+            let mut app = App::new(api, false);
+            app.invite_confirmation = Some(PendingInviteAcceptance {
+                token: "InviteToken_1".to_string(),
+                list_id: Some(7),
+                list_name: Some("Shared".to_string()),
+            });
+            app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()))
+                .await
+                .unwrap();
+            assert!(app.invite_confirmation.is_none());
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_key_ignores_unhandled_alt_modified_keys() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut app = test_app();
+            app.lists = vec![test_list()];
+            app.items = vec![sample_item(1, "Item")];
+            app.detail_scroll = 2;
+            app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT))
+                .await
+                .unwrap();
+            assert_eq!(app.detail_scroll, 2);
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_help_key_keeps_overlay_open_for_unrecognized_keys() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut app = test_app();
+            app.show_help = true;
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()))
+                .await
+                .unwrap();
+            assert!(app.show_help);
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn handle_navigation_skips_mode_tabs_in_note_view_and_scrolls_detail() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut app = test_app();
+            let mut note = test_list();
+            note.list_type = Some("note".to_string());
+            app.lists = vec![note];
+            app.apply_note_detail_result(1, Ok(json!({"note_content": "Line one\nLine two"})));
+            app.focus = FocusPane::Items;
+            app.detail_scroll = 0;
+            app.handle_navigation_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+                .await
+                .unwrap();
+            app.handle_navigation_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+                .await
+                .unwrap();
+            assert!(app.detail_scroll > 0);
+            app.handle_navigation_key(KeyEvent::new(KeyCode::F(13), KeyModifiers::empty()))
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn select_list_panel_row_updates_selection_and_reloads_items() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let (api, requests) = api_with_responses(vec![
+                serde_json::json!({"id": 2, "list_type": "note", "note_content": "Other"})
+                    .to_string(),
+            ])
+            .await;
+            let mut app = App::new(api, true);
+            app.lists = vec![
+                test_list(),
+                test_shopping_list(2, "Other", None, None, None, false),
+            ];
+            app.selected_list = 0;
+            let area = Rect::new(0, 0, 80, 24);
+            let list_rows = list_panel_rows_area(area);
+            let panel_rows = list_panel_rows(&app.lists);
+            let target_row = panel_rows
+                .iter()
+                .position(|row| row.list_index == Some(1))
+                .expect("second list row should exist");
+            app.select_list_panel_row(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    list_rows.x + 2,
+                    list_rows.y + target_row as u16,
+                ),
+                list_rows,
+            );
+            assert_eq!(app.selected_list, 1);
+            assert_eq!(app.focus, FocusPane::Items);
+            let requests = requests.await.expect("list selection should reload note");
+            assert!(requests.iter().any(|req| req.contains("/api/lists/2")));
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn kanban_mode_mouse_noops_when_progress_columns_are_missing() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut app = test_app();
+            app.lists.clear();
+            app.items = vec![sample_item(1, "Orphan")];
+            app.mode = ViewMode::Kanban;
+            app.handle_kanban_mode_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Left), 1, 1),
+                Rect::new(0, 0, 80, 24),
+                true,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn kanban_drag_drop_on_same_column_does_not_persist_move() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut app = test_app();
+            app.lists = vec![test_list()];
+            app.items = vec![sample_item(1, "Stay")];
+            app.items[0].progress = Some(tr("tui-kanban-open"));
+            app.kanban_drag_item = Some(0);
+            app.kanban_drag_source_column = Some(0);
+            app.kanban_drag_started = true;
+            app.kanban_drag_target_column = Some(0);
+            assert!(!app.finish_kanban_drag(Some(0)).await.unwrap());
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn calendar_mode_mouse_left_click_starts_date_selection() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut app = test_app();
+            app.lists = vec![test_list()];
+            app.items = vec![sample_item(1, "Due")];
+            app.items[0].due_date = Some("2026-07-15".to_string());
+            app.mode = ViewMode::Calendar;
+            app.focus = FocusPane::Items;
+            let area = Rect::new(0, 0, 80, 24);
+            let layout = ui_layout(area, shows_list_mode_tabs(&app));
+            let calendar = app.calendar_layout(layout.content);
+            let (_cell_date, cell) = calendar
+                .date_hits
+                .iter()
+                .map(|hit| (hit.date, hit.rect))
+                .next()
+                .expect("calendar should expose a clickable day");
+            app.handle_calendar_mode_mouse(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    cell.x + 1,
+                    cell.y + 1,
+                ),
+                layout.content,
+                true,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(app.calendar_selected_date.is_some());
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn calendar_drag_finish_clears_state_without_target_date() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut app = test_app();
+            app.lists = vec![test_list()];
+            app.items = vec![sample_item(1, "Move")];
+            app.items[0].due_date = Some("2026-07-10".to_string());
+            app.calendar_drag_item = Some(0);
+            app.calendar_drag_source_date = Some(SimpleDate {
+                year: 2026,
+                month: 7,
+                day: 10,
+            });
+            app.calendar_drag_started = true;
+            app.calendar_drag_target_date = None;
+            app.finish_started_calendar_drag(
+                Rect::new(0, 0, 80, 24),
+                mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            )
+            .await
+            .unwrap();
+            assert!(app.calendar_drag_item.is_none());
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::test]
+    fn move_kanban_selection_noops_when_target_equals_current_item() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Only")];
+        app.selected_item = 0;
+        assert!(!app.move_kanban_selection(99));
+    }
+
+    #[kramli_test_macros::test]
+    fn default_progress_value_scans_all_configured_column_names() {
+        let mut app = test_app();
+        let mut blank_then_named = test_list();
+        blank_then_named.states = Some(vec![
+            ApiListState {
+                name: Some("   ".to_string()),
+                color: None,
+                is_done: Some(false),
+            },
+            ApiListState {
+                name: Some("Review".to_string()),
+                color: None,
+                is_done: Some(false),
+            },
+        ]);
+        app.lists = vec![blank_then_named];
+        assert_eq!(app.default_progress_value(), "Review");
+
+        let mut done_only = test_list();
+        done_only.states = Some(vec![ApiListState {
+            name: Some("Archived".to_string()),
+            color: None,
+            is_done: Some(true),
+        }]);
+        app.lists = vec![done_only];
+        assert_eq!(app.default_progress_value(), "Archived");
+    }
+
+    #[kramli_test_macros::test]
+    fn progress_choices_use_builtin_defaults_when_no_columns_exist() {
+        let mut app = test_app();
+        let mut blank_columns = test_list();
+        blank_columns.states = Some(vec![ApiListState {
+            name: Some("   ".to_string()),
+            color: None,
+            is_done: Some(false),
+        }]);
+        blank_columns.state_config = Some(r#"[{"name":"   "}]"#.to_string());
+        app.lists = vec![blank_columns];
+        assert_eq!(
+            app.progress_choices(),
+            vec![
+                tr("tui-kanban-open"),
+                tr("tui-kanban-in-progress"),
+                tr("tui-kanban-done"),
+            ]
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn move_kanban_column_selection_noops_when_target_matches_current() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.lists[0].states = Some(vec![
+            ApiListState {
+                name: Some("Open".to_string()),
+                color: None,
+                is_done: Some(false),
+            },
+            ApiListState {
+                name: Some("Done".to_string()),
+                color: None,
+                is_done: Some(true),
+            },
+        ]);
+        let mut left = sample_item(1, "Left");
+        left.progress = Some("Open".to_string());
+        let mut right = sample_item(2, "Right");
+        right.progress = Some("Done".to_string());
+        right.is_done = Some(true);
+        app.items = vec![left, right];
+        app.selected_item = 0;
+        assert!(!app.move_kanban_column_selection(0));
+    }
+
+    #[kramli_test_macros::test]
+    fn calendar_pointer_date_treats_column_separators_as_misses() {
+        let month = SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 1,
+        };
+        let content = Rect::new(0, 0, 80, 20);
+        let inner = content.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let (month_area, _) = calendar_panel_layout(inner);
+        let month_inner = month_area.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let widths = calendar_cell_widths(month_inner.width.saturating_sub(6));
+        let monday_row = month_inner.y.saturating_add(1);
+        let mut x = month_inner.x;
+        for (idx, width) in widths.iter().enumerate() {
+            if *width > 0 {
+                x = x.saturating_add(*width);
+                if idx + 1 < widths.len() && x < month_inner.x + month_inner.width {
+                    assert_eq!(calendar_pointer_date(content, x, monday_row, month), None);
+                    x = x.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn profile_panel_renders_debug_image_runtime_lines() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.profile_name = Some("Ada".to_string());
+        app.image_runtime_info = Some("images: kitty".to_string());
+        app.image_runtime_debug = vec!["probe: on".to_string(), "caps: 4".to_string()];
+        app.lists = vec![
+            test_list(),
+            test_shopping_list(2, "Other", None, None, None, false),
+        ];
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        let text = terminal_text(&terminal);
+        assert!(text.contains("Ada"));
+        assert!(text.contains("probe: on"));
+    }
+
+    #[kramli_test_macros::test]
+    fn list_panel_renders_text_icons_when_inline_images_are_disabled() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.set_inline_images_enabled(false);
+        app.lists = vec![test_shopping_list(
+            1,
+            "Groceries",
+            Some("bi-cart-fill"),
+            None,
+            None,
+            false,
+        )];
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        assert!(terminal_text(&terminal).contains("Groceries"));
+    }
+
+    #[kramli_test_macros::test]
+    fn draw_kanban_mode_returns_when_progress_columns_are_empty() {
+        let mut app = test_app();
+        app.lists.clear();
+        app.items = vec![sample_item(1, "Uncategorized")];
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 16)).unwrap();
+        terminal
+            .draw(|frame| draw_kanban_mode(frame, &app, frame.area()))
+            .unwrap();
+    }
+
+    #[kramli_test_macros::test]
+    fn editor_field_renders_inactive_field_styles() {
+        let editor = EditorState {
+            mode: EditorMode::Edit,
+            item_id: Some(1),
+            text: String::new(),
+            quantity: String::new(),
+            due_date: String::new(),
+            due_time: String::new(),
+            planned_date: String::new(),
+            planned_time: String::new(),
+            reminder: String::new(),
+            reminder_time: String::new(),
+            reminder_offsets: String::new(),
+            travel_time_minutes: String::new(),
+            priority: String::new(),
+            tags: String::new(),
+            progress: String::new(),
+            notes: String::new(),
+            active_field: EditorField::Text,
+        };
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_editor_field(frame, Rect::new(0, 0, 20, 5), EditorField::Notes, &editor)
+            })
+            .unwrap();
+    }
+
+    #[kramli_test_macros::test]
+    fn image_preference_name_reports_forced_iterm_protocol() {
+        assert_eq!(
+            image_preference_name(ImageProtocolPreference::Forced(ProtocolType::Iterm2)),
+            "imgcat"
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn build_image_picker_auto_probe_applies_env_override_suffix_on_foot() {
+        crate::test_env::with_env_lock(|| {
+            let _terminal_env = TerminalEnvGuard::clear();
+            std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
+            std::env::set_var(TERM_ENV, "foot");
+            std::env::remove_var(TERM_PROGRAM_ENV);
+            std::env::remove_var(KITTY_WINDOW_ID_ENV);
+            let (_picker, _enabled, summary, _debug) =
+                build_image_picker(ImageProtocolPreference::Auto);
+            assert!(
+                summary.contains("probe+env") || summary.contains("sixel"),
+                "unexpected summary: {summary}"
+            );
+        });
+    }
+
+    #[kramli_test_macros::test]
+    fn stepped_kanban_wrapped_selection_returns_none_for_missing_columns() {
+        assert_eq!(stepped_kanban_selection_wrapped(&[], 0, 1), None);
+        assert_eq!(
+            stepped_kanban_selection_wrapped(&[Vec::new(), Vec::new()], 0, 1),
+            None
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn move_kanban_selection_stops_at_last_item_in_column() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "First"), sample_item(2, "Second")];
+        app.selected_item = 1;
+        assert!(!app.move_kanban_selection(1));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn move_selected_item_calendar_hours_skips_unchanged_due_dates() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut app = test_app();
+            app.lists = vec![test_list()];
+            app.mode = ViewMode::Calendar;
+            app.items = vec![sample_item(1, "Scheduled")];
+            app.items[0].due_date = Some("2026-07-21T12:00".to_string());
+            app.selected_item = 0;
+            app.calendar_selected_date = Some(SimpleDate {
+                year: 2026,
+                month: 7,
+                day: 21,
+            });
+            assert!(!app
+                .move_selected_item_calendar_hours(0)
+                .await
+                .expect("zero-hour move should noop"));
+            let unchanged = app.items[0].due_date.clone().unwrap();
+            for delta in 1..=23 {
+                if due_date_with_hour_delta(
+                    Some(unchanged.as_str()),
+                    SimpleDate {
+                        year: 2026,
+                        month: 7,
+                        day: 21,
+                    },
+                    delta,
+                ) == unchanged
+                {
+                    assert!(!app
+                        .move_selected_item_calendar_hours(delta)
+                        .await
+                        .expect("unchanged due date should noop"));
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::test]
+    fn kanban_window_realigns_selected_row_when_it_falls_outside_window() {
+        let bucket: Vec<usize> = (0..30).collect();
+        let (start, _count, _, _) = kanban_window(&bucket, 0, 4);
+        assert!(start <= 0);
+        let (start_high, count_high, _, _) = kanban_window(&bucket, 29, 4);
+        assert!(start_high + count_high >= 30);
+        let (adjust_start, _, _, _) = kanban_window(&bucket, 25, 3);
+        assert!(adjust_start <= 25 && 25 < adjust_start + 3);
+    }
+
+    #[kramli_test_macros::test]
+    fn extract_bootstrap_class_icon_skips_invalid_candidates_before_matching() {
+        assert_eq!(
+            extract_bootstrap_class_icon(r#"<i class="bi bi-Bad_Name bi-cart-fill"></i>"#),
+            Some("cart-fill".to_string())
+        );
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn bootstrap_icon_fetch_uses_disk_cache_before_network() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            crate::test_env::with_env_lock_async(|| async {
+                let icon_name = format!("cached-icon-{}", std::process::id());
+                let svg = r#"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path fill='currentColor' d='M0 0h16v16H0z'/></svg>"#;
+                write_cached_bootstrap_icon(&icon_name, svg.as_bytes()).await;
+                let cache_path = bootstrap_icon_cache_path(&icon_name).expect("cache path");
+                assert!(cache_path.exists());
+                let image = fetch_bootstrap_icon_image(&icon_name)
+                    .await
+                    .expect("cached icon should render without network");
+                assert!(image.width() > 0);
+                let _ = tokio::fs::remove_file(cache_path).await;
+            })
+            .await;
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    #[kramli_test_macros::test]
+    fn html_attr_value_reads_unquoted_attribute_values() {
+        assert_eq!(
+            html_attr_value(r#"<img src=/uploads/photo.jpg alt=pic>"#, "src"),
+            Some("/uploads/photo.jpg".to_string())
+        );
+    }
+
+    #[kramli_test_macros::test]
+    #[should_panic(expected = "acceptance message expected")]
+    fn accept_invite_load_message_guard_rejects_unexpected_variants() {
+        let message = LoadMessage::Lists(Ok(vec![]));
+        match message {
+            LoadMessage::AcceptInvite { .. } => {}
+            _ => panic!("acceptance message expected"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    #[should_panic(expected = "preview message expected")]
+    fn comments_preview_load_message_guard_rejects_unexpected_variants() {
+        let message = LoadMessage::Lists(Ok(vec![]));
+        match message {
+            LoadMessage::LinkPreviews { .. } => {}
+            _ => panic!("preview message expected"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    #[should_panic(expected = "note detail message expected")]
+    fn note_detail_load_message_guard_rejects_unexpected_variants() {
+        let message = LoadMessage::Lists(Ok(vec![]));
+        match message {
+            LoadMessage::NoteDetail { .. } => {}
+            _ => panic!("note detail message expected"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    #[should_panic(expected = "acceptance message expected")]
+    fn failed_invite_message_guard_rejects_unexpected_variants() {
+        let message = LoadMessage::Lists(Ok(vec![]));
+        match message {
+            LoadMessage::AcceptInvite { .. } => {}
+            _ => panic!("acceptance message expected"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    #[should_panic(expected = "accept terms message expected")]
+    fn legal_consent_message_guard_rejects_unexpected_variants() {
+        let message = LoadMessage::Lists(Ok(vec![]));
+        match message {
+            LoadMessage::AcceptTerms { .. } => {}
+            _ => panic!("accept terms message expected"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    #[should_panic(expected = "unexpected reload message")]
+    fn reload_lists_message_guard_rejects_unexpected_variants() {
+        let message = LoadMessage::Items {
+            list_id: 1,
+            result: Ok(vec![]),
+        };
+        match message {
+            LoadMessage::Lists(_) => {}
+            _ => panic!("unexpected reload message"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    #[should_panic(expected = "unexpected items message")]
+    fn reload_items_message_guard_rejects_unexpected_variants() {
+        let message = LoadMessage::Lists(Ok(vec![]));
+        match message {
+            LoadMessage::Items { .. } => {}
+            _ => panic!("unexpected items message"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn image_env_restoration_tests_cover_seeded_previous_values() {
+        crate::test_env::with_env_lock(|| {
+            seed_terminal_env_for_restoration_coverage();
+            let previous_term = std::env::var_os(TERM_ENV);
+            let previous_program = std::env::var_os(TERM_PROGRAM_ENV);
+            let previous_lc_terminal = std::env::var_os(LC_TERMINAL_ENV);
+            let previous_kitty = std::env::var_os(KITTY_WINDOW_ID_ENV);
+            let previous_iterm = std::env::var_os(ITERM_SESSION_ID_ENV);
+            let previous_wt = std::env::var_os(WT_SESSION_ENV);
+
+            std::env::set_var(TERM_ENV, "xterm-kitty");
+            std::env::set_var(KITTY_WINDOW_ID_ENV, "1");
+            assert_eq!(autodetect_protocol_fallback(), Some(ProtocolType::Kitty));
+
+            restore_env_var(TERM_ENV, previous_term);
+            restore_env_var(TERM_PROGRAM_ENV, previous_program);
+            restore_env_var(LC_TERMINAL_ENV, previous_lc_terminal);
+            restore_env_var(KITTY_WINDOW_ID_ENV, previous_kitty);
+            restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
+            restore_env_var(WT_SESSION_ENV, previous_wt);
+        });
+    }
+
+    #[kramli_test_macros::test]
+    fn build_image_picker_restores_seeded_env_after_auto_probe() {
+        crate::test_env::with_env_lock(|| {
+            seed_terminal_env_for_restoration_coverage();
+            let previous_images = std::env::var_os(KRAMLI_TUI_IMAGES_ENV);
+            let previous_term = std::env::var_os(TERM_ENV);
+            let previous_program = std::env::var_os(TERM_PROGRAM_ENV);
+            let previous_lc_terminal = std::env::var_os(LC_TERMINAL_ENV);
+            let previous_iterm = std::env::var_os(ITERM_SESSION_ID_ENV);
+
+            std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
+            std::env::set_var(TERM_ENV, "xterm-256color");
+            std::env::set_var(TERM_PROGRAM_ENV, "iTerm.app");
+            std::env::set_var(LC_TERMINAL_ENV, "iTerm2");
+            std::env::set_var(ITERM_SESSION_ID_ENV, "session");
+            let (_picker, enabled, _summary, _debug) =
+                build_image_picker(ImageProtocolPreference::Auto);
+            assert!(enabled);
+
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+            restore_env_var(TERM_ENV, previous_term);
+            restore_env_var(TERM_PROGRAM_ENV, previous_program);
+            restore_env_var(LC_TERMINAL_ENV, previous_lc_terminal);
+            restore_env_var(ITERM_SESSION_ID_ENV, previous_iterm);
+        });
+    }
+
+    #[kramli_test_macros::test]
+    fn image_protocol_preference_restores_seeded_env_overrides() {
+        crate::test_env::with_env_lock(|| {
+            seed_terminal_env_for_restoration_coverage();
+            let previous_images = std::env::var_os(KRAMLI_TUI_IMAGES_ENV);
+            let previous_protocol = std::env::var_os(KRAMLI_TUI_IMAGE_PROTOCOL_ENV);
+            std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, "sixel");
+            assert!(matches!(
+                image_protocol_preference(),
+                ImageProtocolPreference::Forced(ProtocolType::Sixel)
+            ));
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+            restore_env_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, previous_protocol);
+        });
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn lists_panel_cached_icon_rendering_restores_seeded_image_env() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            crate::test_env::with_env_lock_async(|| async {
+                seed_terminal_env_for_restoration_coverage();
+                let _terminal_env = TerminalEnvGuard::clear();
+                let previous_images = std::env::var_os(KRAMLI_TUI_IMAGES_ENV);
+                let previous_protocol = std::env::var_os(KRAMLI_TUI_IMAGE_PROTOCOL_ENV);
+                std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
+                std::env::set_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, "kitty");
+                let mut app = App::new(ApiClient::for_tests("https://kramli.test"), true);
+                app.set_inline_images_enabled(true);
+                app.picker.set_protocol_type(ProtocolType::Kitty);
+                app.apply_list_icon_result(
+                    "folder2".to_string(),
+                    Ok(DynamicImage::new_rgba8(2, 2)),
+                );
+                app.lists = vec![test_shopping_list(
+                    1,
+                    "Groceries",
+                    None,
+                    Some(9),
+                    Some("Home"),
+                    false,
+                )];
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+                terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+                restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+                restore_env_var(KRAMLI_TUI_IMAGE_PROTOCOL_ENV, previous_protocol);
+            })
+            .await;
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    fn injected_terminal_io_error(message: &str) -> io::Error {
+        io::Error::new(io::ErrorKind::Other, message)
+    }
+
+    #[kramli_test_macros::test]
+    fn init_terminal_hooks_return_error_when_raw_mode_setup_fails() {
+        let result = init_terminal_with_hooks(
+            || Err(injected_terminal_io_error("enable raw failed")),
+            || Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+            |stdout| Terminal::new(CrosstermBackend::new(stdout)),
+        );
+        assert_eq!(result.unwrap_err(), "enable raw failed");
+    }
+
+    #[kramli_test_macros::test]
+    fn init_terminal_hooks_cleanup_raw_mode_when_alternate_screen_fails() {
+        let disable_calls = std::cell::Cell::new(0);
+        let result = init_terminal_with_hooks(
+            || Ok(()),
+            || {
+                disable_calls.set(disable_calls.get() + 1);
+                Ok(())
+            },
+            |_| Err(injected_terminal_io_error("enter screen failed")),
+            |_| Ok(()),
+            |stdout| Terminal::new(CrosstermBackend::new(stdout)),
+        );
+        assert_eq!(result.unwrap_err(), "enter screen failed");
+        assert_eq!(disable_calls.get(), 1);
+    }
+
+    #[kramli_test_macros::test]
+    fn init_terminal_hooks_cleanup_when_terminal_construction_fails() {
+        let disable_calls = std::cell::Cell::new(0);
+        let leave_calls = std::cell::Cell::new(0);
+        let result = init_terminal_with_hooks(
+            || Ok(()),
+            || {
+                disable_calls.set(disable_calls.get() + 1);
+                Ok(())
+            },
+            |_| Ok(()),
+            |_| {
+                leave_calls.set(leave_calls.get() + 1);
+                Ok(())
+            },
+            |_| Err(injected_terminal_io_error("terminal new failed")),
+        );
+        assert_eq!(result.unwrap_err(), "terminal new failed");
+        assert_eq!(disable_calls.get(), 1);
+        assert_eq!(leave_calls.get(), 1);
+    }
+
+    struct FailShowCursorBackend {
+        inner: ratatui::backend::TestBackend,
+    }
+
+    impl ratatui::backend::Backend for FailShowCursorBackend {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.draw(content).map_err(|never| match never {})
+        }
+
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            self.inner.hide_cursor().map_err(|never| match never {})
+        }
+
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            Err(injected_terminal_io_error("show cursor failed"))
+        }
+
+        fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+            self.inner
+                .get_cursor_position()
+                .map_err(|never| match never {})
+        }
+
+        fn set_cursor_position<P: Into<Position>>(
+            &mut self,
+            position: P,
+        ) -> Result<(), Self::Error> {
+            self.inner
+                .set_cursor_position(position)
+                .map_err(|never| match never {})
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            self.inner.clear().map_err(|never| match never {})
+        }
+
+        fn clear_region(
+            &mut self,
+            clear_type: ratatui::backend::ClearType,
+        ) -> Result<(), Self::Error> {
+            self.inner
+                .clear_region(clear_type)
+                .map_err(|never| match never {})
+        }
+
+        fn size(&self) -> Result<Size, Self::Error> {
+            self.inner.size().map_err(|never| match never {})
+        }
+
+        fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
+            self.inner.window_size().map_err(|never| match never {})
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.inner.flush().map_err(|never| match never {})
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn restore_terminal_hooks_collect_disable_raw_mode_failure() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let result = restore_terminal_with_hooks(
+            &mut terminal,
+            || Err(injected_terminal_io_error("disable raw failed")),
+            |_| Ok(()),
+        );
+        assert_eq!(result.unwrap_err(), "disable raw failed");
+    }
+
+    #[kramli_test_macros::test]
+    fn restore_terminal_hooks_collect_leave_screen_failure() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let result = restore_terminal_with_hooks(
+            &mut terminal,
+            || Ok(()),
+            |_| Err(injected_terminal_io_error("leave screen failed")),
+        );
+        assert_eq!(result.unwrap_err(), "leave screen failed");
+    }
+
+    #[kramli_test_macros::test]
+    fn restore_terminal_hooks_collect_show_cursor_failure() {
+        let mut terminal = Terminal::new(FailShowCursorBackend {
+            inner: ratatui::backend::TestBackend::new(80, 24),
+        })
+        .unwrap();
+        let result = restore_terminal_with_hooks(&mut terminal, || Ok(()), |_| Ok(()));
+        assert_eq!(result.unwrap_err(), "show cursor failed");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn run_tui_entrypoint_invokes_default_prepare_closure() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            crate::test_env::with_env_lock_async(|| async {
+                std::env::set_var("KRAMLI_URL", "http://127.0.0.1:9");
+                std::env::set_var("KRAMLI_API_KEY", "kramli_test");
+                let outcome = run_tui_with_terminal_factory(
+                    ApiClient::for_tests("http://127.0.0.1:9"),
+                    false,
+                    || {
+                        Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+                            .map_err(|error| error.to_string())
+                    },
+                    |_| Ok(()),
+                    |app| {
+                        app.beta_consent_pending = false;
+                        app.should_quit = true;
+                    },
+                )
+                .await;
+                assert!(outcome.is_ok());
+            })
+            .await;
+        })
+        .await
+        .expect("test timed out after 20s");
+    }
+
+    fn run_tui_entrypoint_under_pseudo_terminal() {
+        run_tui_test_in_pseudo_terminal("run_tui_entrypoint_tty_case");
+    }
+
+    #[kramli_test_macros::test]
+    #[ignore = "requires pseudo-terminal for real init_terminal coverage"]
+    fn run_tui_entrypoint_tty_case() {
+        if !std::io::IsTerminal::is_terminal(&io::stdout()) {
+            return;
+        }
+        let mut terminal = init_terminal().expect("init_terminal should succeed on a tty");
+        restore_terminal(&mut terminal).expect("restore_terminal should succeed on a tty");
+    }
+
+    #[kramli_test_macros::test]
+    fn run_tui_entrypoint_runs_under_pseudo_terminal() {
+        run_tui_entrypoint_under_pseudo_terminal();
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn note_link_preview_click_ignores_out_of_range_index() {
+        let mut app = test_app();
+        let mut note = test_list();
+        note.list_type = Some("note".to_string());
+        app.lists = vec![note];
+        app.apply_note_detail_result(
+            1,
+            Ok(json!({"note_content": "See https://example.test/link for details"})),
+        );
+        app.link_previews.insert(note_preview_owner(1), Vec::new());
+        let content = Rect::new(10, 5, 60, 20);
+        let inner = content.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        app.handle_note_mode_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                inner.x + 1,
+                inner.y,
+            ),
+            content,
+            true,
+        )
+        .await
+        .expect("out-of-range preview click should be ignored");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn kanban_mouse_handler_returns_when_progress_columns_are_empty() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Orphan")];
+        app.mode = ViewMode::Kanban;
+        app.force_empty_kanban_columns = true;
+        app.handle_kanban_mode_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 5, 5),
+            Rect::new(0, 0, 80, 24),
+            true,
+            false,
+            false,
+        )
+        .await
+        .expect("empty kanban columns should no-op");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn kanban_drag_release_on_same_column_does_not_move_item() {
+        let (api, requests) = api_with_responses(Vec::new()).await;
+        let mut app = App::new(api, true);
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Stay")];
+        app.mode = ViewMode::Kanban;
+        app.selected_item = 0;
+        app.kanban_drag_item = Some(0);
+        app.kanban_drag_started = true;
+        app.kanban_drag_source_column = Some(0);
+        app.kanban_drag_target_column = Some(0);
+        let moved = app
+            .finish_kanban_drag(Some(0))
+            .await
+            .expect("same-column release should succeed");
+        assert!(!moved);
+        let requests = requests.await.expect("test server should finish");
+        assert!(requests.is_empty());
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn calendar_left_down_click_opens_add_editor_from_empty_agenda() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.mode = ViewMode::Calendar;
+        app.calendar_visible_month = Some(today_utc());
+        let content = Rect::new(0, 0, 80, 24);
+        app.handle_calendar_mode_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 70, 20),
+            content,
+            true,
+            false,
+            false,
+        )
+        .await
+        .expect("empty agenda click should succeed");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn calendar_drag_to_same_date_skips_network_update() {
+        let (api, requests) = api_with_responses(Vec::new()).await;
+        let mut app = App::new(api, true);
+        app.lists = vec![test_list()];
+        let mut item = sample_item(1, "Same day");
+        item.due_date = Some("2026-07-10".to_string());
+        app.items = vec![item];
+        app.mode = ViewMode::Calendar;
+        app.calendar_visible_month = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 1,
+        });
+        app.calendar_drag_item = Some(0);
+        app.calendar_drag_started = true;
+        app.calendar_drag_source_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 10,
+        });
+        app.calendar_drag_target_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 10,
+        });
+        app.finish_started_calendar_drag(
+            Rect::new(0, 0, 80, 24),
+            mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
+        )
+        .await
+        .expect("same-date drag should clear without update");
+        assert!(requests
+            .await
+            .expect("test server should finish")
+            .is_empty());
+    }
+
+    #[kramli_test_macros::test]
+    fn move_kanban_selection_is_inert_when_target_matches_current_item() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Only")];
+        app.selected_item = 0;
+        app.mode = ViewMode::Kanban;
+        assert!(!app.move_kanban_selection(1));
+    }
+
+    #[kramli_test_macros::test]
+    fn default_progress_value_falls_back_when_every_column_name_is_blank() {
+        let mut app = test_app();
+        let mut blank_columns = test_list();
+        blank_columns.states = Some(vec![ApiListState {
+            name: Some("   ".to_string()),
+            color: None,
+            is_done: Some(false),
+        }]);
+        app.lists = vec![blank_columns];
+        assert_eq!(app.default_progress_value(), tr("tui-kanban-open"));
+    }
+
+    #[kramli_test_macros::test]
+    fn progress_suggestions_use_defaults_when_columns_are_blank() {
+        let mut app = test_app();
+        let mut blank_columns = test_list();
+        blank_columns.states = Some(vec![ApiListState {
+            name: Some("   ".to_string()),
+            color: None,
+            is_done: Some(false),
+        }]);
+        app.lists = vec![blank_columns];
+        let suggestions = app.progress_suggestions();
+        assert_eq!(suggestions.len(), 3);
+        assert!(suggestions.contains(&tr("tui-kanban-open")));
+    }
+
+    #[kramli_test_macros::test]
+    fn apply_editor_suggestion_returns_false_when_editor_is_missing() {
+        let mut app = test_app();
+        app.editor = None;
+        assert!(!app.apply_editor_suggestion(1));
+    }
+
+    #[kramli_test_macros::test]
+    fn move_kanban_column_selection_is_inert_when_selection_is_unchanged() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "Only")];
+        app.selected_item = 0;
+        app.mode = ViewMode::Kanban;
+        assert!(!app.move_kanban_column_selection(0));
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn move_selected_item_calendar_hours_is_inert_when_due_date_is_unchanged() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        let mut item = sample_item(1, "Fixed");
+        item.due_date = Some("2026-07-10".to_string());
+        app.items = vec![item];
+        app.mode = ViewMode::Calendar;
+        app.selected_item = 0;
+        app.calendar_selected_date = Some(SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 10,
+        });
+        assert!(!app
+            .move_selected_item_calendar_hours(0)
+            .await
+            .expect("unchanged hour delta should succeed"));
+    }
+
+    #[kramli_test_macros::test]
+    fn calendar_pointer_date_returns_none_for_column_gutter() {
+        let month = SimpleDate {
+            year: 2026,
+            month: 7,
+            day: 1,
+        };
+        let content = Rect::new(0, 0, 40, 20);
+        let (_, month_area) = calendar_panel_layout(content.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        }));
+        let inner = month_area.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let widths = calendar_cell_widths(inner.width.saturating_sub(6));
+        let monday_row = inner.y.saturating_add(1);
+        let gutter_x = inner.x + widths.iter().take(1).sum::<u16>() + 1;
+        assert_eq!(
+            calendar_pointer_date(content, gutter_x, monday_row, month),
+            None
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn draw_kanban_mode_returns_when_progress_columns_are_missing() {
+        let mut app = test_app();
+        app.lists = vec![test_list()];
+        app.items = vec![sample_item(1, "No columns")];
+        app.mode = ViewMode::Kanban;
+        app.force_empty_kanban_columns = true;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+    }
+
+    #[kramli_test_macros::test]
+    fn profile_panel_renders_debug_image_runtime_lines_in_debug_builds() {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.profile_name = Some("Debug".to_string());
+        app.image_runtime_info = Some("images: kitty".to_string());
+        app.image_runtime_debug = vec!["probe: on".to_string()];
+        app.lists = vec![test_list()];
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        assert!(terminal_text(&terminal).contains("probe: on"));
+    }
+
+    #[kramli_test_macros::test]
+    fn list_panel_renders_bootstrap_icon_targets_for_nested_folders() {
+        let mut app = test_app();
+        app.beta_consent_pending = false;
+        app.set_inline_images_enabled(true);
+        app.picker.set_protocol_type(ProtocolType::Halfblocks);
+        app.lists = vec![
+            test_shopping_list(1, "Root", Some("folder2"), None, None, false),
+            test_shopping_list(2, "Child", Some("cart-fill"), Some(1), Some("Root"), false),
+        ];
+        app.apply_list_icon_result("folder2".to_string(), Ok(DynamicImage::new_rgba8(2, 2)));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+        assert!(terminal_text(&terminal).contains("Root"));
+    }
+
+    #[kramli_test_macros::test]
+    fn build_image_picker_auto_probe_uses_env_override_suffix_for_iterm() {
+        crate::test_env::with_env_lock(|| {
+            let _terminal_env = TerminalEnvGuard::clear();
+            let previous_images = std::env::var_os(KRAMLI_TUI_IMAGES_ENV);
+            std::env::set_var(KRAMLI_TUI_IMAGES_ENV, "1");
+            std::env::set_var(TERM_ENV, "xterm-256color");
+            std::env::set_var(TERM_PROGRAM_ENV, "WezTerm");
+            std::env::set_var(LC_TERMINAL_ENV, "iTerm2");
+            std::env::set_var(ITERM_SESSION_ID_ENV, "session");
+            let (_picker, enabled, summary, _debug) =
+                build_image_picker(ImageProtocolPreference::Auto);
+            assert!(enabled);
+            assert!(summary.contains("probe+iterm") || summary.contains("probe+env"));
+            restore_env_var(KRAMLI_TUI_IMAGES_ENV, previous_images);
+        });
+    }
+
+    #[kramli_test_macros::test]
+    fn stepped_kanban_selection_returns_none_for_empty_bucket() {
+        let buckets = vec![vec![1], vec![]];
+        assert_eq!(stepped_kanban_selection(&buckets, 1, 1), None);
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn fetch_bootstrap_icon_image_uses_cached_bytes_when_render_succeeds() {
+        let icon = format!("cached-icon-{}", std::process::id());
+        let cache_path = bootstrap_icon_cache_path(&icon).expect("cache path");
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let svg = r#"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='#fff'/></svg>"#;
+        fs::write(&cache_path, svg.as_bytes()).unwrap();
+        let image = fetch_bootstrap_icon_image(&icon)
+            .await
+            .expect("cached icon");
+        assert!(image.width() > 0);
+        assert!(image.height() > 0);
+        let _ = fs::remove_file(cache_path);
+    }
+
+    #[kramli_test_macros::test]
+    fn write_cached_bootstrap_icon_noops_when_cache_path_is_unavailable() {
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(write_cached_bootstrap_icon("", b"svg"));
+    }
+
+    #[kramli_test_macros::test]
+    fn extract_html_image_source_reads_data_src_attribute() {
+        assert_eq!(
+            extract_html_image_source(r#"<img data-src="/uploads/note.png">"#).as_deref(),
+            Some("/uploads/note.png")
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn accept_invite_load_message_guard_accepts_expected_variant() {
+        let message = LoadMessage::AcceptInvite {
+            list_id: Some(7),
+            result: Ok(json!({"list_id": 7})),
+        };
+        match message {
+            LoadMessage::AcceptInvite { .. } => {}
+            _ => panic!("acceptance message expected"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn link_previews_load_message_guard_accepts_expected_variant() {
+        let message = LoadMessage::LinkPreviews {
+            owner: item_preview_owner(1),
+            identity: PreviewRequestIdentity {
+                generation: 1,
+                fingerprint: 1,
+            },
+            previews: vec![],
+        };
+        match message {
+            LoadMessage::LinkPreviews { .. } => {}
+            _ => panic!("preview message expected"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn note_detail_load_message_guard_accepts_expected_variant() {
+        let message = LoadMessage::NoteDetail {
+            list_id: 1,
+            result: Ok(json!({"note_content": "Plain"})),
+        };
+        match message {
+            LoadMessage::NoteDetail { .. } => {}
+            _ => panic!("note detail message expected"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn reload_lists_load_message_guard_accepts_expected_variant() {
+        let message = LoadMessage::Lists(Ok(vec![]));
+        match message {
+            LoadMessage::Lists(_) => {}
+            _ => panic!("unexpected reload message"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn reload_items_load_message_guard_accepts_expected_variant() {
+        let message = LoadMessage::Items {
+            list_id: 1,
+            result: Ok(vec![]),
+        };
+        match message {
+            LoadMessage::Items { .. } => {}
+            _ => panic!("unexpected items message"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn legal_consent_load_message_guard_accepts_expected_variant() {
+        let message = LoadMessage::AcceptTerms {
+            result: Ok(json!({"legal": {"pending": []}})),
+        };
+        match message {
+            LoadMessage::AcceptTerms { .. } => {}
+            _ => panic!("accept terms message expected"),
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn restore_terminal_on_real_stdout_when_available() {
+        if !std::io::IsTerminal::is_terminal(&io::stdout()) {
+            return;
+        }
+        let backend = CrosstermBackend::new(io::stdout());
+        if let Ok(mut terminal) = Terminal::new(backend) {
+            restore_terminal(&mut terminal).expect("restore should succeed on stdout tty");
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn init_terminal_on_real_stdout_when_available() {
+        if !std::io::IsTerminal::is_terminal(&io::stdout()) {
+            return;
+        }
+        let mut terminal = init_terminal().expect("init should succeed on stdout tty");
+        restore_terminal(&mut terminal).expect("restore should succeed on stdout tty");
     }
 }

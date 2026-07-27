@@ -100,6 +100,7 @@ role-editor = Bewerker
 role-viewer = Lezer
 
 view-list = Lijst
+view-note = Note
 view-board = Bord
 view-calendar = Kalender
 view-timeline = Tijdlijn
@@ -357,3 +358,4 @@ tui-invite-confirm-body = Deelnemen aan ‘{ $list }’?
 tui-invite-confirm-hint = Enter: accepteren   Esc: annuleren
 tui-invite-accepting = Uitnodiging accepteren...
 tui-help-actions-5 =   v Link openen/accepteren   V Volgende link   Alt+↑/↓ Details schuiven
+tui-help-note-links =   ↑/↓ Scroll note   v Open/accept link   V Select next link   Click link card

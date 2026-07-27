@@ -100,6 +100,7 @@ role-editor = Düzenleyici
 role-viewer = Görüntüleyici
 
 view-list = Liste
+view-note = Note
 view-board = Pano
 view-calendar = Takvim
 view-timeline = Zaman çizelgesi
@@ -357,3 +358,4 @@ tui-invite-confirm-body = “{ $list }” listesine katılınsın mı?
 tui-invite-confirm-hint = Enter: kabul et   Esc: iptal
 tui-invite-accepting = Davet kabul ediliyor...
 tui-help-actions-5 =   v Bağlantıyı aç/kabul et   V Sonraki bağlantı   Alt+↑/↓ Ayrıntıları kaydır
+tui-help-note-links =   ↑/↓ Scroll note   v Open/accept link   V Select next link   Click link card

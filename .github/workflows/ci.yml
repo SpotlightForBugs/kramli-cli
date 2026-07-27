@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  KRAMLI_TEST_TIMEOUT_SECS: "20"
 
 jobs:
   test:

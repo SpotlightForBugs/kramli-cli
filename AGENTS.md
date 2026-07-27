@@ -59,3 +59,40 @@ The `clean-pr` GitHub Actions workflow enforces this server-side:
 - **`clean` job** — scrubs PR descriptions and deletes Bugbot comments from the `cursor` bot.
 
 Fork PRs may not be rewriteable by `GITHUB_TOKEN` (same-repo branches only).
+
+## Test coverage and bug discovery
+
+When working toward test coverage, writing tests, or running parallel subagents on a module:
+
+### Fix bad behavior — do not work around it
+
+If tests reveal incorrect behavior, panics, deadlocks, hangs, or logic errors in **production code**, **patch the production code**. That is in scope.
+
+- Do **not** weaken assertions, skip branches, or add test-only hacks just to make coverage green while leaving the bug in place.
+- A test that **fails because it asserts correct behavior** against a broken implementation is valid work: fix the implementation, then the test passes.
+- Small, documented **test hooks** in the module under test (for example `set_test_*_err`) are fine when they are the only practical way to exercise an error path — keep them minimal and local to that module.
+
+### Stay in scope
+
+- Change only production code **directly related** to the behavior you are testing or the task you were assigned.
+- Do **not** refactor, reformat, rename, or “clean up” unrelated modules, dependencies, CI, or tooling.
+- Do **not** edit files outside your assigned area “while you are here.”
+- Subagents assigned to one module must not modify other modules except shared test infrastructure explicitly called out in the task (for example `test_env.rs`, `kramli-test-macros`).
+
+### Test conventions in this repo
+
+- Use `#[kramli_test_macros::test]` and `#[kramli_test_macros::tokio_test]` — not bare `#[test]` / `#[tokio::test]` (timeouts apply to all tests).
+- `#[ignore]` is OK on macro-wrapped tests (for example pseudo-terminal subprocess cases); never use plain `#[test]` for ignored tests.
+- Name tests descriptively (`*_covers_*_branches`, `*_returns_*`, etc.) — no `cov_*` prefixes.
+- Never nest `with_env_vars_async`; use `with_env_vars_async_unlocked` inside an outer env block.
+- Do not use `/tmp/` paths in tests (DeepSource RS-S1003).
+- Run tests with `cargo test -- --test-threads=1`. Do not pipe test output through `tail` (errors appear at the top; buffering can hide failures).
+
+### Subagent handoff
+
+When orchestrating parallel agents, include in each prompt:
+
+1. **Scope:** exact file(s) or module(s) they may change.
+2. **Permission to fix bugs** found while testing those modules.
+3. **Prohibition** on out-of-scope edits.
+4. **Timeout:** each agent runs only its own test(s), max 20s per test (`KRAMLI_TEST_TIMEOUT_SECS`).

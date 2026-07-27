@@ -203,7 +203,11 @@ mod tests {
         }
     }
 
-    #[test]
+    fn confirm_true(_: &str, _: bool) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    #[kramli_test_macros::test]
     fn run_with_cli_hooks_handles_preference_and_runtime_failures() {
         crate::test_env::with_env_vars(&[("KRAMLI_URL", ""), ("KRAMLI_API_KEY", "")], || {
             fn runtime_error() -> Result<tokio::runtime::Runtime, String> {
@@ -236,7 +240,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn run_with_cli_covers_success_and_error_outcomes() {
         crate::test_env::with_env_vars(&[("KRAMLI_URL", ""), ("KRAMLI_API_KEY", "")], || {
             assert_eq!(
@@ -254,7 +258,7 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn first_run_prompt_is_disabled_for_non_interactive_paths() {
         let mut cli = cli_for(Some(Commands::Status));
         cli.json = true;
@@ -280,7 +284,7 @@ mod tests {
         ))));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn first_run_prompt_is_enabled_for_interactive_or_regular_commands() {
         let mut cli = cli_for(None);
         cli.interactive = true;
@@ -296,13 +300,13 @@ mod tests {
         ))));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn first_run_preferences_skip_prompt_when_streams_are_not_terminal() {
         let cli = cli_for(Some(Commands::Status));
         assert!(ensure_first_run_preferences(&cli).is_ok());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn first_run_prompt_blocker_covers_stream_combinations() {
         let cli = cli_for(Some(Commands::Status));
         assert!(first_run_prompt_blocked(&cli, false, true));
@@ -314,13 +318,13 @@ mod tests {
         assert!(first_run_prompt_blocked(&json_cli, true, true));
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn telemetry_init_respects_disable_environment() {
         let guard = init_telemetry_when(false);
         assert!(guard.is_none());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn telemetry_init_reads_disabled_environment() {
         crate::test_env::with_env_vars(&[(DO_NOT_TRACK_ENV, "1")], || {
             let guard = init_telemetry();
@@ -328,18 +332,18 @@ mod tests {
         });
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn telemetry_init_can_enable_guard_from_environment() {
         let guard = init_telemetry_when(true);
         assert!(guard.is_some());
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn test_main_entrypoint_is_inert_under_cfg_test() {
         assert_eq!(main(), ExitCode::SUCCESS);
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn run_with_cli_can_capture_errors_when_enabled() {
         crate::test_env::with_env_vars(
             &[
@@ -357,7 +361,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[kramli_test_macros::test]
     fn first_run_prompt_helper_covers_confirm_save_and_error_paths() {
         let config_root = std::env::temp_dir().join(format!(
             "kramli-main-first-run-{}-{}",
@@ -427,5 +431,226 @@ mod tests {
                 assert!(failing.is_err());
             },
         );
+    }
+
+    #[kramli_test_macros::test]
+    fn first_run_prompt_only_asks_bootstrap_when_telemetry_is_saved() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-main-bootstrap-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0_u128, |value| value.as_nanos())
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+        let config_path = config_root.join("config.json");
+        std::fs::write(&config_path, r#"{"telemetry_enabled":true}"#).expect("seed config");
+
+        crate::test_env::with_env_vars(
+            &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("config root should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("config root should be valid utf-8"),
+                ),
+                (
+                    crate::config::KRAMLI_CONFIG_PATH_ENV,
+                    config_path
+                        .to_str()
+                        .expect("config path should be valid utf-8"),
+                ),
+            ],
+            || {
+                let cli = cli_for(Some(Commands::Status));
+                let mut prompts = Vec::new();
+                ensure_first_run_preferences_with(&cli, true, true, |prompt, default| {
+                    prompts.push((prompt.to_string(), default));
+                    confirm_true(prompt, default)
+                })
+                .expect("bootstrap-only prompt should succeed");
+
+                assert_eq!(prompts.len(), 1);
+                assert!(prompts[0].0.contains("Bootstrap") || prompts[0].0.contains("bootstrap"));
+                let saved = Config::load();
+                assert!(saved.telemetry_enabled());
+                assert!(saved.bootstrap_icons_enabled());
+            },
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn first_run_preferences_skip_save_when_both_answers_already_saved() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-main-no-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0_u128, |value| value.as_nanos())
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+        let config_path = config_root.join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{"telemetry_enabled":true,"bootstrap_icons_enabled":true}"#,
+        )
+        .expect("seed config");
+
+        crate::test_env::with_env_vars(
+            &[(
+                crate::config::KRAMLI_CONFIG_PATH_ENV,
+                config_path
+                    .to_str()
+                    .expect("config path should be valid utf-8"),
+            )],
+            || {
+                let cli = cli_for(Some(Commands::Status));
+                ensure_first_run_preferences_with(&cli, true, true, confirm_true)
+                    .expect("configured preferences should not prompt");
+            },
+        );
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[kramli_test_macros::test]
+    fn first_run_preferences_returns_error_when_confirm_callback_fails() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-main-confirm-error-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0_u128, |value| value.as_nanos())
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+
+        crate::test_env::with_env_vars(
+            &[
+                (
+                    "HOME",
+                    config_root
+                        .to_str()
+                        .expect("config root should be valid utf-8"),
+                ),
+                (
+                    "XDG_CONFIG_HOME",
+                    config_root
+                        .to_str()
+                        .expect("config root should be valid utf-8"),
+                ),
+                (
+                    crate::config::KRAMLI_CONFIG_PATH_ENV,
+                    config_root
+                        .join("config.json")
+                        .to_str()
+                        .expect("config path should be valid utf-8"),
+                ),
+                ("DO_NOT_TRACK", ""),
+                ("KRAMLI_NO_TELEMETRY", ""),
+                ("KRAMLI_TELEMETRY", ""),
+                ("KRAMLI_BOOTSTRAP_ICONS", ""),
+                ("KRAMLI_TUI_BOOTSTRAP_ICONS", ""),
+                ("KRAMLI_LOAD_BOOTSTRAP_ICONS", ""),
+            ],
+            || {
+                let cli = cli_for(Some(Commands::Status));
+                assert!(ensure_first_run_preferences_with(&cli, true, true, |_, _| {
+                    Err("configured preferences should not prompt".to_string())
+                })
+                .is_err());
+            },
+        );
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[kramli_test_macros::test]
+    fn first_run_preferences_surfaces_config_save_errors() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-main-save-error-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0_u128, |value| value.as_nanos())
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+        let config_path = config_root.join("config.json");
+        std::fs::write(&config_path, r#"{"telemetry_enabled":true}"#).expect("seed config");
+        let mut permissions = std::fs::metadata(&config_path)
+            .expect("config metadata")
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&config_path, permissions).expect("mark config readonly");
+
+        crate::test_env::with_env_vars(
+            &[(
+                crate::config::KRAMLI_CONFIG_PATH_ENV,
+                config_path
+                    .to_str()
+                    .expect("config path should be valid utf-8"),
+            )],
+            || {
+                let cli = cli_for(Some(Commands::Status));
+                assert!(
+                    ensure_first_run_preferences_with(&cli, true, true, |_, _| Ok(true)).is_err()
+                );
+            },
+        );
+
+        let mut permissions = std::fs::metadata(&config_path)
+            .expect("config metadata")
+            .permissions();
+        permissions.set_readonly(false);
+        let _ = std::fs::set_permissions(&config_path, permissions);
+        let _ = std::fs::remove_dir_all(config_root);
+    }
+
+    #[kramli_test_macros::test]
+    fn run_with_cli_reports_runtime_builder_failures() {
+        crate::test_env::with_env_vars(&[("KRAMLI_URL", ""), ("KRAMLI_API_KEY", "")], || {
+            let exit = run_with_cli_hooks(
+                cli_for(Some(Commands::Status)),
+                |_| Ok(()),
+                || Err("runtime failed".to_string()),
+            );
+            assert_eq!(exit, ExitCode::FAILURE);
+        });
+    }
+
+    #[kramli_test_macros::test]
+    fn first_run_preferences_ask_confirm_runs_ok_branch() {
+        let config_root = std::env::temp_dir().join(format!(
+            "kramli-main-cov-prompt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0_u128, |value| value.as_nanos())
+        ));
+        std::fs::create_dir_all(&config_root).expect("temp config root should exist");
+
+        crate::test_env::with_env_vars(
+            &[(
+                crate::config::KRAMLI_CONFIG_PATH_ENV,
+                config_root
+                    .join("config.json")
+                    .to_str()
+                    .expect("config path should be valid utf-8"),
+            )],
+            || {
+                let cli = cli_for(Some(Commands::Status));
+                let mut prompted = false;
+                ensure_first_run_preferences_with(&cli, true, true, |prompt, default| {
+                    prompted = true;
+                    confirm_true(prompt, default)
+                })
+                .expect("ask confirm Ok(true) should succeed");
+                assert!(prompted, "fresh config should invoke ask confirm");
+            },
+        );
+        let _ = std::fs::remove_dir_all(config_root);
     }
 }
