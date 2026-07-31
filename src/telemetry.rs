@@ -6,22 +6,47 @@
 //! addresses, and hostnames are not attached to events.
 
 use crate::config::Config;
-use sentry::protocol::{Event, SpanStatus, Value};
+use sentry::protocol::{Context, Event, Frame, Map, SpanStatus, Stacktrace, Value};
+use std::path::Path;
+use std::sync::Mutex;
 
 const SAFE_TAG_KEYS: &[&str] = &[
     "action",
     "api.method",
     "api.route",
     "api.status_class",
+    "api.upload",
     "command",
     "error.category",
     "mode",
     "operation",
     "outcome",
+    "surface",
     "view",
 ];
+const SAFE_EXTRA_KEYS: &[&str] = &[
+    "api.method",
+    "api.route",
+    "api.status_class",
+    "cli.version",
+    "command",
+    "error.category",
+    "mode",
+    "outcome",
+    "surface",
+];
+const SAFE_CONTEXT_KEYS: &[&str] = &["cli", "runtime", "trace"];
 const KRAMLI_TRACES_SAMPLE_RATE_ENV: &str = "KRAMLI_TRACES_SAMPLE_RATE";
 const KRAMLI_CAPTURE_COMMAND_ERRORS_ENV: &str = "KRAMLI_CAPTURE_COMMAND_ERRORS";
+
+#[derive(Clone, Debug, Default)]
+struct HttpCallContext {
+    method: Option<String>,
+    route: Option<String>,
+    status_class: Option<String>,
+}
+
+static LAST_HTTP_CALL: Mutex<Option<HttpCallContext>> = Mutex::new(None);
 
 /// Returns `true` when telemetry should be active.
 ///
@@ -43,6 +68,103 @@ pub(crate) fn traces_sample_rate() -> f32 {
         .and_then(|raw| raw.trim().parse::<f32>().ok())
         .filter(|value| value.is_finite())
         .map_or(1.0, |value| value.clamp(0.0, 1.0))
+}
+
+/// Remember the most recent API call for error diagnostics (no secrets).
+pub(crate) fn record_http_call(method: &str, path: &str, status: u16) {
+    let Ok(mut guard) = LAST_HTTP_CALL.lock() else {
+        return;
+    };
+    *guard = Some(HttpCallContext {
+        method: Some(method.to_ascii_uppercase()),
+        route: Some(route_template(path)),
+        status_class: Some(status_class(status)),
+    });
+}
+
+/// Classify a CLI error message into a low-cardinality category.
+pub(crate) fn classify_command_error(message: &str) -> &'static str {
+    let blob = message.to_ascii_lowercase();
+    if blob.contains("not logged in")
+        || blob.contains("nicht angemeldet")
+        || blob.contains("kramli_api_key")
+        || blob.contains("unauthorized")
+        || blob.contains("401")
+    {
+        "auth"
+    } else if blob.contains("listenreferenz ist leer") || blob.contains("list reference is empty") {
+        "validation"
+    } else if blob.contains("not found")
+        || blob.contains("nicht gefunden")
+        || blob.contains("404")
+        || blob.contains("unknown list")
+    {
+        "not_found"
+    } else if blob.contains("timeout")
+        || blob.contains("network")
+        || blob.contains("connection")
+        || blob.contains("dns")
+        || blob.contains("offline")
+        || blob.contains("tls")
+    {
+        "network"
+    } else if blob.contains("api-error") || blob.contains("api error") || blob.contains("http") {
+        "api"
+    } else {
+        "internal"
+    }
+}
+
+/// Capture a command failure with scrubbed text plus safe diagnostic context.
+pub(crate) fn capture_command_error(message: &str) {
+    let scrubbed = scrub_message(message);
+    let category = classify_command_error(message);
+    sentry::configure_scope(|scope| {
+        scope.set_tag("error.category", category);
+        scope.set_tag("outcome", "error");
+        scope.set_context(
+            "cli",
+            Context::Other(build_cli_context(category, message)),
+        );
+        if let Ok(guard) = LAST_HTTP_CALL.lock() {
+            if let Some(call) = guard.as_ref() {
+                if let Some(method) = &call.method {
+                    scope.set_tag("api.method", method.as_str());
+                }
+                if let Some(route) = &call.route {
+                    scope.set_tag("api.route", route.as_str());
+                }
+                if let Some(status_class) = &call.status_class {
+                    scope.set_tag("api.status_class", status_class.as_str());
+                }
+            }
+        }
+    });
+    sentry::capture_message(&scrubbed, sentry::Level::Error);
+}
+
+fn build_cli_context(category: &str, message: &str) -> Map<String, Value> {
+    let mut context = Map::new();
+    context.insert("version".into(), Value::from(env!("CARGO_PKG_VERSION")));
+    context.insert("error.category".into(), Value::from(category));
+    context.insert(
+        "error.summary".into(),
+        Value::from(scrub_message(message).chars().take(240).collect::<String>()),
+    );
+    if let Ok(guard) = LAST_HTTP_CALL.lock() {
+        if let Some(call) = guard.as_ref() {
+            if let Some(method) = &call.method {
+                context.insert("api.method".into(), Value::from(method.clone()));
+            }
+            if let Some(route) = &call.route {
+                context.insert("api.route".into(), Value::from(route.clone()));
+            }
+            if let Some(status_class) = &call.status_class {
+                context.insert("api.status_class".into(), Value::from(status_class.clone()));
+            }
+        }
+    }
+    context
 }
 
 /// Ordinary CLI failures are usually expected user/API outcomes (not logged in,
@@ -152,10 +274,51 @@ fn secret_marker(token: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn event_text_blob(event: &Event<'_>) -> String {
+    let mut parts = Vec::new();
+    if let Some(message) = &event.message {
+        parts.push(message.as_str());
+    }
+    if let Some(entry) = &event.logentry {
+        parts.push(entry.message.as_str());
+    }
+    for exception in &event.exception.values {
+        if let Some(value) = &exception.value {
+            parts.push(value.as_str());
+        }
+        parts.push(exception.ty.as_str());
+    }
+    parts.join(" ").to_ascii_lowercase()
+}
+
+/// Drop expected CLI outcomes and pipe-closed panics before scrubbing.
+fn should_drop_event(event: &Event<'_>) -> bool {
+    let blob = event_text_blob(event);
+    if blob.contains("broken pipe") {
+        return true;
+    }
+    if blob.contains("not logged in")
+        || blob.contains("nicht angemeldet")
+        || blob.contains("kramli login")
+        || blob.contains("kramli_api_key")
+    {
+        return true;
+    }
+    if blob.contains("listenreferenz ist leer") || blob.contains("list reference is empty") {
+        return true;
+    }
+    false
+}
+
 /// `before_send` hook: scrub the human-readable parts of an event.
 pub(crate) fn scrub_event(mut event: Event<'static>) -> Option<Event<'static>> {
-    // Keep only minimal diagnostics.
-    event.culprit = None;
+    if should_drop_event(&event) {
+        return None;
+    }
+    event.culprit = event
+        .culprit
+        .take()
+        .filter(|value| is_safe_metric_label(value));
     event.transaction = event
         .transaction
         .take()
@@ -166,15 +329,27 @@ pub(crate) fn scrub_event(mut event: Event<'static>) -> Option<Event<'static>> {
     event.environment = None;
     event.user = None;
     event.request = None;
-    event.contexts.retain(|key, _| key == "trace");
     event.breadcrumbs.values.clear();
-    event.stacktrace = None;
     event.template = None;
     event.threads.values.clear();
-    event.tags.retain(|key, value| is_safe_tag(key, value));
-    event.extra.clear();
     event.debug_meta = std::borrow::Cow::default();
     event.sdk = None;
+
+    event
+        .contexts
+        .retain(|key, _| SAFE_CONTEXT_KEYS.contains(&key.as_str()));
+    sanitize_contexts(&mut event.contexts);
+
+    event
+        .tags
+        .retain(|key, value| is_safe_tag(key, value));
+    event
+        .extra
+        .retain(|key, value| is_safe_extra_key(key) && is_safe_extra_value(value));
+
+    if let Some(stacktrace) = event.stacktrace.as_mut() {
+        sanitize_stacktrace(stacktrace);
+    }
 
     if let Some(message) = event.message.take() {
         event.message = Some(scrub_message(&message));
@@ -188,11 +363,14 @@ pub(crate) fn scrub_event(mut event: Event<'static>) -> Option<Event<'static>> {
         if let Some(value) = exception.value.take() {
             exception.value = Some(scrub_message(&value));
         }
-        exception.module = None;
-        exception.stacktrace = None;
+        if let Some(module) = exception.module.take() {
+            exception.module = Some(sanitize_module_path(&module));
+        }
+        if let Some(stacktrace) = exception.stacktrace.as_mut() {
+            sanitize_stacktrace(stacktrace);
+        }
         exception.raw_stacktrace = None;
         exception.thread_id = None;
-        exception.mechanism = None;
     }
     Some(event)
 }
@@ -231,12 +409,14 @@ impl TraceTransaction {
         }
     }
 
-    /// Attach a safe low-cardinality tag to the transaction.
+    /// Attach a safe low-cardinality tag to the transaction and active scope.
     pub(crate) fn set_tag(&self, key: &str, value: impl ToString) {
-        if is_safe_tag(key, &value.to_string()) {
+        let value = value.to_string();
+        if is_safe_tag(key, &value) {
             if let Some(transaction) = &self.inner {
-                transaction.set_tag(key, value);
+                transaction.set_tag(key, &value);
             }
+            sentry::configure_scope(|scope| scope.set_tag(key, &value));
         }
     }
 
@@ -387,6 +567,71 @@ fn is_safe_tag(key: &str, value: &str) -> bool {
     SAFE_TAG_KEYS.contains(&key) && is_safe_metric_label(value)
 }
 
+fn is_safe_extra_key(key: &str) -> bool {
+    SAFE_EXTRA_KEYS.contains(&key)
+}
+
+fn is_safe_extra_value(value: &Value) -> bool {
+    match value {
+        Value::String(text) => is_safe_metric_label(text),
+        Value::Bool(_) | Value::Number(_) => true,
+        _ => false,
+    }
+}
+
+fn sanitize_module_path(module: &str) -> String {
+    module.rsplit("::").next().unwrap_or(module).to_string()
+}
+
+fn sanitize_path_filename(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn sanitize_stacktrace(stacktrace: &mut Stacktrace) {
+    for frame in &mut stacktrace.frames {
+        sanitize_frame(frame);
+    }
+}
+
+fn sanitize_frame(frame: &mut Frame) {
+    if let Some(abs_path) = frame.abs_path.take() {
+        frame.abs_path = Some(sanitize_path_filename(&abs_path));
+    }
+    if let Some(filename) = frame.filename.take() {
+        frame.filename = Some(sanitize_path_filename(&filename));
+    }
+    frame.vars.clear();
+}
+
+fn sanitize_contexts(contexts: &mut Map<String, Context>) {
+    for (key, context) in contexts.iter_mut() {
+        if key != "cli" {
+            continue;
+        }
+        let Context::Other(values) = context else {
+            continue;
+        };
+        values.retain(|field, value| match field.as_str() {
+            "version" | "error.category" | "api.method" | "api.route" | "api.status_class" => {
+                is_safe_extra_value(value)
+            }
+            "error.summary" => value
+                .as_str()
+                .is_some_and(|text| text.len() <= 240 && !text.contains('@')),
+            _ => false,
+        });
+        for value in values.values_mut() {
+            if let Value::String(text) = value {
+                *text = scrub_message(text);
+            }
+        }
+    }
+}
+
 fn is_safe_metric_label(value: &str) -> bool {
     let trimmed = value.trim();
     !trimmed.is_empty()
@@ -531,7 +776,7 @@ fn looks_like_jwt(token: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::parse_env_bool;
-    use sentry::protocol::{Event, Exception, LogEntry, Map};
+    use sentry::protocol::{Context, Event, Exception, Frame, LogEntry, Map, Stacktrace, Value};
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -835,7 +1080,7 @@ mod tests {
         event.exception.values.push(Exception {
             ty: "error".to_string(),
             value: Some("boom for user@example.com".to_string()),
-            module: Some("sensitive.module".to_string()),
+            module: Some("kramli_cli::secrets".to_string()),
             ..Exception::default()
         });
 
@@ -857,11 +1102,135 @@ mod tests {
 
         let exc = &scrubbed.exception.values[0];
         assert_eq!(exc.value.as_deref(), Some("boom for [REDACTED_EMAIL]"));
-        assert!(exc.module.is_none());
-        assert!(exc.stacktrace.is_none());
+        assert_eq!(exc.module.as_deref(), Some("secrets"));
         assert!(exc.raw_stacktrace.is_none());
         assert!(exc.thread_id.is_none());
-        assert!(exc.mechanism.is_none());
+    }
+
+    #[kramli_test_macros::test]
+    fn classify_command_error_buckets_expected_outcomes() {
+        assert_eq!(
+            classify_command_error("Not logged in. Run `kramli login`."),
+            "auth"
+        );
+        assert_eq!(classify_command_error("Listenreferenz ist leer."), "validation");
+        assert_eq!(classify_command_error("List not found"), "not_found");
+        assert_eq!(classify_command_error("network timeout"), "network");
+        assert_eq!(classify_command_error("API-Error 500"), "api");
+        assert_eq!(classify_command_error("unexpected panic"), "internal");
+    }
+
+    #[kramli_test_macros::test]
+    fn scrub_event_preserves_safe_cli_context_and_stacktrace() {
+        record_http_call("GET", "/lists/42/items", 404);
+        let mut event = Event {
+            message: Some("List not found".to_string()),
+            tags: Map::from_iter([
+                (String::from("command"), String::from("items")),
+                (String::from("error.category"), String::from("not_found")),
+            ]),
+            contexts: Map::from_iter([(
+                String::from("cli"),
+                Context::Other(Map::from_iter([
+                    (
+                        String::from("version"),
+                        Value::from(env!("CARGO_PKG_VERSION")),
+                    ),
+                    (
+                        String::from("error.summary"),
+                        Value::from("List not found"),
+                    ),
+                    (String::from("api.method"), Value::from("GET")),
+                    (
+                        String::from("api.route"),
+                        Value::from("/lists/{id}/items"),
+                    ),
+                    (String::from("api.status_class"), Value::from("4xx")),
+                ])),
+            )]),
+            stacktrace: Some(Stacktrace {
+                frames: vec![Frame {
+                    abs_path: Some("/Users/me/kramli-cli/src/api.rs".to_string()),
+                    filename: Some("api.rs".to_string()),
+                    ..Frame::default()
+                }],
+                ..Stacktrace::default()
+            }),
+            ..Event::default()
+        };
+        event.exception.values.push(Exception {
+            ty: "error".to_string(),
+            value: Some("List not found".to_string()),
+            module: Some("kramli_cli::api".to_string()),
+            stacktrace: Some(Stacktrace {
+                frames: vec![Frame {
+                    abs_path: Some("/secret/home/api.rs".to_string()),
+                    vars: Map::from_iter([(
+                        String::from("email"),
+                        Value::from("user@example.com"),
+                    )]),
+                    ..Frame::default()
+                }],
+                ..Stacktrace::default()
+            }),
+            ..Exception::default()
+        });
+
+        let scrubbed = scrub_event(event).expect("event should be kept");
+        let cli = scrubbed
+            .contexts
+            .get("cli")
+            .expect("cli context should remain");
+        let Context::Other(values) = cli else {
+            panic!("cli context should be a map");
+        };
+        assert_eq!(
+            values.get("api.route").and_then(Value::as_str),
+            Some("/lists/{id}/items")
+        );
+        assert_eq!(
+            scrubbed
+                .stacktrace
+                .as_ref()
+                .and_then(|trace| trace.frames.first())
+                .and_then(|frame| frame.filename.as_deref()),
+            Some("api.rs")
+        );
+        let exc = &scrubbed.exception.values[0];
+        assert_eq!(exc.module.as_deref(), Some("api"));
+        assert!(exc.stacktrace.is_some());
+        let frame = exc
+            .stacktrace
+            .as_ref()
+            .and_then(|trace| trace.frames.first())
+            .expect("exception stacktrace frame");
+        assert!(frame.vars.is_empty());
+        assert_eq!(frame.abs_path.as_deref(), Some("api.rs"));
+    }
+
+    #[kramli_test_macros::test]
+    fn scrub_event_drops_expected_cli_outcomes() {
+        for message in [
+            "Not logged in. Run `kramli login` or set KRAMLI_API_KEY.",
+            "Nicht angemeldet. `kramli login` ausführen oder KRAMLI_API_KEY setzen.",
+            "Listenreferenz ist leer.",
+            "panic: failed printing to stdout: Broken pipe (os error 32)",
+        ] {
+            let event = Event {
+                message: Some(message.to_string()),
+                ..Event::default()
+            };
+            assert!(scrub_event(event).is_none(), "expected drop for {message}");
+        }
+    }
+
+    #[kramli_test_macros::test]
+    fn scrub_event_keeps_unexpected_failures() {
+        let event = Event {
+            message: Some("unexpected internal failure".to_string()),
+            ..Event::default()
+        };
+        assert!(scrub_event(event).is_some());
     }
 
     #[kramli_test_macros::test]

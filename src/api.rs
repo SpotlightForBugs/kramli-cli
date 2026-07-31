@@ -400,8 +400,15 @@ impl ApiClient {
         span
     }
 
-    fn finish_response_span(&self, span: &telemetry::TraceSpan, status: u16) {
+    fn finish_response_span(
+        &self,
+        span: &telemetry::TraceSpan,
+        method: &'static str,
+        path: &str,
+        status: u16,
+    ) {
         span.set_tag("api.status_class", telemetry::status_class(status));
+        telemetry::record_http_call(method, path, status);
     }
 
     fn format_api_error_message(body: &[u8]) -> String {
@@ -535,7 +542,7 @@ impl ApiClient {
                 return Err(error);
             }
         };
-        self.finish_response_span(&span, resp.status().as_u16());
+        self.finish_response_span(&span, "GET", path, resp.status().as_u16());
         let result = Self::handle(resp, Some(&span)).await;
         span.set_status(result.is_ok());
         span.finish();
@@ -575,7 +582,7 @@ impl ApiClient {
                 return Err(error);
             }
         };
-        self.finish_response_span(&span, resp.status().as_u16());
+        self.finish_response_span(&span, "GET", path, resp.status().as_u16());
         let result = Self::handle(resp, Some(&span)).await;
         span.set_status(result.is_ok());
         span.finish();
@@ -642,7 +649,7 @@ impl ApiClient {
                 return Err(error);
             }
         };
-        self.finish_response_span(&span, resp.status().as_u16());
+        self.finish_response_span(&span, "POST", path, resp.status().as_u16());
         let result = Self::handle(resp, Some(&span)).await;
         span.set_status(result.is_ok());
         span.finish();
@@ -695,7 +702,7 @@ impl ApiClient {
                 return Err(error);
             }
         };
-        self.finish_response_span(&span, resp.status().as_u16());
+        self.finish_response_span(&span, "POST", path, resp.status().as_u16());
         let result = Self::handle(resp, Some(&span)).await;
         span.set_status(result.is_ok());
         span.finish();
@@ -732,7 +739,7 @@ impl ApiClient {
                 return Err(error);
             }
         };
-        self.finish_response_span(&span, resp.status().as_u16());
+        self.finish_response_span(&span, "PUT", path, resp.status().as_u16());
         let result = Self::handle(resp, Some(&span)).await;
         span.set_status(result.is_ok());
         span.finish();
@@ -769,7 +776,7 @@ impl ApiClient {
                 return Err(error);
             }
         };
-        self.finish_response_span(&span, resp.status().as_u16());
+        self.finish_response_span(&span, "PATCH", path, resp.status().as_u16());
         let result = Self::handle(resp, Some(&span)).await;
         span.set_status(result.is_ok());
         span.finish();
@@ -795,7 +802,7 @@ impl ApiClient {
                 return Err(error);
             }
         };
-        self.finish_response_span(&span, resp.status().as_u16());
+        self.finish_response_span(&span, "DELETE", path, resp.status().as_u16());
         let result = Self::handle(resp, Some(&span)).await;
         span.set_status(result.is_ok());
         span.finish();
@@ -822,7 +829,7 @@ impl ApiClient {
             }
         };
         let status = resp.status();
-        self.finish_response_span(&span, status.as_u16());
+        self.finish_response_span(&span, "DELETE", path, status.as_u16());
         if status == StatusCode::NO_CONTENT || status.is_success() {
             span.set_status(true);
             span.finish();
@@ -884,7 +891,7 @@ impl ApiClient {
         };
 
         let status = resp.status();
-        self.finish_response_span(&span, status.as_u16());
+        self.finish_response_span(&span, "GET", "resource", status.as_u16());
         if status.is_success() {
             let result = Self::read_limited_bytes(resp, MAX_RESOURCE_BYTES).await;
             if let Ok(bytes) = &result {

@@ -69,7 +69,7 @@ where
 
     if let Err(e) = runtime.block_on(cli::run(cli)) {
         if guard.is_some() && telemetry::should_capture_command_error(&e) {
-            sentry::capture_message(&telemetry::scrub_message(&e), sentry::Level::Error);
+            telemetry::capture_command_error(&e);
         }
         eprintln!("\x1b[31m{}\x1b[0m {e}", tr("main-error-prefix"));
         return ExitCode::FAILURE;
@@ -89,7 +89,7 @@ fn init_telemetry_when(enabled: bool) -> Option<sentry::ClientInitGuard> {
             sentry::ClientOptions {
                 release: sentry::release_name!(),
                 send_default_pii: false,
-                attach_stacktrace: false,
+                attach_stacktrace: true,
                 max_breadcrumbs: 0,
                 default_integrations: true,
                 auto_session_tracking: false,
