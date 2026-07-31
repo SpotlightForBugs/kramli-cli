@@ -145,7 +145,7 @@ pub(crate) enum Commands {
     },
     /// Show profile
     Profile,
-    /// Account security level and login confirmation
+    /// Login-alert preference and login confirmation
     Security {
         #[command(subcommand)]
         action: SecurityCmd,
@@ -2670,15 +2670,6 @@ mod tests {
     async fn account_security_handoff_ping_and_config_commands_cover_api_paths() {
         let profile = serde_json::to_string(&sample_profile(Some("en"))).unwrap();
         let security = json!({
-            "security": {
-                "level_label": "Strong",
-                "score": 5,
-                "max_score": 7,
-                "factors": [
-                    {"label": "Password", "met": true},
-                    {"label": "Two-factor", "met": false}
-                ]
-            },
             "security_email_login_alerts": false
         })
         .to_string();
@@ -2875,7 +2866,7 @@ mod tests {
             json!({"ok": true}).to_string(),
             json!({"ok": true}).to_string(),
             profile,
-            json!({"security": {"score": 1, "max_score": 1, "factors": []}}).to_string(),
+            json!({"security_email_login_alerts": true}).to_string(),
             json!({"legal": {"pending": []}}).to_string(),
             json!({"ok": true}).to_string(),
             json!({"ok": true}).to_string(),
@@ -4896,12 +4887,6 @@ mod tests {
     #[kramli_test_macros::tokio_test]
     async fn security_status_human_output_covers_disabled_login_alerts() {
         let (base_url, requests) = server_with_base_url(vec![json!({
-            "security": {
-                "level_label": "Good",
-                "score": 80,
-                "max_score": 100,
-                "factors": [{"label": "2FA", "met": true}]
-            },
             "security_email_login_alerts": false
         })
         .to_string()])
@@ -5061,15 +5046,6 @@ mod tests {
     #[kramli_test_macros::tokio_test]
     async fn run_security_status_human_output_lists_factor_checkmarks() {
         let (base_url, requests) = server_with_base_url(vec![json!({
-            "security": {
-                "level_label": "Strong",
-                "score": 4,
-                "max_score": 5,
-                "factors": [
-                    {"label": "Password", "met": true},
-                    {"label": "Two-factor", "met": false}
-                ]
-            },
             "security_email_login_alerts": true
         })
         .to_string()])
@@ -5526,12 +5502,6 @@ mod tests {
     #[kramli_test_macros::tokio_test]
     async fn human_folder_security_invite_and_handoff_branches_are_covered() {
         let security_on = json!({
-            "security": {
-                "level": "medium",
-                "score": 3,
-                "max_score": 5,
-                "factors": [{"label": "Recovery email", "met": false}]
-            },
             "security_email_login_alerts": true
         })
         .to_string();
@@ -6075,12 +6045,6 @@ mod tests {
         );
 
         let (security_base_url, security_requests) = server_with_base_url(vec![json!({
-            "security": {
-                "level_label": "Good",
-                "score": 4,
-                "max_score": 5,
-                "factors": [{"label": "App lock", "met": true}]
-            },
             "security_email_login_alerts": true
         })
         .to_string()])
@@ -6443,15 +6407,6 @@ mod tests {
     #[kramli_test_macros::tokio_test]
     async fn run_security_status_human_output_lists_security_factors() {
         let (base_url, requests) = server_with_base_url(vec![json!({
-            "security": {
-                "level_label": "Strong",
-                "score": 4,
-                "max_score": 5,
-                "factors": [
-                    {"label": "Password", "met": true},
-                    {"label": "Two-factor", "met": false}
-                ]
-            },
             "security_email_login_alerts": true
         })
         .to_string()])
@@ -6643,12 +6598,6 @@ mod tests {
     #[kramli_test_macros::tokio_test]
     async fn run_security_status_human_output_handles_missing_factor_fields() {
         let (base_url, requests) = server_with_base_url(vec![json!({
-            "security": {
-                "level_label": "Strong",
-                "score": 4,
-                "max_score": 5,
-                "factors": [{}]
-            },
             "security_email_login_alerts": false
         })
         .to_string()])
@@ -6708,11 +6657,6 @@ mod tests {
     #[kramli_test_macros::tokio_test]
     async fn run_security_status_human_output_omits_factors_when_absent() {
         let (base_url, requests) = server_with_base_url(vec![json!({
-            "security": {
-                "level_label": "Good",
-                "score": 80,
-                "max_score": 100
-            },
             "security_email_login_alerts": true
         })
         .to_string()])
@@ -7063,7 +7007,7 @@ pub(crate) enum KeyCmd {
 #[derive(Subcommand)]
 /// Account security subcommands.
 pub(crate) enum SecurityCmd {
-    /// Security level, factors, and login alert emails
+    /// Login alert emails preference
     Status,
     /// Confirm an unusual login (token from email/security notice)
     Ack {
@@ -10228,19 +10172,6 @@ async fn run_security(cmd: SecurityCmd, as_json: bool) -> Result<(), String> {
                 );
                 return Ok(());
             }
-            let summary = data.get("security").cloned().unwrap_or(Value::Null);
-            let level = summary
-                .get("level_label")
-                .and_then(Value::as_str)
-                .or_else(|| summary.get("level").and_then(Value::as_str))
-                .unwrap_or("-");
-            let score = summary.get("score").and_then(Value::as_u64).unwrap_or(0);
-            let max_score = summary
-                .get("max_score")
-                .and_then(Value::as_u64)
-                .unwrap_or(100);
-            println!("{} {}", tr("label-security-level"), level.bold());
-            println!("{}        {score}/{max_score}", tr("label-score"));
             let login_alerts = data
                 .get("security_email_login_alerts")
                 .and_then(Value::as_bool)
@@ -10254,15 +10185,6 @@ async fn run_security(cmd: SecurityCmd, as_json: bool) -> Result<(), String> {
                     tr("label-off")
                 }
             );
-            if let Some(factors) = summary.get("factors").and_then(Value::as_array) {
-                println!("\n{}", tr("label-factors"));
-                for factor in factors {
-                    let label = factor.get("label").and_then(Value::as_str).unwrap_or("?");
-                    let met = factor.get("met").and_then(Value::as_bool).unwrap_or(false);
-                    let mark = if met { "✓".green() } else { "·".normal() };
-                    println!("  {mark} {label}");
-                }
-            }
             Ok(())
         }
         SecurityCmd::Ack { token } => {
