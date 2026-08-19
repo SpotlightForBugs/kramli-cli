@@ -164,6 +164,19 @@ impl ApiClient {
         err.is_connect() || err.is_timeout() || err.is_request()
     }
 
+    fn format_reqwest_error(err: &reqwest::Error) -> String {
+        let mut parts = vec![err.to_string()];
+        let mut source = std::error::Error::source(err);
+        while let Some(cause) = source {
+            let text = cause.to_string();
+            if parts.last().is_none_or(|last| last != &text) {
+                parts.push(text);
+            }
+            source = cause.source();
+        }
+        parts.join(": ")
+    }
+
     fn limiter() -> &'static tokio::sync::Mutex<Option<Instant>> {
         LAST_REQUEST_AT.get_or_init(|| tokio::sync::Mutex::new(None))
     }
@@ -226,7 +239,10 @@ impl ApiClient {
                         span.set_data_i64("api.rate_limit_wait_ms", metric_i64(wait_ms));
                         span.set_status(false);
                     }
-                    return Err(tr_args("api-network-error", &[("error", e.to_string())]));
+                    return Err(tr_args(
+                        "api-network-error",
+                        &[("error", Self::format_reqwest_error(&e))],
+                    ));
                 }
             };
 
@@ -1714,5 +1730,24 @@ GdzaWItrbfAg0TSf4sxw5mkc4g==\n\
             .expect("retried request should succeed");
         assert!(got["ok"].as_bool().unwrap_or(false));
         handle.await.expect("server finished");
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn format_reqwest_error_includes_source_chain() {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .expect("client");
+        let err = client
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("closed port should fail");
+        let formatted = ApiClient::format_reqwest_error(&err);
+        assert!(
+            formatted.contains("error sending request")
+                || formatted.contains("error trying to connect")
+        );
+        assert!(formatted.contains(':'));
     }
 }
