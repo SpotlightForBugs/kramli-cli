@@ -94,6 +94,218 @@ pub(crate) struct ListItem {
     pub(crate) image_url: Option<String>,
     pub(crate) image_filename: Option<String>,
     pub(crate) attachments: Option<Vec<Attachment>>,
+    #[serde(default)]
+    pub(crate) is_habit: Option<bool>,
+    #[serde(default)]
+    pub(crate) health_goal: Option<HealthGoal>,
+    #[serde(default)]
+    pub(crate) health_last_value: Option<f64>,
+    #[serde(default)]
+    pub(crate) health_last_sync_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Health goal linked to an item (Apple Health / Health Connect).
+pub(crate) struct HealthGoal {
+    pub(crate) metric: String,
+    #[serde(default)]
+    pub(crate) threshold: Option<f64>,
+    #[serde(default)]
+    pub(crate) period: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workout_type: Option<String>,
+}
+
+impl HealthGoal {
+    pub(crate) fn new(
+        metric: String,
+        threshold: Option<f64>,
+        workout_type: Option<String>,
+    ) -> Self {
+        Self {
+            metric,
+            threshold,
+            period: Some("daily".to_string()),
+            workout_type,
+        }
+    }
+
+    pub(crate) fn display_label(&self) -> String {
+        let threshold = self
+            .threshold
+            .map(|value| {
+                if (value - value.round()).abs() < f64::EPSILON {
+                    format!("{}", value as i64)
+                } else {
+                    value.to_string()
+                }
+            })
+            .unwrap_or_else(|| "?".to_string());
+        match self
+            .workout_type
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            Some(workout_type) => format!("{} / {workout_type} ≥ {threshold}", self.metric),
+            None => format!("{} ≥ {threshold}", self.metric),
+        }
+    }
+}
+
+/// Metrics accepted by the Kramli API for Health goals.
+pub(crate) const HEALTH_METRICS: &[&str] = &[
+    "steps",
+    "exercise_minutes",
+    "workout",
+    "active_calories",
+    "distance_km",
+    "sleep_hours",
+    "flights_climbed",
+    "water_liters",
+];
+
+/// Apple HKWorkoutActivityType names for TUI cycling. Android-only Health
+/// Connect sports are omitted; empty means any workout.
+pub(crate) const HEALTH_WORKOUT_TYPE_SUGGESTIONS: &[&str] = &[
+    "AMERICAN_FOOTBALL",
+    "ARCHERY",
+    "AUSTRALIAN_FOOTBALL",
+    "BADMINTON",
+    "BARRE",
+    "BASEBALL",
+    "BASKETBALL",
+    "BIKING",
+    "BOWLING",
+    "BOXING",
+    "CARDIO_DANCE",
+    "CLIMBING",
+    "COOLDOWN",
+    "CORE_TRAINING",
+    "CRICKET",
+    "CROSS_COUNTRY_SKIING",
+    "CROSS_TRAINING",
+    "CURLING",
+    "DISC_SPORTS",
+    "DOWNHILL_SKIING",
+    "ELLIPTICAL",
+    "EQUESTRIAN_SPORTS",
+    "FENCING",
+    "FISHING",
+    "FITNESS_GAMING",
+    "FLEXIBILITY",
+    "FUNCTIONAL_STRENGTH_TRAINING",
+    "GOLF",
+    "GYMNASTICS",
+    "HANDBALL",
+    "HAND_CYCLING",
+    "HIGH_INTENSITY_INTERVAL_TRAINING",
+    "HIKING",
+    "HOCKEY",
+    "HUNTING",
+    "JUMP_ROPE",
+    "KICKBOXING",
+    "LACROSSE",
+    "MARTIAL_ARTS",
+    "MIND_AND_BODY",
+    "MIXED_CARDIO",
+    "PADDLE_SPORTS",
+    "PICKLEBALL",
+    "PILATES",
+    "PLAY",
+    "PREPARATION_AND_RECOVERY",
+    "RACQUETBALL",
+    "ROWING",
+    "RUGBY",
+    "RUNNING",
+    "SAILING",
+    "SKATING",
+    "SNOWBOARDING",
+    "SNOW_SPORTS",
+    "SOCCER",
+    "SOCIAL_DANCE",
+    "SOFTBALL",
+    "SQUASH",
+    "STAIRS",
+    "STAIR_CLIMBING",
+    "STEP_TRAINING",
+    "SURFING",
+    "SWIMMING",
+    "TABLE_TENNIS",
+    "TAI_CHI",
+    "TENNIS",
+    "TRACK_AND_FIELD",
+    "TRADITIONAL_STRENGTH_TRAINING",
+    "UNDERWATER_DIVING",
+    "VOLLEYBALL",
+    "WALKING",
+    "WATER_FITNESS",
+    "WATER_POLO",
+    "WATER_SPORTS",
+    "WHEELCHAIR_RUN_PACE",
+    "WHEELCHAIR_WALK_PACE",
+    "WRESTLING",
+    "YOGA",
+];
+
+fn is_health_workout_type_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > 64 {
+        return false;
+    }
+    bytes[0].is_ascii_uppercase()
+        && bytes[1..]
+            .iter()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == b'_')
+}
+
+pub(crate) fn parse_health_goal_parts(
+    metric: Option<String>,
+    threshold: Option<f64>,
+    workout_type: Option<String>,
+) -> Result<Option<HealthGoal>, String> {
+    let Some(metric) = metric
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        if threshold.is_some()
+            || workout_type
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(tr("cli-health-metric-required"));
+        }
+        return Ok(None);
+    };
+    if !HEALTH_METRICS.contains(&metric.as_str()) {
+        return Err(tr_args(
+            "cli-health-metric-invalid",
+            &[("metric", metric), ("allowed", HEALTH_METRICS.join(", "))],
+        ));
+    }
+    let workout_type = workout_type
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let workout_type = match workout_type {
+        Some(_) if metric != "workout" => {
+            return Err(tr("cli-health-workout-type-requires-workout"));
+        }
+        Some(value) if value.eq_ignore_ascii_case("other") => None,
+        Some(value) if is_health_workout_type_name(&value) => Some(value),
+        Some(value) => {
+            return Err(tr_args(
+                "cli-health-workout-type-invalid",
+                &[("workout_type", value)],
+            ));
+        }
+        None => None,
+    };
+    let threshold = match threshold {
+        Some(value) if value > 0.0 => Some(value),
+        Some(_) => return Err(tr("cli-health-threshold-positive")),
+        None if metric == "workout" => Some(1.0),
+        None => return Err(tr("cli-health-threshold-required")),
+    };
+    Ok(Some(HealthGoal::new(metric, threshold, workout_type)))
 }
 
 impl ListItem {
@@ -169,6 +381,16 @@ pub(crate) struct CreateItem {
     pub(crate) tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) parent_item_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) is_habit: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) health_goal: Option<HealthGoal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) repeat_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) repeat_interval_value: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) repeat_interval_unit: Option<String>,
 }
 
 // ── Folder ──

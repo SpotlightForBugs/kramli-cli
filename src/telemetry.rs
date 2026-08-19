@@ -122,10 +122,7 @@ pub(crate) fn capture_command_error(message: &str) {
     sentry::configure_scope(|scope| {
         scope.set_tag("error.category", category);
         scope.set_tag("outcome", "error");
-        scope.set_context(
-            "cli",
-            Context::Other(build_cli_context(category, message)),
-        );
+        scope.set_context("cli", Context::Other(build_cli_context(category, message)));
         if let Ok(guard) = LAST_HTTP_CALL.lock() {
             if let Some(call) = guard.as_ref() {
                 if let Some(method) = &call.method {
@@ -340,9 +337,7 @@ pub(crate) fn scrub_event(mut event: Event<'static>) -> Option<Event<'static>> {
         .retain(|key, _| SAFE_CONTEXT_KEYS.contains(&key.as_str()));
     sanitize_contexts(&mut event.contexts);
 
-    event
-        .tags
-        .retain(|key, value| is_safe_tag(key, value));
+    event.tags.retain(|key, value| is_safe_tag(key, value));
     event
         .extra
         .retain(|key, value| is_safe_extra_key(key) && is_safe_extra_value(value));
@@ -1113,7 +1108,10 @@ mod tests {
             classify_command_error("Not logged in. Run `kramli login`."),
             "auth"
         );
-        assert_eq!(classify_command_error("Listenreferenz ist leer."), "validation");
+        assert_eq!(
+            classify_command_error("Listenreferenz ist leer."),
+            "validation"
+        );
         assert_eq!(classify_command_error("List not found"), "not_found");
         assert_eq!(classify_command_error("network timeout"), "network");
         assert_eq!(classify_command_error("API-Error 500"), "api");
@@ -1136,15 +1134,9 @@ mod tests {
                         String::from("version"),
                         Value::from(env!("CARGO_PKG_VERSION")),
                     ),
-                    (
-                        String::from("error.summary"),
-                        Value::from("List not found"),
-                    ),
+                    (String::from("error.summary"), Value::from("List not found")),
                     (String::from("api.method"), Value::from("GET")),
-                    (
-                        String::from("api.route"),
-                        Value::from("/lists/{id}/items"),
-                    ),
+                    (String::from("api.route"), Value::from("/lists/{id}/items")),
                     (String::from("api.status_class"), Value::from("4xx")),
                 ])),
             )]),

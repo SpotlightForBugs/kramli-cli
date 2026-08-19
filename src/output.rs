@@ -739,6 +739,19 @@ fn print_item_progress(item: &ListItem) {
     }
 }
 
+fn print_item_habit_and_health(item: &ListItem) {
+    if item.is_habit == Some(true) {
+        println!("  {}  ✓", tr("label-habit").dimmed());
+    }
+    if let Some(goal) = item.health_goal.as_ref() {
+        let mut label = goal.display_label();
+        if let Some(value) = item.health_last_value {
+            label = format!("{label} ({value})");
+        }
+        println!("  {}  {label}", tr("label-health-goal").dimmed());
+    }
+}
+
 fn print_item_color(item: &ListItem) {
     if let Some(color) = item.color.as_deref() {
         let dot = color_dot(Some(color));
@@ -891,6 +904,7 @@ pub(crate) fn print_item_detail(item: &ListItem, comments: &[ItemComment]) {
     print_item_quantity(item);
     print_item_schedule(item);
     print_item_progress(item);
+    print_item_habit_and_health(item);
     print_item_color(item);
     print_item_tags(item);
     print_item_assignees(item);
@@ -1306,6 +1320,10 @@ mod tests {
             image_url: None,
             image_filename: None,
             attachments: None,
+            is_habit: None,
+            health_goal: None,
+            health_last_value: None,
+            health_last_sync_at: None,
         }
     }
 

@@ -36,7 +36,8 @@ use crate::config::Config;
 use crate::i18n::{tr, tr_args};
 use crate::internal_links::{LinkPreview, LinkPreviewActionKind, LinkPreviewResolver};
 use crate::models::{
-    Attachment, ItemComment, ListItem, ListState as ApiListState, Profile, ShoppingList,
+    parse_health_goal_parts, Attachment, ItemComment, ListItem, ListState as ApiListState, Profile,
+    ShoppingList, HEALTH_METRICS, HEALTH_WORKOUT_TYPE_SUGGESTIONS,
 };
 use crate::note::{
     collect_note_link_sources, note_content, safe_update_payload, validate_plain_note,
@@ -474,6 +475,10 @@ enum EditorField {
     Priority,
     Tags,
     Progress,
+    Habit,
+    HealthMetric,
+    HealthThreshold,
+    HealthWorkoutType,
     Notes,
 }
 
@@ -493,6 +498,10 @@ impl EditorField {
             Self::Priority => "!".to_string(),
             Self::Tags => tr("label-tags"),
             Self::Progress => tr("label-state"),
+            Self::Habit => tr("label-habit"),
+            Self::HealthMetric => tr("label-health-metric"),
+            Self::HealthThreshold => tr("label-health-threshold"),
+            Self::HealthWorkoutType => tr("label-health-workout-type"),
             Self::Notes => tr("label-notes"),
         }
     }
@@ -531,6 +540,10 @@ struct EditorState {
     priority: String,
     tags: String,
     progress: String,
+    habit: String,
+    health_metric: String,
+    health_threshold: String,
+    health_workout_type: String,
     notes: String,
     active_field: EditorField,
 }
@@ -747,7 +760,7 @@ struct ListPanelRow {
     label: String,
 }
 
-const ITEM_EDITOR_FIELDS: [EditorField; 14] = [
+const ITEM_EDITOR_FIELDS: [EditorField; 18] = [
     EditorField::Text,
     EditorField::Quantity,
     EditorField::DueDate,
@@ -761,6 +774,10 @@ const ITEM_EDITOR_FIELDS: [EditorField; 14] = [
     EditorField::Priority,
     EditorField::Tags,
     EditorField::Progress,
+    EditorField::Habit,
+    EditorField::HealthMetric,
+    EditorField::HealthThreshold,
+    EditorField::HealthWorkoutType,
     EditorField::Notes,
 ];
 const SIMPLE_EDITOR_FIELDS: [EditorField; 1] = [EditorField::Text];
@@ -2554,6 +2571,29 @@ impl App {
             priority: item.priority.clone().unwrap_or_default(),
             tags: item.tags.clone().unwrap_or_default().join(", "),
             progress: item.progress.clone().unwrap_or_default(),
+            habit: editor_bool_label(item.is_habit),
+            health_metric: item
+                .health_goal
+                .as_ref()
+                .map(|goal| goal.metric.clone())
+                .unwrap_or_default(),
+            health_threshold: item
+                .health_goal
+                .as_ref()
+                .and_then(|goal| goal.threshold)
+                .map(|value| {
+                    if (value - value.round()).abs() < f64::EPSILON {
+                        format!("{}", value as i64)
+                    } else {
+                        value.to_string()
+                    }
+                })
+                .unwrap_or_default(),
+            health_workout_type: item
+                .health_goal
+                .as_ref()
+                .and_then(|goal| goal.workout_type.clone())
+                .unwrap_or_default(),
             notes: item
                 .notes
                 .as_deref()
@@ -2595,6 +2635,10 @@ impl App {
             priority: String::default(),
             tags: String::default(),
             progress: String::default(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::default(),
             active_field: EditorField::Text,
         });
@@ -2632,6 +2676,10 @@ impl App {
             priority: String::default(),
             tags: String::default(),
             progress: self.default_progress_value(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::default(),
             active_field: EditorField::Text,
         });
@@ -2662,6 +2710,10 @@ impl App {
             priority: String::default(),
             tags: String::default(),
             progress: String::default(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::default(),
             active_field: EditorField::Text,
         });
@@ -2685,6 +2737,10 @@ impl App {
             priority: String::default(),
             tags: String::default(),
             progress: String::default(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::default(),
             active_field: EditorField::Text,
         });
@@ -2715,6 +2771,10 @@ impl App {
             priority: String::default(),
             tags: String::default(),
             progress: String::default(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::default(),
             active_field: EditorField::Text,
         });
@@ -2869,6 +2929,42 @@ impl App {
         body.insert("tags".to_string(), tags_value(&editor.tags));
         if editor.mode == EditorMode::Create || current_progress != progress {
             body.insert("progress".to_string(), Value::String(progress));
+        }
+        if let Some(habit) = parse_editor_bool_input(&editor.habit) {
+            body.insert("is_habit".to_string(), Value::Bool(habit));
+            if habit {
+                body.insert("repeat_type".to_string(), Value::String("interval".into()));
+                body.insert("repeat_interval_value".to_string(), Value::from(1));
+                body.insert(
+                    "repeat_interval_unit".to_string(),
+                    Value::String("day".into()),
+                );
+            }
+        }
+        let health_metric = editor.health_metric.trim();
+        let health_threshold = editor.health_threshold.trim();
+        let health_workout_type = editor.health_workout_type.trim();
+        let health_threshold = if health_threshold.is_empty() {
+            None
+        } else {
+            Some(
+                health_threshold
+                    .parse::<f64>()
+                    .map_err(|_| tr("cli-health-threshold-positive"))?,
+            )
+        };
+        let health_goal = parse_health_goal_parts(
+            (!health_metric.is_empty()).then(|| health_metric.to_string()),
+            health_threshold,
+            (!health_workout_type.is_empty()).then(|| health_workout_type.to_string()),
+        )?;
+        if let Some(goal) = health_goal {
+            body.insert(
+                "health_goal".to_string(),
+                serde_json::to_value(goal).map_err(|e| e.to_string())?,
+            );
+        } else if editor.mode == EditorMode::Edit {
+            body.insert("health_goal".to_string(), Value::Null);
         }
         body.insert(
             "notes".to_string(),
@@ -4423,6 +4519,60 @@ impl App {
                 }
                 false
             }
+            EditorField::Habit => {
+                let suggestions = vec![tr("label-off"), tr("label-on")];
+                let current = self
+                    .editor
+                    .as_ref()
+                    .map(|editor| editor.habit.clone())
+                    .unwrap_or_default();
+                let Some(next) = cycle_suggestion_value(&current, &suggestions, delta) else {
+                    return false;
+                };
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.habit = next;
+                    return true;
+                }
+                false
+            }
+            EditorField::HealthMetric => {
+                let suggestions: Vec<String> = HEALTH_METRICS
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect();
+                let current = self
+                    .editor
+                    .as_ref()
+                    .map(|editor| editor.health_metric.clone())
+                    .unwrap_or_default();
+                let Some(next) = cycle_suggestion_value(&current, &suggestions, delta) else {
+                    return false;
+                };
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.health_metric = next;
+                    return true;
+                }
+                false
+            }
+            EditorField::HealthWorkoutType => {
+                let suggestions: Vec<String> = HEALTH_WORKOUT_TYPE_SUGGESTIONS
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect();
+                let current = self
+                    .editor
+                    .as_ref()
+                    .map(|editor| editor.health_workout_type.clone())
+                    .unwrap_or_default();
+                let Some(next) = cycle_suggestion_value(&current, &suggestions, delta) else {
+                    return false;
+                };
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.health_workout_type = next;
+                    return true;
+                }
+                false
+            }
             EditorField::Progress => {
                 let suggestions = self.progress_suggestions();
                 let current = self
@@ -5405,6 +5555,10 @@ fn active_editor_value_mut(editor: &mut EditorState) -> &mut String {
         EditorField::Priority => &mut editor.priority,
         EditorField::Tags => &mut editor.tags,
         EditorField::Progress => &mut editor.progress,
+        EditorField::Habit => &mut editor.habit,
+        EditorField::HealthMetric => &mut editor.health_metric,
+        EditorField::HealthThreshold => &mut editor.health_threshold,
+        EditorField::HealthWorkoutType => &mut editor.health_workout_type,
         EditorField::Notes => &mut editor.notes,
     }
 }
@@ -5424,6 +5578,10 @@ fn active_editor_value(editor: &EditorState) -> &String {
         EditorField::Priority => &editor.priority,
         EditorField::Tags => &editor.tags,
         EditorField::Progress => &editor.progress,
+        EditorField::Habit => &editor.habit,
+        EditorField::HealthMetric => &editor.health_metric,
+        EditorField::HealthThreshold => &editor.health_threshold,
+        EditorField::HealthWorkoutType => &editor.health_workout_type,
         EditorField::Notes => &editor.notes,
     }
 }
@@ -6488,6 +6646,23 @@ fn draw_item_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 tr("label-travel-time").trim_end_matches(':')
             )));
         }
+        if item.is_habit == Some(true) {
+            lines.push(Line::from(format!(
+                "{}: {}",
+                tr("label-habit").trim_end_matches(':'),
+                tr("label-on")
+            )));
+        }
+        if let Some(goal) = item.health_goal.as_ref() {
+            let mut label = goal.display_label();
+            if let Some(value) = item.health_last_value {
+                label = format!("{label} ({value})");
+            }
+            lines.push(Line::from(format!(
+                "{}: {label}",
+                tr("label-health-goal").trim_end_matches(':')
+            )));
+        }
         lines.push(Line::from(format!(
             "{}: {}",
             tr("label-quantity").trim_end_matches(':'),
@@ -7109,6 +7284,10 @@ fn render_editor_field(
         EditorField::Priority => &editor.priority,
         EditorField::Tags => &editor.tags,
         EditorField::Progress => &editor.progress,
+        EditorField::Habit => &editor.habit,
+        EditorField::HealthMetric => &editor.health_metric,
+        EditorField::HealthThreshold => &editor.health_threshold,
+        EditorField::HealthWorkoutType => &editor.health_workout_type,
         EditorField::Notes => &editor.notes,
     };
 
@@ -8922,6 +9101,10 @@ mod tests {
             image_url: None,
             image_filename: None,
             attachments: None,
+            is_habit: None,
+            health_goal: None,
+            health_last_value: None,
+            health_last_sync_at: None,
         }
     }
 
@@ -10231,6 +10414,10 @@ mod tests {
                 priority: "high".to_string(),
                 tags: "x,y".to_string(),
                 progress: "Review".to_string(),
+                habit: String::default(),
+                health_metric: String::default(),
+                health_threshold: String::default(),
+                health_workout_type: String::default(),
                 notes: "note".to_string(),
                 active_field: EditorField::Progress,
             }
@@ -10326,6 +10513,10 @@ mod tests {
             priority: "high".to_string(),
             tags: "x, y".to_string(),
             progress: "customstate".to_string(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: "memo".to_string(),
             active_field: EditorField::Text,
         });
@@ -10347,6 +10538,10 @@ mod tests {
             priority: String::default(),
             tags: String::default(),
             progress: app.default_progress_value(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::default(),
             active_field: EditorField::Text,
         });
@@ -10633,6 +10828,10 @@ mod tests {
             priority: String::default(),
             tags: String::default(),
             progress: String::default(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::default(),
             active_field: EditorField::Text,
         });
@@ -11026,6 +11225,10 @@ mod tests {
                 priority: "high".to_string(),
                 tags: "a,b".to_string(),
                 progress: "Open".to_string(),
+                habit: String::default(),
+                health_metric: String::default(),
+                health_threshold: String::default(),
+                health_workout_type: String::default(),
                 notes: "notes".to_string(),
                 active_field: EditorField::Text,
             };
@@ -12208,6 +12411,10 @@ mod tests {
             priority: String::default(),
             tags: String::default(),
             progress: String::default(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::default(),
             active_field: EditorField::Text,
         };
@@ -12238,6 +12445,10 @@ mod tests {
             priority: String::default(),
             tags: String::default(),
             progress: String::default(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::default(),
             active_field: EditorField::Text,
         };
@@ -12277,6 +12488,10 @@ mod tests {
             priority: String::default(),
             tags: String::default(),
             progress: String::default(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::default(),
             active_field: EditorField::Text,
         });
@@ -12300,6 +12515,10 @@ mod tests {
             priority: String::default(),
             tags: String::default(),
             progress: String::default(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::default(),
             active_field: EditorField::Text,
         });
@@ -12954,6 +13173,10 @@ mod tests {
             image_url: None,
             image_filename: None,
             attachments: None,
+            is_habit: None,
+            health_goal: None,
+            health_last_value: None,
+            health_last_sync_at: None,
         };
 
         assert!(item_matches_filter(&item, "batteries"));
@@ -13692,6 +13915,10 @@ mod tests {
             priority: "priority".to_string(),
             tags: "tags".to_string(),
             progress: "progress".to_string(),
+            habit: "habit".to_string(),
+            health_metric: "health_metric".to_string(),
+            health_threshold: "health_threshold".to_string(),
+            health_workout_type: "health_workout_type".to_string(),
             notes: "notes".to_string(),
             active_field: EditorField::Text,
         };
@@ -13710,6 +13937,10 @@ mod tests {
             (EditorField::Priority, "priority"),
             (EditorField::Tags, "tags"),
             (EditorField::Progress, "progress"),
+            (EditorField::Habit, "habit"),
+            (EditorField::HealthMetric, "health_metric"),
+            (EditorField::HealthThreshold, "health_threshold"),
+            (EditorField::HealthWorkoutType, "health_workout_type"),
             (EditorField::Notes, "notes"),
         ];
 
@@ -13759,6 +13990,10 @@ mod tests {
             priority: String::default(),
             tags: "Br".to_string(),
             progress: tr("tui-kanban-open"),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::default(),
             active_field: EditorField::Reminder,
         });
@@ -14835,6 +15070,10 @@ mod tests {
             priority: String::new(),
             tags: String::new(),
             progress: String::new(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::new(),
             active_field: EditorField::Text,
         });
@@ -15052,6 +15291,10 @@ mod tests {
             priority: String::new(),
             tags: String::new(),
             progress: String::new(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::new(),
             active_field: EditorField::Text,
         });
@@ -15078,6 +15321,10 @@ mod tests {
             priority: String::new(),
             tags: String::new(),
             progress: String::new(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::new(),
             active_field: EditorField::Text,
         });
@@ -15110,6 +15357,10 @@ mod tests {
             priority: String::new(),
             tags: String::new(),
             progress: String::new(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::new(),
             active_field: EditorField::Text,
         });
@@ -15897,6 +16148,10 @@ mod tests {
             priority: String::default(),
             tags: "Eg".to_string(),
             progress: tr("tui-kanban-open"),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::default(),
             active_field: EditorField::Reminder,
         });
@@ -17779,6 +18034,10 @@ mod tests {
                 priority: String::new(),
                 tags: String::new(),
                 progress: String::new(),
+                habit: String::default(),
+                health_metric: String::default(),
+                health_threshold: String::default(),
+                health_workout_type: String::default(),
                 notes: String::new(),
                 active_field: EditorField::Text,
             });
@@ -17875,6 +18134,10 @@ mod tests {
             priority: String::new(),
             tags: String::new(),
             progress: "not-a-column".to_string(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::new(),
             active_field: EditorField::Progress,
         });
@@ -18335,6 +18598,10 @@ mod tests {
             priority: String::new(),
             tags: String::new(),
             progress: String::new(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::new(),
             active_field: EditorField::Notes,
         });
@@ -18359,6 +18626,10 @@ mod tests {
             priority: String::new(),
             tags: String::new(),
             progress: String::new(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::new(),
             active_field: EditorField::Text,
         });
@@ -18608,6 +18879,10 @@ mod tests {
                 priority: String::new(),
                 tags: String::new(),
                 progress: String::new(),
+                habit: String::default(),
+                health_metric: String::default(),
+                health_threshold: String::default(),
+                health_workout_type: String::default(),
                 notes: String::new(),
                 active_field: EditorField::Text,
             });
@@ -18631,6 +18906,10 @@ mod tests {
                 priority: String::new(),
                 tags: String::new(),
                 progress: String::new(),
+                habit: String::default(),
+                health_metric: String::default(),
+                health_threshold: String::default(),
+                health_workout_type: String::default(),
                 notes: String::new(),
                 active_field: EditorField::Text,
             });
@@ -18661,6 +18940,10 @@ mod tests {
                 priority: String::new(),
                 tags: String::new(),
                 progress: String::new(),
+                habit: String::default(),
+                health_metric: String::default(),
+                health_threshold: String::default(),
+                health_workout_type: String::default(),
                 notes: String::new(),
                 active_field: EditorField::Text,
             });
@@ -19192,6 +19475,10 @@ mod tests {
             priority: String::new(),
             tags: String::new(),
             progress: String::new(),
+            habit: String::default(),
+            health_metric: String::default(),
+            health_threshold: String::default(),
+            health_workout_type: String::default(),
             notes: String::new(),
             active_field: EditorField::Text,
         };

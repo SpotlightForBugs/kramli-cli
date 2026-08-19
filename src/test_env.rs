@@ -239,12 +239,22 @@ pub(crate) fn run_test_in_pseudo_terminal(test_filter: &str) {
             "{} {test_filter} --exact --nocapture --test-threads=1 --ignored",
             exe.display()
         );
-        let timeout = ["timeout", "gtimeout"]
-            .into_iter()
-            .find(|name| std::process::Command::new(name).arg("--version").output().is_ok());
+        let timeout = ["timeout", "gtimeout"].into_iter().find(|name| {
+            std::process::Command::new(name)
+                .arg("--version")
+                .output()
+                .is_ok()
+        });
         let mut child = if let Some(timeout) = timeout {
             let mut cmd = std::process::Command::new(timeout);
-            cmd.args([&test_timeout_arg(), script, "-q", "-c", &command, "/dev/null"]);
+            cmd.args([
+                &test_timeout_arg(),
+                script,
+                "-q",
+                "-c",
+                &command,
+                "/dev/null",
+            ]);
             cmd
         } else {
             let mut cmd = std::process::Command::new(script);

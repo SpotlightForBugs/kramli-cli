@@ -1013,6 +1013,10 @@ mod tests {
             image_url: None,
             image_filename: None,
             attachments: None,
+            is_habit: None,
+            health_goal: None,
+            health_last_value: None,
+            health_last_sync_at: None,
         };
 
         assert!(item_matches_filters(
@@ -1543,6 +1547,11 @@ mod tests {
                 assign: Some("1,2".to_string()),
                 color: Some("#22aa66".to_string()),
                 progress: Some("in progress".to_string()),
+                habit: None,
+                health_metric: None,
+                health_threshold: None,
+                health_workout_type: None,
+                clear_health_goal: false,
             }),
         };
 
@@ -2013,6 +2022,10 @@ mod tests {
                 assign: Some("1, nope, 2".to_string()),
                 color: Some("#ffffff".to_string()),
                 progress: Some("Open".to_string()),
+                habit: None,
+                health_metric: None,
+                health_threshold: None,
+                health_workout_type: None,
             },
         )
         .await
@@ -2039,6 +2052,11 @@ mod tests {
                 assign: Some("2,3".to_string()),
                 color: Some("#000000".to_string()),
                 progress: Some("Done".to_string()),
+                habit: None,
+                health_metric: None,
+                health_threshold: None,
+                health_workout_type: None,
+                clear_health_goal: false,
             },
         )
         .await
@@ -2087,6 +2105,11 @@ mod tests {
                 assign: None,
                 color: None,
                 progress: None,
+                habit: None,
+                health_metric: None,
+                health_threshold: None,
+                health_workout_type: None,
+                clear_health_goal: false,
             },
         )
         .await
@@ -2161,6 +2184,10 @@ mod tests {
                     assign: None,
                     color: None,
                     progress: None,
+                    habit: None,
+                    health_metric: None,
+                    health_threshold: None,
+                    health_workout_type: None,
                 },
             )
             .await
@@ -2187,6 +2214,11 @@ mod tests {
                     assign: None,
                     color: None,
                     progress: None,
+                    habit: None,
+                    health_metric: None,
+                    health_threshold: None,
+                    health_workout_type: None,
+                    clear_health_goal: false,
                 },
             )
             .await
@@ -2248,6 +2280,10 @@ mod tests {
                 image_url: None,
                 image_filename: None,
                 attachments: None,
+                is_habit: None,
+                health_goal: None,
+                health_last_value: None,
+                health_last_sync_at: None,
             };
             enrich_item_tags_from_list(&api, &mut item_without_list).await;
             assert!(item_without_list.tags.is_none());
@@ -2343,6 +2379,10 @@ mod tests {
                 assign: None,
                 color: None,
                 progress: None,
+                habit: None,
+                health_metric: None,
+                health_threshold: None,
+                health_workout_type: None,
             },
         )
         .await;
@@ -2417,6 +2457,10 @@ mod tests {
                         assign: None,
                         color: None,
                         progress: None,
+                        habit: None,
+                        health_metric: None,
+                        health_threshold: None,
+                        health_workout_type: None,
                     },
                     true,
                 )
@@ -2442,6 +2486,11 @@ mod tests {
                         assign: None,
                         color: None,
                         progress: None,
+                        habit: None,
+                        health_metric: None,
+                        health_threshold: None,
+                        health_workout_type: None,
+                        clear_health_goal: false,
                     },
                     true,
                 )
@@ -3077,24 +3126,40 @@ mod tests {
 
     #[kramli_test_macros::tokio_test]
     async fn env_var_helper_restores_existing_values() {
-        let prior = std::env::var(TEST_KRAMLI_API_KEY_ENV).ok();
-        with_env_vars_async(&[(TEST_KRAMLI_API_KEY_ENV, "before")], || async {
-            with_env_vars_async_unlocked(&[(TEST_KRAMLI_API_KEY_ENV, "during")], || async {
-                assert_eq!(
-                    std::env::var(TEST_KRAMLI_API_KEY_ENV).as_deref(),
-                    Ok("during")
-                );
+        // Use a unique probe var never touched by other tests or prod code, to avoid
+        // cross-test pollution on the global process environment (KRAMLI_API_KEY etc).
+        let probe = format!(
+            "{TEST_ENV_FLAG_ENV}_restore_existing_{}_{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        );
+        std::env::remove_var(&probe);
+
+        let prior = std::env::var(&probe).ok(); // None
+        with_env_vars_async(&[(&probe, "before")], || async {
+            with_env_vars_async_unlocked(&[(&probe, "during")], || async {
+                assert_eq!(std::env::var(&probe).as_deref(), Ok("during"));
             })
             .await;
 
-            assert_eq!(
-                std::env::var(TEST_KRAMLI_API_KEY_ENV).as_deref(),
-                Ok("before")
-            );
+            assert_eq!(std::env::var(&probe).as_deref(), Ok("before"));
         })
         .await;
 
-        assert_eq!(std::env::var(TEST_KRAMLI_API_KEY_ENV).ok(), prior);
+        assert_eq!(std::env::var(&probe).ok(), prior);
+
+        // Explicitly test restoration of a pre-existing value (not just absent).
+        std::env::set_var(&probe, "original_prior");
+        with_env_vars_async(&[(&probe, "temporary")], || async {
+            assert_eq!(std::env::var(&probe).as_deref(), Ok("temporary"));
+        })
+        .await;
+        assert_eq!(
+            std::env::var(&probe).ok(),
+            Some("original_prior".to_string())
+        );
+
+        std::env::remove_var(&probe);
     }
 
     #[kramli_test_macros::tokio_test]
@@ -4141,6 +4206,10 @@ mod tests {
                 assign: Some("1,2".to_string()),
                 color: Some("#aabbcc".to_string()),
                 progress: Some("planned".to_string()),
+                habit: None,
+                health_metric: None,
+                health_threshold: None,
+                health_workout_type: None,
             }),
         })
         .await
@@ -4268,6 +4337,10 @@ mod tests {
                             assign: None,
                             color: None,
                             progress: None,
+                            habit: None,
+                            health_metric: None,
+                            health_threshold: None,
+                            health_workout_type: None,
                         }),
                     },
                     CommandContext {
@@ -5247,6 +5320,11 @@ mod tests {
             assign: None,
             color: None,
             progress: None,
+            habit: None,
+            health_metric: None,
+            health_threshold: None,
+            health_workout_type: None,
+            clear_health_goal: false,
         })
         .expect("item update dry-run should build")
         .expect("item update should be dry-runnable");
@@ -6825,6 +6903,18 @@ pub(crate) enum ItemCmd {
         /// Item state (e.g. "In Progress", "Review")
         #[arg(long, alias = "state")]
         progress: Option<String>,
+        /// Mark as habit (streak tracking; implies a daily repeat if none set)
+        #[arg(long)]
+        habit: Option<bool>,
+        /// Health metric (steps, exercise_minutes, workout, …)
+        #[arg(long)]
+        health_metric: Option<String>,
+        /// Health goal threshold for the metric
+        #[arg(long)]
+        health_threshold: Option<f64>,
+        /// Workout type when --health-metric workout
+        #[arg(long)]
+        health_workout_type: Option<String>,
     },
     /// Update an item
     Update {
@@ -6869,6 +6959,21 @@ pub(crate) enum ItemCmd {
         /// Item state (e.g. "In Progress", "Review")
         #[arg(long, alias = "state")]
         progress: Option<String>,
+        /// Mark as habit (streak tracking; implies a daily repeat if none set)
+        #[arg(long)]
+        habit: Option<bool>,
+        /// Health metric (steps, exercise_minutes, workout, …)
+        #[arg(long)]
+        health_metric: Option<String>,
+        /// Health goal threshold for the metric
+        #[arg(long)]
+        health_threshold: Option<f64>,
+        /// Workout type when --health-metric workout
+        #[arg(long)]
+        health_workout_type: Option<String>,
+        /// Clear any Health goal on the item
+        #[arg(long)]
+        clear_health_goal: bool,
     },
     /// Toggle an item between done and not done
     #[command(alias = "check")]
@@ -7440,6 +7545,10 @@ fn dry_run_requests_for_item_cmd(cmd: &ItemCmd) -> Result<Option<Vec<DryRunReque
             assign,
             color,
             progress,
+            habit,
+            health_metric,
+            health_threshold,
+            health_workout_type,
         } => {
             let body = build_item_add_payload(ItemAddArgs {
                 list_id: *list_id,
@@ -7461,6 +7570,10 @@ fn dry_run_requests_for_item_cmd(cmd: &ItemCmd) -> Result<Option<Vec<DryRunReque
                 assign: assign.clone(),
                 color: color.clone(),
                 progress: progress.clone(),
+                habit: *habit,
+                health_metric: health_metric.clone(),
+                health_threshold: *health_threshold,
+                health_workout_type: health_workout_type.clone(),
             })?;
             Ok(Some(vec![dry_run_request(
                 "POST",
@@ -7487,6 +7600,11 @@ fn dry_run_requests_for_item_cmd(cmd: &ItemCmd) -> Result<Option<Vec<DryRunReque
             assign,
             color,
             progress,
+            habit,
+            health_metric,
+            health_threshold,
+            health_workout_type,
+            clear_health_goal,
         } => {
             let body = build_item_update_payload(ItemUpdateArgs {
                 id: *id,
@@ -7507,6 +7625,11 @@ fn dry_run_requests_for_item_cmd(cmd: &ItemCmd) -> Result<Option<Vec<DryRunReque
                 assign: assign.clone(),
                 color: color.clone(),
                 progress: progress.clone(),
+                habit: *habit,
+                health_metric: health_metric.clone(),
+                health_threshold: *health_threshold,
+                health_workout_type: health_workout_type.clone(),
+                clear_health_goal: *clear_health_goal,
             })?;
             Ok(Some(vec![dry_run_request(
                 "PUT",
@@ -8567,6 +8690,10 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
             assign,
             color,
             progress,
+            habit,
+            health_metric,
+            health_threshold,
+            health_workout_type,
         } => {
             run_items_add(
                 &api,
@@ -8591,6 +8718,10 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
                     assign,
                     color,
                     progress,
+                    habit,
+                    health_metric,
+                    health_threshold,
+                    health_workout_type,
                 },
             )
             .await?
@@ -8614,6 +8745,11 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
             assign,
             color,
             progress,
+            habit,
+            health_metric,
+            health_threshold,
+            health_workout_type,
+            clear_health_goal,
         } => {
             run_items_update(
                 &api,
@@ -8637,6 +8773,11 @@ async fn run_items(cmd: ItemCmd, as_json: bool) -> Result<(), String> {
                     assign,
                     color,
                     progress,
+                    habit,
+                    health_metric,
+                    health_threshold,
+                    health_workout_type,
+                    clear_health_goal,
                 },
             )
             .await?
@@ -8863,6 +9004,10 @@ struct ItemAddArgs {
     assign: Option<String>,
     color: Option<String>,
     progress: Option<String>,
+    habit: Option<bool>,
+    health_metric: Option<String>,
+    health_threshold: Option<f64>,
+    health_workout_type: Option<String>,
 }
 
 async fn run_items_add(api: &ApiClient, as_json: bool, args: ItemAddArgs) -> Result<(), String> {
@@ -8881,6 +9026,38 @@ async fn run_items_add(api: &ApiClient, as_json: bool, args: ItemAddArgs) -> Res
             "{} {}",
             "✓".green(),
             tr_args("cli-item-created", &[("id", item.id.to_string())])
+        );
+    }
+    Ok(())
+}
+
+fn apply_habit_and_health_fields(
+    body: &mut serde_json::Map<String, Value>,
+    habit: Option<bool>,
+    health_metric: Option<String>,
+    health_threshold: Option<f64>,
+    health_workout_type: Option<String>,
+    clear_health_goal: bool,
+) -> Result<(), String> {
+    let health_goal =
+        parse_health_goal_parts(health_metric, health_threshold, health_workout_type)?;
+    if clear_health_goal && health_goal.is_some() {
+        return Err(tr("cli-health-clear-conflict"));
+    }
+    if let Some(habit) = habit {
+        body.insert("is_habit".into(), Value::Bool(habit));
+        if habit && body.get("repeat_type").is_none() {
+            body.insert("repeat_type".into(), Value::String("interval".into()));
+            body.insert("repeat_interval_value".into(), Value::from(1));
+            body.insert("repeat_interval_unit".into(), Value::String("day".into()));
+        }
+    }
+    if clear_health_goal {
+        body.insert("health_goal".into(), Value::Null);
+    } else if let Some(goal) = health_goal {
+        body.insert(
+            "health_goal".into(),
+            serde_json::to_value(goal).map_err(|e| e.to_string())?,
         );
     }
     Ok(())
@@ -8906,6 +9083,10 @@ fn build_item_add_payload(args: ItemAddArgs) -> Result<Value, String> {
         assign,
         color,
         progress,
+        habit,
+        health_metric,
+        health_threshold,
+        health_workout_type,
         ..
     } = args;
     let tag_vec = tags.map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
@@ -8929,17 +9110,33 @@ fn build_item_add_payload(args: ItemAddArgs) -> Result<Value, String> {
         priority,
         tags: tag_vec,
         parent_item_id: parent,
+        is_habit: None,
+        health_goal: None,
+        repeat_type: None,
+        repeat_interval_value: None,
+        repeat_interval_unit: None,
     };
     let mut payload = serde_json::to_value(&body).map_err(|e| e.to_string())?;
+    let map = payload
+        .as_object_mut()
+        .ok_or_else(|| "create payload must be an object".to_string())?;
     if let Some(a) = assign {
-        payload["assigned_to"] = Value::Array(parse_id_values(&a));
+        map.insert("assigned_to".into(), Value::Array(parse_id_values(&a)));
     }
     if let Some(c) = color {
-        payload["color"] = Value::String(c);
+        map.insert("color".into(), Value::String(c));
     }
     if let Some(progress_value) = normalize_progress_value(progress) {
-        payload["progress"] = progress_value;
+        map.insert("progress".into(), progress_value);
     }
+    apply_habit_and_health_fields(
+        map,
+        habit,
+        health_metric,
+        health_threshold,
+        health_workout_type,
+        false,
+    )?;
     Ok(payload)
 }
 
@@ -8962,6 +9159,11 @@ struct ItemUpdateArgs {
     assign: Option<String>,
     color: Option<String>,
     progress: Option<String>,
+    habit: Option<bool>,
+    health_metric: Option<String>,
+    health_threshold: Option<f64>,
+    health_workout_type: Option<String>,
+    clear_health_goal: bool,
 }
 
 async fn run_items_update(
@@ -9005,6 +9207,11 @@ fn build_item_update_payload(
         assign,
         color,
         progress,
+        habit,
+        health_metric,
+        health_threshold,
+        health_workout_type,
+        clear_health_goal,
         ..
     } = args;
     let mut body = serde_json::Map::new();
@@ -9050,6 +9257,14 @@ fn build_item_update_payload(
     if let Some(a) = assign {
         body.insert("assigned_to".into(), Value::Array(parse_id_values(&a)));
     }
+    apply_habit_and_health_fields(
+        &mut body,
+        habit,
+        health_metric,
+        health_threshold,
+        health_workout_type,
+        clear_health_goal,
+    )?;
     if body.is_empty() {
         return Err(tr("cli-no-changes"));
     }
@@ -10497,5 +10712,173 @@ fn run_privacy(cmd: PrivacyCmd, as_json: bool) -> Result<(), String> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod health_goal_cli_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[kramli_test_macros::test]
+    fn add_payload_includes_habit_health_and_default_daily_repeat() {
+        let payload = build_item_add_payload(ItemAddArgs {
+            list_id: 1,
+            text: "10k Schritte".into(),
+            quantity: None,
+            due: None,
+            due_time: None,
+            planned: None,
+            planned_time: None,
+            reminder: None,
+            reminder_time: None,
+            reminder_days_before: None,
+            reminder_offsets: None,
+            travel_time_minutes: None,
+            priority: None,
+            tags: None,
+            notes: None,
+            parent: None,
+            assign: None,
+            color: None,
+            progress: None,
+            habit: Some(true),
+            health_metric: Some("steps".into()),
+            health_threshold: Some(10000.0),
+            health_workout_type: None,
+        })
+        .expect("payload");
+        assert_eq!(payload["is_habit"], json!(true));
+        assert_eq!(payload["repeat_type"], json!("interval"));
+        assert_eq!(payload["repeat_interval_value"], json!(1));
+        assert_eq!(payload["repeat_interval_unit"], json!("day"));
+        assert_eq!(payload["health_goal"]["metric"], json!("steps"));
+        assert_eq!(payload["health_goal"]["threshold"], json!(10000.0));
+    }
+
+    #[kramli_test_macros::test]
+    fn update_payload_can_clear_health_goal() {
+        let body = build_item_update_payload(ItemUpdateArgs {
+            id: 9,
+            text: None,
+            quantity: None,
+            due: None,
+            due_time: None,
+            planned: None,
+            planned_time: None,
+            reminder: None,
+            reminder_time: None,
+            reminder_days_before: None,
+            reminder_offsets: None,
+            travel_time_minutes: None,
+            priority: None,
+            tags: None,
+            notes: None,
+            assign: None,
+            color: None,
+            progress: None,
+            habit: None,
+            health_metric: None,
+            health_threshold: None,
+            health_workout_type: None,
+            clear_health_goal: true,
+        })
+        .expect("payload");
+        assert_eq!(body.get("health_goal"), Some(&Value::Null));
+    }
+
+    #[kramli_test_macros::test]
+    fn add_rejects_health_threshold_without_metric() {
+        let err = build_item_add_payload(ItemAddArgs {
+            list_id: 1,
+            text: "x".into(),
+            quantity: None,
+            due: None,
+            due_time: None,
+            planned: None,
+            planned_time: None,
+            reminder: None,
+            reminder_time: None,
+            reminder_days_before: None,
+            reminder_offsets: None,
+            travel_time_minutes: None,
+            priority: None,
+            tags: None,
+            notes: None,
+            parent: None,
+            assign: None,
+            color: None,
+            progress: None,
+            habit: None,
+            health_metric: None,
+            health_threshold: Some(10.0),
+            health_workout_type: None,
+        })
+        .expect_err("threshold alone should fail");
+        assert!(!err.is_empty());
+    }
+
+    #[kramli_test_macros::test]
+    fn add_payload_accepts_pilates_workout_type() {
+        let payload = build_item_add_payload(ItemAddArgs {
+            list_id: 1,
+            text: "Pilates".into(),
+            quantity: None,
+            due: None,
+            due_time: None,
+            planned: None,
+            planned_time: None,
+            reminder: None,
+            reminder_time: None,
+            reminder_days_before: None,
+            reminder_offsets: None,
+            travel_time_minutes: None,
+            priority: None,
+            tags: None,
+            notes: None,
+            parent: None,
+            assign: None,
+            color: None,
+            progress: None,
+            habit: Some(true),
+            health_metric: Some("workout".into()),
+            health_threshold: None,
+            health_workout_type: Some("PILATES".into()),
+        })
+        .expect("payload");
+        assert_eq!(payload["health_goal"]["metric"], json!("workout"));
+        assert_eq!(payload["health_goal"]["workout_type"], json!("PILATES"));
+        assert_eq!(payload["health_goal"]["threshold"], json!(1.0));
+    }
+
+    #[kramli_test_macros::test]
+    fn add_rejects_garbage_workout_type() {
+        let err = build_item_add_payload(ItemAddArgs {
+            list_id: 1,
+            text: "x".into(),
+            quantity: None,
+            due: None,
+            due_time: None,
+            planned: None,
+            planned_time: None,
+            reminder: None,
+            reminder_time: None,
+            reminder_days_before: None,
+            reminder_offsets: None,
+            travel_time_minutes: None,
+            priority: None,
+            tags: None,
+            notes: None,
+            parent: None,
+            assign: None,
+            color: None,
+            progress: None,
+            habit: None,
+            health_metric: Some("workout".into()),
+            health_threshold: None,
+            health_workout_type: Some("not-a-type".into()),
+        })
+        .expect_err("garbage workout type should fail");
+        assert!(!err.is_empty());
     }
 }

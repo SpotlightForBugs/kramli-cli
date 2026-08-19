@@ -14,7 +14,7 @@ use crate::attachments::{
 use crate::config::Config;
 use crate::i18n::{tr, tr_args};
 use crate::internal_links::{LinkPreview, LinkPreviewActionKind, LinkPreviewResolver};
-use crate::models::{ListItem, ShoppingList};
+use crate::models::{parse_health_goal_parts, ListItem, ShoppingList};
 use crate::note::{ensure_task_list, normalize_list_type, safe_update_payload};
 use crate::telemetry;
 
@@ -351,6 +351,7 @@ async fn create_item(api: &ApiClient, args: &Map<String, Value>) -> Result<Value
     if let Some(parent_item_id) = optional_i64(args, "parent_item_id")? {
         body.insert("parent_item_id".to_string(), Value::from(parent_item_id));
     }
+    insert_habit_health_fields(args, &mut body, false)?;
 
     api.post(&format!("/lists/{list_id}/items"), &Value::Object(body))
         .await
@@ -377,6 +378,7 @@ async fn update_item(api: &ApiClient, args: &Map<String, Value>) -> Result<Value
     if let Some(assigned_to) = optional_i64_array(args, "assigned_to")? {
         body.insert("assigned_to".to_string(), Value::Array(assigned_to));
     }
+    insert_habit_health_fields(args, &mut body, true)?;
     if body.is_empty() {
         return Err(tr("mcp-no-changes"));
     }
@@ -422,13 +424,8 @@ async fn get_list(api: &ApiClient, args: &Map<String, Value>) -> Result<Value, S
 
 async fn get_item(api: &ApiClient, args: &Map<String, Value>) -> Result<Value, String> {
     let id = required_i64(args, "id")?;
-    let item: Value = api.get(&format!("/items/{id}")).await?;
-    let comments: Value = api.get(&format!("/items/{id}/comments")).await?;
-    let mut result = item;
-    if let Some(object) = result.as_object_mut() {
-        object.insert("comments".to_string(), comments);
-    }
-    Ok(result)
+    // Server GET /items/<id> now returns the item with embedded "comments" array.
+    api.get(&format!("/items/{id}")).await
 }
 
 async fn search(api: &ApiClient, args: &Map<String, Value>) -> Result<Value, String> {
@@ -676,6 +673,75 @@ fn optional_bool(args: &Map<String, Value>, name: &str) -> Result<Option<bool>, 
         Some(Value::Bool(value)) => Ok(Some(*value)),
         _ => Err(tr_args("mcp-argument-must-bool", &[("name", name.into())])),
     }
+}
+
+fn optional_f64(args: &Map<String, Value>, name: &str) -> Result<Option<f64>, String> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(value)) => value
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| tr_args("mcp-argument-must-number", &[("name", name.into())])),
+        _ => Err(tr_args(
+            "mcp-argument-must-number",
+            &[("name", name.into())],
+        )),
+    }
+}
+
+fn insert_habit_health_fields(
+    args: &Map<String, Value>,
+    body: &mut Map<String, Value>,
+    allow_clear: bool,
+) -> Result<(), String> {
+    if let Some(is_habit) = optional_bool(args, "is_habit")? {
+        body.insert("is_habit".to_string(), Value::Bool(is_habit));
+        if is_habit && body.get("repeat_type").is_none() {
+            body.insert("repeat_type".to_string(), Value::String("interval".into()));
+            body.insert("repeat_interval_value".to_string(), Value::from(1));
+            body.insert(
+                "repeat_interval_unit".to_string(),
+                Value::String("day".into()),
+            );
+        }
+    }
+
+    if let Some(goal_value) = args.get("health_goal") {
+        if goal_value.is_null() {
+            if allow_clear {
+                body.insert("health_goal".to_string(), Value::Null);
+            }
+            return Ok(());
+        }
+        if let Some(object) = goal_value.as_object() {
+            let metric = optional_string(object, "metric")?;
+            let threshold = optional_f64(object, "threshold")?;
+            let workout_type = optional_string(object, "workout_type")?;
+            let goal = parse_health_goal_parts(metric, threshold, workout_type)?
+                .ok_or_else(|| tr("cli-health-metric-required"))?;
+            body.insert(
+                "health_goal".to_string(),
+                serde_json::to_value(goal).map_err(|e| e.to_string())?,
+            );
+            return Ok(());
+        }
+        return Err(tr_args(
+            "mcp-argument-must-object",
+            &[("name", "health_goal".into())],
+        ));
+    }
+
+    // Flat MCP args (metric/threshold) as a convenience for agents.
+    let metric = optional_string(args, "health_metric")?;
+    let threshold = optional_f64(args, "health_threshold")?;
+    let workout_type = optional_string(args, "health_workout_type")?;
+    if let Some(goal) = parse_health_goal_parts(metric, threshold, workout_type)? {
+        body.insert(
+            "health_goal".to_string(),
+            serde_json::to_value(goal).map_err(|e| e.to_string())?,
+        );
+    }
+    Ok(())
 }
 
 fn optional_string_array(
@@ -1029,7 +1095,22 @@ fn tools() -> Vec<Value> {
                     "priority": {"type": "string"},
                     "progress": {"type": "string"},
                     "tags": {"type": "array", "items": {"type": "string"}},
-                    "parent_item_id": {"type": "integer"}
+                    "parent_item_id": {"type": "integer"},
+                    "is_habit": {"type": "boolean", "description": "Mark as habit (streak tracking). Implies a daily repeat when unset."},
+                    "health_goal": {
+                        "type": ["object", "null"],
+                        "description": "Health goal object {metric, threshold, workout_type?}.",
+                        "properties": {
+                            "metric": {"type": "string"},
+                            "threshold": {"type": "number"},
+                            "workout_type": {"type": "string"},
+                            "period": {"type": "string"}
+                        },
+                        "additionalProperties": false
+                    },
+                    "health_metric": {"type": "string", "description": "Flat alias for health_goal.metric."},
+                    "health_threshold": {"type": "number", "description": "Flat alias for health_goal.threshold."},
+                    "health_workout_type": {"type": "string", "description": "Flat alias for health_goal.workout_type."}
                 },
                 "required": ["list_id", "text"],
                 "additionalProperties": false
@@ -1058,7 +1139,22 @@ fn tools() -> Vec<Value> {
                     "color": {"type": "string", "description": "Color. Send an empty string to clear it."},
                     "progress": {"type": "string", "description": "Custom state. Send an empty string to clear it."},
                     "tags": {"type": "array", "items": {"type": "string"}},
-                    "assigned_to": {"type": "array", "items": {"type": "integer"}}
+                    "assigned_to": {"type": "array", "items": {"type": "integer"}},
+                    "is_habit": {"type": "boolean", "description": "Mark as habit (streak tracking). Implies a daily repeat when unset."},
+                    "health_goal": {
+                        "type": ["object", "null"],
+                        "description": "Health goal object {metric, threshold, workout_type?}. Send null to clear.",
+                        "properties": {
+                            "metric": {"type": "string"},
+                            "threshold": {"type": "number"},
+                            "workout_type": {"type": "string"},
+                            "period": {"type": "string"}
+                        },
+                        "additionalProperties": false
+                    },
+                    "health_metric": {"type": "string", "description": "Flat alias for health_goal.metric."},
+                    "health_threshold": {"type": "number", "description": "Flat alias for health_goal.threshold."},
+                    "health_workout_type": {"type": "string", "description": "Flat alias for health_goal.workout_type."}
                 },
                 "required": ["id"],
                 "additionalProperties": false
@@ -1176,12 +1272,13 @@ fn tools() -> Vec<Value> {
 mod tests {
     use super::{
         content_length, create_item, create_list, delete_item, error_response, handle_message,
-        handle_tool_call, insert_clearable_string, insert_optional_string, insert_reminder_fields,
-        list_items, mcp_method_trace_name, mcp_tool_trace_name, optional_bool,
-        optional_clearable_string, optional_i64, optional_i64_array, optional_preserved_string,
-        optional_string, optional_string_array, read_message, required_i64, required_string,
-        run_stdio, run_with_io, toggle_item_done, tool_result, tool_text_result, tools,
-        try_parse_message, update_item, update_list, write_message, MessageFraming,
+        handle_tool_call, insert_clearable_string, insert_habit_health_fields,
+        insert_optional_string, insert_reminder_fields, list_items, mcp_method_trace_name,
+        mcp_tool_trace_name, optional_bool, optional_clearable_string, optional_i64,
+        optional_i64_array, optional_preserved_string, optional_string, optional_string_array,
+        read_message, required_i64, required_string, run_stdio, run_with_io, toggle_item_done,
+        tool_result, tool_text_result, tools, try_parse_message, update_item, update_list,
+        write_message, MessageFraming,
     };
     use crate::api::ApiClient;
     use crate::attachments::initialize_mcp_file_policy;
@@ -1320,18 +1417,28 @@ mod tests {
 
     #[kramli_test_macros::tokio_test]
     async fn env_helper_restores_existing_values() {
-        const TEST_ENV: &str = "KRAMLI_MCP_TEST_TMP";
-        crate::test_env::with_env_vars_async(&[(TEST_ENV, "before")], || async {
-            with_env_vars_async_unlocked(&[(TEST_ENV, "during")], || async {
-                assert_eq!(std::env::var(TEST_ENV).as_deref(), Ok("during"));
+        // Unique probe to avoid any cross-test env pollution on shared process state.
+        let probe = format!(
+            "KRAMLI_MCP_TEST_TMP_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        );
+        std::env::remove_var(&probe);
+
+        crate::test_env::with_env_vars_async(&[(&probe, "before")], || async {
+            with_env_vars_async_unlocked(&[(&probe, "during")], || async {
+                assert_eq!(std::env::var(&probe).as_deref(), Ok("during"));
             })
             .await;
 
-            assert_eq!(std::env::var(TEST_ENV).as_deref(), Ok("before"));
+            assert_eq!(std::env::var(&probe).as_deref(), Ok("before"));
         })
         .await;
 
-        assert!(std::env::var(TEST_ENV).is_err());
+        assert!(std::env::var(&probe).is_err());
     }
 
     #[kramli_test_macros::test]
@@ -1471,6 +1578,44 @@ mod tests {
 
         assert_eq!(body.get("reminder"), None);
         assert_eq!(body.get("travel_time_minutes"), Some(&Value::from(15)));
+    }
+
+    #[kramli_test_macros::test]
+    fn insert_habit_health_fields_sets_goal_and_daily_repeat() {
+        let args = json!({
+            "is_habit": true,
+            "health_metric": "steps",
+            "health_threshold": 10000.0
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+        let mut body = Map::new();
+        insert_habit_health_fields(&args, &mut body, false).expect("valid habit/health");
+
+        assert_eq!(body.get("is_habit"), Some(&Value::Bool(true)));
+        assert_eq!(body.get("repeat_type"), Some(&json!("interval")));
+        assert_eq!(body.get("repeat_interval_value"), Some(&json!(1)));
+        assert_eq!(body.get("repeat_interval_unit"), Some(&json!("day")));
+        assert_eq!(
+            body.get("health_goal"),
+            Some(&json!({
+                "metric": "steps",
+                "threshold": 10000.0,
+                "period": "daily"
+            }))
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn insert_habit_health_fields_can_clear_goal_on_update() {
+        let args = json!({ "health_goal": null })
+            .as_object()
+            .cloned()
+            .expect("object");
+        let mut body = Map::new();
+        insert_habit_health_fields(&args, &mut body, true).expect("clear allowed");
+        assert_eq!(body.get("health_goal"), Some(&Value::Null));
     }
 
     #[kramli_test_macros::test]
@@ -2708,8 +2853,7 @@ mod tests {
     #[kramli_test_macros::tokio_test]
     async fn new_read_tools_use_expected_get_contracts() {
         let (api, requests) = api_with_responses(vec![
-            json!({"id": 5, "text": "Item"}).to_string(),
-            json!([{"id": 1, "text": "Comment"}]).to_string(),
+            json!({"id": 5, "text": "Item", "comments": []}).to_string(),
             json!({"items": [{"id": 5, "text": "Item"}]}).to_string(),
             json!([{"id": 2, "detail": {"text": "Changed"}}]).to_string(),
         ])
@@ -2731,12 +2875,8 @@ mod tests {
             requests[0].lines().next().unwrap(),
             "GET /api/items/5 HTTP/1.1"
         );
-        assert_eq!(
-            requests[1].lines().next().unwrap(),
-            "GET /api/items/5/comments HTTP/1.1"
-        );
-        assert!(requests[2].starts_with("GET /api/search?"));
-        assert!(requests[3].starts_with("GET /api/lists/7/activity?"));
+        assert!(requests[1].starts_with("GET /api/search?"));
+        assert!(requests[2].starts_with("GET /api/lists/7/activity?"));
         assert!(requests.iter().all(|request| request.starts_with("GET ")));
     }
 
@@ -3107,10 +3247,7 @@ mod tests {
             .await;
 
             run_tool(
-                vec![
-                    json!({"id": 9, "text": "Item"}).to_string(),
-                    json!([]).to_string(),
-                ],
+                vec![json!({"id": 9, "text": "Item", "comments": []}).to_string()],
                 json!({"name": "get_item", "arguments": {"id": 9}}),
                 |result| assert_eq!(result["structuredContent"]["data"]["id"], 9),
             )

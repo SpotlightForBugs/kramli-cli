@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_LANGUAGE, RETRY_AFTER};
-use reqwest::{Client, Response, StatusCode, Url};
+use reqwest::{Certificate, Client, Response, StatusCode, Url};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
@@ -40,10 +40,12 @@ impl ResourceRequestKind {
 
 const DEFAULT_RATE_LIMIT_MS: u64 = 120;
 const MAX_429_RETRIES: u32 = 3;
+const MAX_TRANSIENT_RETRIES: u32 = 2;
 const MAX_RESOURCE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_MESSAGE_CHARS: usize = 500;
 const KRAMLI_RATE_LIMIT_MS_ENV: &str = "KRAMLI_RATE_LIMIT_MS";
 const KRAMLI_ALLOW_EXTERNAL_RESOURCES_ENV: &str = "KRAMLI_ALLOW_EXTERNAL_RESOURCES";
+const EXTRA_CA_BUNDLE_ENVS: &[&str] = &["SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE"];
 
 fn metric_i64(value: impl TryInto<i64>) -> i64 {
     value.try_into().unwrap_or(i64::MAX)
@@ -76,11 +78,7 @@ impl ApiClient {
         let api_key = config.require_api_key()?;
         let base_url = config.base_url().trim_end_matches('/').to_string();
         Self::ensure_secure_base_url(&base_url)?;
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|e| tr_args("api-http-client-error", &[("error", e.to_string())]))?;
+        let client = Self::build_http_client()?;
         Ok(Self {
             client,
             base_url,
@@ -126,6 +124,44 @@ impl ApiClient {
             .and_then(|raw| raw.trim().parse::<u64>().ok())
             .unwrap_or(DEFAULT_RATE_LIMIT_MS);
         Duration::from_millis(millis)
+    }
+
+    fn extra_root_certificates() -> Vec<Certificate> {
+        let mut certs = Vec::new();
+        let mut seen_paths = std::collections::BTreeSet::new();
+        for key in EXTRA_CA_BUNDLE_ENVS {
+            let Ok(raw) = std::env::var(key) else {
+                continue;
+            };
+            let path = raw.trim();
+            if path.is_empty() || !seen_paths.insert(path.to_string()) {
+                continue;
+            }
+            let Ok(pem) = std::fs::read(path) else {
+                continue;
+            };
+            if let Ok(parsed) = Certificate::from_pem_bundle(&pem) {
+                certs.extend(parsed);
+            }
+        }
+        certs
+    }
+
+    fn build_http_client() -> Result<Client, String> {
+        let mut builder = Client::builder()
+            .http1_only()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20));
+        for cert in Self::extra_root_certificates() {
+            builder = builder.add_root_certificate(cert);
+        }
+        builder
+            .build()
+            .map_err(|e| tr_args("api-http-client-error", &[("error", e.to_string())]))
+    }
+
+    fn is_transient_transport_error(err: &reqwest::Error) -> bool {
+        err.is_connect() || err.is_timeout() || err.is_request()
     }
 
     fn limiter() -> &'static tokio::sync::Mutex<Option<Instant>> {
@@ -179,6 +215,12 @@ impl ApiClient {
             let resp = match build_request().send().await {
                 Ok(resp) => resp,
                 Err(e) => {
+                    if attempt < MAX_TRANSIENT_RETRIES && Self::is_transient_transport_error(&e) {
+                        attempt += 1;
+                        let delay = Duration::from_millis(150_u64.saturating_mul(attempt as u64));
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
                     if let Some(span) = span {
                         span.set_data_i64("api.retry_count", metric_i64(attempt));
                         span.set_data_i64("api.rate_limit_wait_ms", metric_i64(wait_ms));
@@ -1581,5 +1623,96 @@ mod tests {
             ApiClient::format_api_error_message(body.as_bytes()),
             format!("[{} bytes]", body.len())
         );
+    }
+
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIICHzCCAcQCCQDa0Y3VbbFUwTAKBggqhkjOPQQDAjAdMRswGQYDVQQDDBJrcmFt\n\
+bGktY2xpLXRlc3QtY2EwHhcNMjYwODE5MTU1NjE3WhcNMjYwODIwMTU1NjE3WjAd\n\
+MRswGQYDVQQDDBJrcmFtbGktY2xpLXRlc3QtY2EwggFLMIIBAwYHKoZIzj0CATCB\n\
+9wIBATAsBgcqhkjOPQEBAiEA/////wAAAAEAAAAAAAAAAAAAAAD/////////////\n\
+//8wWwQg/////wAAAAEAAAAAAAAAAAAAAAD///////////////wEIFrGNdiqOpPn\n\
+s+u9VXaYhrxlHQawzFOw9jvOPD4n0mBLAxUAxJ02CIbnBJNqZnjhE50mt4GffpAE\n\
+QQRrF9Hy4SxCR/i85uVjpEDydwN9gS3rM6D0oTlF2JjClk/jQuL+Gn+bjufrSnwP\n\
+nhYrzjNXazFezsu2QGg3v1H1AiEA/////wAAAAD//////////7zm+q2nF56E87nK\n\
+wvxjJVECAQEDQgAE5Z25WC/Q7SWd/ru77N8fGduSdfFr5VfTbBdtGPplLERItZzk\n\
+16qykLJ/FUiXuOuTQEu4R+RTSWxWjul45ipbszAKBggqhkjOPQQDAgNJADBGAiEA\n\
+rPvzWUXsCCbuaTW+dN4Acf0Ezk/41bQp948iBWIwwE0CIQCJJNBgDpHlcxY/6csM\n\
+GdzaWItrbfAg0TSf4sxw5mkc4g==\n\
+-----END CERTIFICATE-----\n";
+
+    #[kramli_test_macros::test]
+    fn extra_root_certificates_skips_missing_bundle() {
+        crate::test_env::with_env_vars(
+            &[
+                (
+                    "SSL_CERT_FILE",
+                    "/this/path/does/not/exist/kramli-missing-ca.pem",
+                ),
+                ("CURL_CA_BUNDLE", ""),
+                ("REQUESTS_CA_BUNDLE", ""),
+            ],
+            || {
+                assert!(ApiClient::extra_root_certificates().is_empty());
+            },
+        );
+    }
+
+    #[kramli_test_macros::test]
+    fn extra_root_certificates_loads_pem_bundle_from_env() {
+        let path = std::env::temp_dir().join(format!(
+            "kramli-test-ca-{}-{}.pem",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, TEST_CA_PEM).expect("write test CA bundle");
+        let loaded = crate::test_env::with_env_vars(
+            &[
+                ("SSL_CERT_FILE", path.to_str().expect("utf8 path")),
+                ("CURL_CA_BUNDLE", ""),
+                ("REQUESTS_CA_BUNDLE", ""),
+            ],
+            || ApiClient::extra_root_certificates(),
+        );
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.len(), 1);
+    }
+
+    #[kramli_test_macros::test]
+    fn build_http_client_succeeds_with_extra_ca() {
+        let client = ApiClient::build_http_client();
+        assert!(client.is_ok());
+    }
+
+    #[kramli_test_macros::tokio_test]
+    async fn send_with_retry_retries_dropped_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server address");
+        let base_url = format!("http://{addr}");
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("first accept");
+            drop(stream);
+            let (mut stream, _) = listener.accept().await.expect("retry accept");
+            let mut buf = vec![0_u8; 8192];
+            let _ = stream.read(&mut buf).await;
+            let body = br#"{"ok":true}"#;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+        });
+        let api = test_client(&base_url);
+        let got: Value = api
+            .get("/ok")
+            .await
+            .expect("retried request should succeed");
+        assert!(got["ok"].as_bool().unwrap_or(false));
+        handle.await.expect("server finished");
     }
 }
