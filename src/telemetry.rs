@@ -70,6 +70,37 @@ pub(crate) fn traces_sample_rate() -> f32 {
         .map_or(1.0, |value| value.clamp(0.0, 1.0))
 }
 
+pub(crate) fn init_client_options() -> sentry::ClientOptions {
+    let options = sentry::ClientOptions::new()
+        .send_default_pii(false)
+        .attach_stacktrace(true)
+        .max_breadcrumbs(0)
+        .default_integrations(true)
+        .auto_session_tracking(false)
+        .traces_sample_rate(traces_sample_rate())
+        .before_send(scrub_event);
+    match sentry::release_name!() {
+        Some(release) => options.release(release),
+        None => options,
+    }
+}
+
+#[cfg(test)]
+fn test_client_options() -> sentry::ClientOptions {
+    let options = sentry::ClientOptions::new()
+        .send_default_pii(false)
+        .attach_stacktrace(false)
+        .max_breadcrumbs(0)
+        .default_integrations(false)
+        .auto_session_tracking(false)
+        .traces_sample_rate(1.0)
+        .before_send(scrub_event);
+    match sentry::release_name!() {
+        Some(release) => options.release(release),
+        None => options,
+    }
+}
+
 /// Remember the most recent API call for error diagnostics (no secrets).
 pub(crate) fn record_http_call(method: &str, path: &str, status: u16) {
     let Ok(mut guard) = LAST_HTTP_CALL.lock() else {
@@ -1238,17 +1269,7 @@ mod tests {
     fn trace_span_applies_tags_data_and_status_with_active_sentry() {
         let _guard = sentry::init((
             "https://9435ede2d0d8eceedf3b3e0eb5cb6aff@o4509985277018112.ingest.de.sentry.io/4510966154002512",
-            sentry::ClientOptions {
-                release: sentry::release_name!(),
-                send_default_pii: false,
-                attach_stacktrace: false,
-                max_breadcrumbs: 0,
-                default_integrations: false,
-                auto_session_tracking: false,
-                traces_sample_rate: 1.0,
-                before_send: Some(std::sync::Arc::new(scrub_event)),
-                ..sentry::ClientOptions::default()
-            },
+            test_client_options(),
         ));
 
         let transaction =
@@ -1265,17 +1286,7 @@ mod tests {
     fn trace_span_drop_applies_cancelled_status_with_active_sentry() {
         let _guard = sentry::init((
             "https://9435ede2d0d8eceedf3b3e0eb5cb6aff@o4509985277018112.ingest.de.sentry.io/4510966154002512",
-            sentry::ClientOptions {
-                release: sentry::release_name!(),
-                send_default_pii: false,
-                attach_stacktrace: false,
-                max_breadcrumbs: 0,
-                default_integrations: false,
-                auto_session_tracking: false,
-                traces_sample_rate: 1.0,
-                before_send: Some(std::sync::Arc::new(scrub_event)),
-                ..sentry::ClientOptions::default()
-            },
+            test_client_options(),
         ));
 
         let transaction =
