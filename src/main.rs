@@ -86,17 +86,7 @@ fn init_telemetry_when(enabled: bool) -> Option<sentry::ClientInitGuard> {
     enabled.then(|| {
         sentry::init((
             "https://9435ede2d0d8eceedf3b3e0eb5cb6aff@o4509985277018112.ingest.de.sentry.io/4510966154002512",
-            sentry::ClientOptions {
-                release: sentry::release_name!(),
-                send_default_pii: false,
-                attach_stacktrace: true,
-                max_breadcrumbs: 0,
-                default_integrations: true,
-                auto_session_tracking: false,
-                traces_sample_rate: telemetry::traces_sample_rate(),
-                before_send: Some(std::sync::Arc::new(telemetry::scrub_event)),
-                ..sentry::ClientOptions::default()
-            },
+            telemetry::init_client_options(),
         ))
     })
 }
