@@ -24,6 +24,8 @@
   </a>
 </p>
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SpotlightForBugs/kramli-cli)
+
 
 <p align="center">
   <img src=".github/assets/og-image.jpg" alt="Kramli app preview" width="640">
