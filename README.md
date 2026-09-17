@@ -8,7 +8,6 @@
   <strong>Command-line client for <a href="https://kramli.de">Kramli</a></strong><br>
   Shopping lists, todos, and shared lists <i>>_</i> managed from your terminal.
 </p>
-
 <p align="center">
   <a href="https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli/">
     <img src="https://app.deepsource.com/gh/SpotlightForBugs/kramli-cli.svg/?label=code+coverage&show_trend=true&token=R3u8WNRSja7eRF8JiJrmNkUZ" alt="Code Coverage">
@@ -22,9 +21,10 @@
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
   </a>
+  <a href="https://deepwiki.com/SpotlightForBugs/kramli-cli">
+    <img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki">
+  </a>
 </p>
-
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/SpotlightForBugs/kramli-cli)
 
 
 <p align="center">
