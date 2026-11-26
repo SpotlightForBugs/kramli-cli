@@ -800,9 +800,7 @@ mod tests {
     fn keyring_entry_can_be_constructed() {
         with_clean_config_env(|| {
             assert!(Config::keyring_entry(KEYRING_API_KEY_LEGACY).is_ok());
-            assert!(
-                Config::keyring_entry(&keyring_account_for_base_url(DEFAULT_BASE_URL)).is_ok()
-            );
+            assert!(Config::keyring_entry(&keyring_account_for_base_url(DEFAULT_BASE_URL)).is_ok());
         });
     }
 
