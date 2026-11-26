@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(all(target_os = "macos", not(test)))]
@@ -6,6 +7,7 @@ use std::process::Command;
 use std::sync::Mutex;
 
 use keyring::Entry;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
 use crate::i18n::{tr, tr_args};
@@ -13,7 +15,8 @@ use crate::i18n::{tr, tr_args};
 const DEFAULT_BASE_URL: &str = "https://kramli.de";
 pub(crate) const KRAMLI_CONFIG_PATH_ENV: &str = "KRAMLI_CONFIG_PATH";
 const KEYRING_SERVICE: &str = "kramli-cli";
-const KEYRING_API_KEY: &str = "api-key";
+/// Legacy flat keyring account (pre per-URL keys). Migrated on first read.
+const KEYRING_API_KEY_LEGACY: &str = "api-key";
 const KRAMLI_URL_ENV: &str = "KRAMLI_URL";
 const KRAMLI_API_KEY_ENV: &str = "KRAMLI_API_KEY";
 const DO_NOT_TRACK_ENV: &str = "DO_NOT_TRACK";
@@ -24,13 +27,45 @@ const KRAMLI_TUI_BOOTSTRAP_ICONS_ENV: &str = "KRAMLI_TUI_BOOTSTRAP_ICONS";
 const KRAMLI_LOAD_BOOTSTRAP_ICONS_ENV: &str = "KRAMLI_LOAD_BOOTSTRAP_ICONS";
 
 #[cfg(test)]
-static TEST_KEYCHAIN_API_KEY: Mutex<Option<Result<Option<String>, String>>> = Mutex::new(None);
+static TEST_KEYCHAIN_API_KEYS: Mutex<Option<Result<BTreeMap<String, String>, String>>> =
+    Mutex::new(None);
 
 #[cfg(test)]
 pub(crate) fn reset_test_keychain_api_key() {
-    *TEST_KEYCHAIN_API_KEY
+    *TEST_KEYCHAIN_API_KEYS
         .lock()
         .expect("keychain test lock poisoned") = None;
+}
+
+/// Normalize a base URL so keys for the same host share one keychain slot.
+pub(crate) fn normalize_base_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return DEFAULT_BASE_URL.to_string();
+    }
+    let Ok(parsed) = Url::parse(trimmed) else {
+        return trimmed.to_ascii_lowercase();
+    };
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    let Some(host_raw) = parsed.host_str() else {
+        return trimmed.to_ascii_lowercase();
+    };
+    // host_str() for IPv6 may omit brackets; keep a single bracketed form.
+    let host = if host_raw.starts_with('[') {
+        host_raw.to_ascii_lowercase()
+    } else if host_raw.contains(':') {
+        format!("[{}]", host_raw.to_ascii_lowercase())
+    } else {
+        host_raw.to_ascii_lowercase()
+    };
+    match parsed.port() {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    }
+}
+
+fn keyring_account_for_base_url(base_url: &str) -> String {
+    format!("api-key:{}", normalize_base_url(base_url))
 }
 
 // ── On-disk config: non-sensitive settings only ──
@@ -199,33 +234,38 @@ impl Config {
         self.file.update_check_url = url;
     }
 
-    // ── Keychain-backed API key (env override: KRAMLI_API_KEY) ──
+    // ── Keychain-backed API key, scoped per base URL (env: KRAMLI_API_KEY) ──
 
-    fn keyring_entry(key: &str) -> Result<Entry, String> {
-        Entry::new(KEYRING_SERVICE, key)
+    fn keyring_entry(account: &str) -> Result<Entry, String> {
+        Entry::new(KEYRING_SERVICE, account)
             .map_err(|e| tr_args("config-keychain-error", &[("error", e.to_string())]))
     }
 
+    fn keychain_slot(&self) -> String {
+        normalize_base_url(&self.base_url())
+    }
+
     #[cfg(test)]
-    fn keychain_api_key() -> Result<Option<String>, String> {
-        match TEST_KEYCHAIN_API_KEY
+    fn keychain_api_key_for(slot: &str) -> Result<Option<String>, String> {
+        match TEST_KEYCHAIN_API_KEYS
             .lock()
             .expect("keychain test lock poisoned")
             .clone()
         {
-            Some(result) => result,
+            Some(Ok(map)) => Ok(map.get(slot).cloned()),
+            Some(Err(error)) => Err(error),
             None => Ok(None),
         }
     }
 
     #[cfg(not(test))]
-    fn keychain_api_key() -> Result<Option<String>, String> {
-        Self::real_keychain_api_key()
+    fn keychain_api_key_for(slot: &str) -> Result<Option<String>, String> {
+        Self::real_keychain_api_key_for(slot)
     }
 
     #[cfg(not(test))]
-    fn real_keychain_api_key() -> Result<Option<String>, String> {
-        let entry = Self::keyring_entry(KEYRING_API_KEY)?;
+    fn read_keyring_password(account: &str) -> Result<Option<String>, String> {
+        let entry = Self::keyring_entry(account)?;
         match entry.get_password() {
             Ok(key) => {
                 if key.trim().is_empty() {
@@ -238,7 +278,7 @@ impl Config {
             Err(error) => {
                 #[cfg(target_os = "macos")]
                 {
-                    if let Some(key) = Self::api_key_via_security_cli() {
+                    if let Some(key) = Self::api_key_via_security_cli(account) {
                         return Ok(Some(key));
                     }
                 }
@@ -250,15 +290,35 @@ impl Config {
         }
     }
 
+    #[cfg(not(test))]
+    fn real_keychain_api_key_for(slot: &str) -> Result<Option<String>, String> {
+        let account = keyring_account_for_base_url(slot);
+        if let Some(key) = Self::read_keyring_password(&account)? {
+            return Ok(Some(key));
+        }
+        // One-shot migration: bind the legacy flat key to the *current* base URL
+        // only. Changing base_url later will not reuse that key for another host.
+        let Some(legacy) = Self::read_keyring_password(KEYRING_API_KEY_LEGACY)? else {
+            return Ok(None);
+        };
+        if let Ok(entry) = Self::keyring_entry(&account) {
+            let _ = entry.set_password(&legacy);
+        }
+        if let Ok(entry) = Self::keyring_entry(KEYRING_API_KEY_LEGACY) {
+            let _ = entry.delete_credential();
+        }
+        Ok(Some(legacy))
+    }
+
     #[cfg(all(target_os = "macos", not(test)))]
-    fn api_key_via_security_cli() -> Option<String> {
+    fn api_key_via_security_cli(account: &str) -> Option<String> {
         let output = Command::new("security")
             .args([
                 "find-generic-password",
                 "-s",
                 KEYRING_SERVICE,
                 "-a",
-                KEYRING_API_KEY,
+                account,
                 "-w",
             ])
             .output()
@@ -275,65 +335,91 @@ impl Config {
         }
     }
 
-    /// API key: env `KRAMLI_API_KEY` > OS keychain.
+    /// API key for the active base URL: env `KRAMLI_API_KEY` > OS keychain.
     pub(crate) fn api_key(&self) -> Option<String> {
         if let Ok(key) = std::env::var(KRAMLI_API_KEY_ENV) {
             if !key.is_empty() {
                 return Some(key);
             }
         }
-        Self::keychain_api_key().unwrap_or_default()
+        Self::keychain_api_key_for(&self.keychain_slot()).unwrap_or_default()
     }
 
-    /// Store an API key in the OS keychain.
+    /// Store an API key in the OS keychain for the active base URL.
     pub(crate) fn set_api_key(&self, key: &str) -> Result<(), String> {
+        let slot = self.keychain_slot();
         #[cfg(test)]
         {
-            *TEST_KEYCHAIN_API_KEY
+            let mut guard = TEST_KEYCHAIN_API_KEYS
                 .lock()
-                .expect("keychain test lock poisoned") = Some(Ok(Some(key.to_string())));
+                .expect("keychain test lock poisoned");
+            let map = match guard.as_mut() {
+                Some(Ok(map)) => map,
+                Some(Err(_)) | None => {
+                    *guard = Some(Ok(BTreeMap::new()));
+                    match guard.as_mut() {
+                        Some(Ok(map)) => map,
+                        _ => unreachable!("just inserted Ok map"),
+                    }
+                }
+            };
+            map.insert(slot, key.to_string());
             return Ok(());
         }
         #[cfg(not(test))]
         {
-            Self::keyring_entry(KEYRING_API_KEY)?
+            let account = keyring_account_for_base_url(&slot);
+            Self::keyring_entry(&account)?
                 .set_password(key)
-                .map_err(|e| tr_args("config-store-key-error", &[("error", e.to_string())]))
-        }
-    }
-
-    /// Delete the stored API key from the OS keychain.
-    pub(crate) fn delete_api_key(&self) -> Result<(), String> {
-        #[cfg(test)]
-        {
-            *TEST_KEYCHAIN_API_KEY
-                .lock()
-                .expect("keychain test lock poisoned") = Some(Ok(None));
-            return Ok(());
-        }
-        #[cfg(not(test))]
-        {
-            if let Ok(entry) = Self::keyring_entry(KEYRING_API_KEY) {
+                .map_err(|e| tr_args("config-store-key-error", &[("error", e.to_string())]))?;
+            // Drop the legacy flat slot so it cannot leak across hosts after upgrade.
+            if let Ok(entry) = Self::keyring_entry(KEYRING_API_KEY_LEGACY) {
                 let _ = entry.delete_credential();
             }
             Ok(())
         }
     }
 
-    /// Return an API key or an actionable login error.
+    /// Delete the API key for the active base URL from the OS keychain.
+    pub(crate) fn delete_api_key(&self) -> Result<(), String> {
+        let slot = self.keychain_slot();
+        #[cfg(test)]
+        {
+            let mut guard = TEST_KEYCHAIN_API_KEYS
+                .lock()
+                .expect("keychain test lock poisoned");
+            if let Some(Ok(map)) = guard.as_mut() {
+                map.remove(&slot);
+            }
+            return Ok(());
+        }
+        #[cfg(not(test))]
+        {
+            let account = keyring_account_for_base_url(&slot);
+            if let Ok(entry) = Self::keyring_entry(&account) {
+                let _ = entry.delete_credential();
+            }
+            if let Ok(entry) = Self::keyring_entry(KEYRING_API_KEY_LEGACY) {
+                let _ = entry.delete_credential();
+            }
+            Ok(())
+        }
+    }
+
+    /// Return an API key for the active base URL or an actionable login error.
     pub(crate) fn require_api_key(&self) -> Result<String, String> {
         if let Ok(key) = std::env::var(KRAMLI_API_KEY_ENV) {
             if !key.is_empty() {
                 return Ok(key);
             }
         }
-        match Self::keychain_api_key()? {
+        match Self::keychain_api_key_for(&self.keychain_slot())? {
             Some(key) => Ok(key),
             None => Err(tr("config-not-logged-in")),
         }
     }
 
-    /// Return whether an API key is available from env or keychain.
+    /// Return whether an API key is available from env or keychain for this URL.
     pub(crate) fn has_api_key(&self) -> bool {
         self.api_key().is_some()
     }
@@ -493,15 +579,21 @@ mod tests {
     fn with_test_keychain<T>(value: Result<Option<String>, String>, f: impl FnOnce() -> T) -> T {
         let _guard = TEST_KEYCHAIN_LOCK.lock().expect("test lock poisoned");
         {
-            let mut keychain = TEST_KEYCHAIN_API_KEY
+            let mut keychain = TEST_KEYCHAIN_API_KEYS
                 .lock()
                 .expect("keychain test lock poisoned");
-            *keychain = Some(value);
+            *keychain = Some(value.map(|opt| {
+                let mut map = BTreeMap::new();
+                if let Some(key) = opt {
+                    map.insert(normalize_base_url(DEFAULT_BASE_URL), key);
+                }
+                map
+            }));
         }
 
         let result = f();
 
-        let mut keychain = TEST_KEYCHAIN_API_KEY
+        let mut keychain = TEST_KEYCHAIN_API_KEYS
             .lock()
             .expect("keychain test lock poisoned");
         *keychain = None;
@@ -707,7 +799,10 @@ mod tests {
     #[kramli_test_macros::test]
     fn keyring_entry_can_be_constructed() {
         with_clean_config_env(|| {
-            assert!(Config::keyring_entry(KEYRING_API_KEY).is_ok());
+            assert!(Config::keyring_entry(KEYRING_API_KEY_LEGACY).is_ok());
+            assert!(
+                Config::keyring_entry(&keyring_account_for_base_url(DEFAULT_BASE_URL)).is_ok()
+            );
         });
     }
 
@@ -715,10 +810,13 @@ mod tests {
     fn keychain_fallback_branches_are_testable_without_system_keychain() {
         with_clean_config_env(|| {
             let _guard = TEST_KEYCHAIN_LOCK.lock().expect("test lock poisoned");
-            *TEST_KEYCHAIN_API_KEY
+            *TEST_KEYCHAIN_API_KEYS
                 .lock()
                 .expect("keychain test lock poisoned") = None;
-            assert_eq!(Config::keychain_api_key(), Ok(None));
+            assert_eq!(
+                Config::keychain_api_key_for(&normalize_base_url(DEFAULT_BASE_URL)),
+                Ok(None)
+            );
             drop(_guard);
 
             with_test_keychain(Ok(Some("stored-key".to_string())), || {
@@ -732,6 +830,54 @@ mod tests {
                 assert_eq!(cfg.api_key(), None);
                 assert_eq!(cfg.require_api_key(), Err(tr("config-not-logged-in")));
             });
+        });
+    }
+
+    #[kramli_test_macros::test]
+    fn normalize_base_url_strips_slash_and_lowercases_host() {
+        assert_eq!(
+            normalize_base_url("https://Kramli.DE/"),
+            "https://kramli.de"
+        );
+        assert_eq!(
+            normalize_base_url("http://127.0.0.1:8000/"),
+            "http://127.0.0.1:8000"
+        );
+        assert_eq!(normalize_base_url("http://[::1]:8000"), "http://[::1]:8000");
+    }
+
+    #[kramli_test_macros::test]
+    fn api_key_is_scoped_per_base_url_and_not_shared_across_hosts() {
+        with_clean_config_env(|| {
+            let _guard = TEST_KEYCHAIN_LOCK.lock().expect("test lock poisoned");
+            *TEST_KEYCHAIN_API_KEYS
+                .lock()
+                .expect("keychain test lock poisoned") = Some(Ok(BTreeMap::new()));
+
+            let mut prod = config_file(None, None);
+            prod.set_base_url(Some("https://kramli.de".to_string()));
+            prod.set_api_key("kramli_prod_key")
+                .expect("prod key should store");
+            assert_eq!(prod.api_key().as_deref(), Some("kramli_prod_key"));
+
+            let mut other = config_file(None, None);
+            other.set_base_url(Some("https://evil.example".to_string()));
+            assert_eq!(other.api_key(), None);
+            assert_eq!(other.require_api_key(), Err(tr("config-not-logged-in")));
+
+            other
+                .set_api_key("kramli_evil_key")
+                .expect("evil key should store");
+            assert_eq!(other.api_key().as_deref(), Some("kramli_evil_key"));
+            assert_eq!(prod.api_key().as_deref(), Some("kramli_prod_key"));
+
+            other.delete_api_key().expect("evil key should delete");
+            assert_eq!(other.api_key(), None);
+            assert_eq!(prod.api_key().as_deref(), Some("kramli_prod_key"));
+
+            *TEST_KEYCHAIN_API_KEYS
+                .lock()
+                .expect("keychain test lock poisoned") = None;
         });
     }
 
@@ -759,16 +905,16 @@ mod tests {
         );
 
         with_env_vars(&[(KRAMLI_URL_ENV, ""), (KRAMLI_API_KEY_ENV, "")], || {
-            *TEST_KEYCHAIN_API_KEY
+            *TEST_KEYCHAIN_API_KEYS
                 .lock()
-                .expect("keychain test lock poisoned") = Some(Ok(None));
+                .expect("keychain test lock poisoned") = Some(Ok(BTreeMap::new()));
             let cfg = config_file(None, None);
             assert_eq!(cfg.base_url(), DEFAULT_BASE_URL);
             assert_eq!(cfg.api_key(), None);
             assert_eq!(cfg.require_api_key(), Err(tr("config-not-logged-in")));
             assert!(!cfg.has_api_key());
             assert!(!cfg.api_key_from_env());
-            *TEST_KEYCHAIN_API_KEY
+            *TEST_KEYCHAIN_API_KEYS
                 .lock()
                 .expect("keychain test lock poisoned") = None;
         });
